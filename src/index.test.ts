@@ -272,19 +272,17 @@ describe("MnemonicDB", () => {
     it("should create datoms on INSERT", async () => {
       await db.exec("INSERT INTO persons (name, age) VALUES ('Bob', 25)");
 
-      // Check datoms were created
+      // Check datoms were created (now in attribute-specific tables)
       const nameDatoms = await db.query<{ e: string; v: string }>(
-        `SELECT e, v FROM datoms_text
-         WHERE a = (SELECT mnemonic_attr_id('person/name'))
-         AND retracted_by IS NULL`
+        `SELECT e, v FROM attr_person_name
+         WHERE retracted_by IS NULL`
       );
       expect(nameDatoms.length).toBe(1);
       expect(nameDatoms[0].v).toBe("Bob");
 
       const ageDatoms = await db.query<{ e: string; v: number }>(
-        `SELECT e, v FROM datoms_int4
-         WHERE a = (SELECT mnemonic_attr_id('person/age'))
-         AND retracted_by IS NULL`
+        `SELECT e, v FROM attr_person_age
+         WHERE retracted_by IS NULL`
       );
       expect(ageDatoms.length).toBe(1);
       expect(ageDatoms[0].v).toBe(25);
@@ -313,11 +311,10 @@ describe("MnemonicDB", () => {
 
       await db.exec(`UPDATE persons SET name = 'David' WHERE id = ${id}`);
 
-      // Old name should be retracted
+      // Old name should be retracted (now in attribute-specific table)
       const retractedNames = await db.query<{ v: string; retracted_by: string }>(
-        `SELECT v, retracted_by FROM datoms_text
+        `SELECT v, retracted_by FROM attr_person_name
          WHERE e = ${id}
-         AND a = (SELECT mnemonic_attr_id('person/name'))
          AND retracted_by IS NOT NULL`
       );
       expect(retractedNames.length).toBe(1);
@@ -325,9 +322,8 @@ describe("MnemonicDB", () => {
 
       // New name should be current
       const currentNames = await db.query<{ v: string }>(
-        `SELECT v FROM datoms_text
+        `SELECT v FROM attr_person_name
          WHERE e = ${id}
-         AND a = (SELECT mnemonic_attr_id('person/name'))
          AND retracted_by IS NULL`
       );
       expect(currentNames.length).toBe(1);
@@ -355,25 +351,25 @@ describe("MnemonicDB", () => {
 
       await db.exec(`DELETE FROM persons WHERE id = ${id}`);
 
-      // All datoms should be retracted - check each table separately
-      const currentTextDatoms = await db.query(
-        `SELECT * FROM datoms_text WHERE e = ${id} AND retracted_by IS NULL`
+      // All datoms should be retracted - check each attribute table
+      const currentNameDatoms = await db.query(
+        `SELECT * FROM attr_person_name WHERE e = ${id} AND retracted_by IS NULL`
       );
-      const currentIntDatoms = await db.query(
-        `SELECT * FROM datoms_int4 WHERE e = ${id} AND retracted_by IS NULL`
+      const currentAgeDatoms = await db.query(
+        `SELECT * FROM attr_person_age WHERE e = ${id} AND retracted_by IS NULL`
       );
-      expect(currentTextDatoms.length).toBe(0);
-      expect(currentIntDatoms.length).toBe(0);
+      expect(currentNameDatoms.length).toBe(0);
+      expect(currentAgeDatoms.length).toBe(0);
 
       // But retracted datoms should still exist
-      const retractedTextDatoms = await db.query(
-        `SELECT * FROM datoms_text WHERE e = ${id} AND retracted_by IS NOT NULL`
+      const retractedNameDatoms = await db.query(
+        `SELECT * FROM attr_person_name WHERE e = ${id} AND retracted_by IS NOT NULL`
       );
-      const retractedIntDatoms = await db.query(
-        `SELECT * FROM datoms_int4 WHERE e = ${id} AND retracted_by IS NOT NULL`
+      const retractedAgeDatoms = await db.query(
+        `SELECT * FROM attr_person_age WHERE e = ${id} AND retracted_by IS NOT NULL`
       );
-      expect(retractedTextDatoms.length).toBe(1); // name
-      expect(retractedIntDatoms.length).toBe(1); // age
+      expect(retractedNameDatoms.length).toBe(1); // name
+      expect(retractedAgeDatoms.length).toBe(1); // age
     });
   });
 });
