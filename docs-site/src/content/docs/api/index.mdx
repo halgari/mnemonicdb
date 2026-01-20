@@ -1,0 +1,91 @@
+---
+title: API Overview
+description: MnemonicDB TypeScript API reference
+---
+
+MnemonicDB provides a TypeScript API for interacting with the database. The API wraps PGLite and provides convenient methods for schema definition, querying, and temporal operations.
+
+## Installation
+
+```bash
+npm install mnemonicdb
+# or
+pnpm add mnemonicdb
+# or
+bun add mnemonicdb
+```
+
+## Quick Start
+
+```typescript
+import { createMnemonicDB } from 'mnemonicdb';
+
+// Create a new in-memory database
+const db = await createMnemonicDB();
+
+// Define schema
+await db.defineAttribute({
+  ident: 'person/name',
+  valueType: 'db.type/text',
+  cardinality: 'db.cardinality/one',
+});
+
+await db.defineAttribute({
+  ident: 'person/age',
+  valueType: 'db.type/int4',
+  cardinality: 'db.cardinality/one',
+});
+
+await db.defineView({
+  name: 'persons',
+  attributes: ['person/name', 'person/age'],
+});
+
+// Use standard SQL
+await db.exec("INSERT INTO persons (name, age) VALUES ('Alice', 30)");
+const persons = await db.query('SELECT * FROM persons');
+
+// Clean up
+await db.close();
+```
+
+## Module Exports
+
+The main module exports the following:
+
+### Factory Functions
+
+| Function | Description |
+|----------|-------------|
+| `createMnemonicDB(dataDir?)` | Create and initialize a new database |
+| `openMnemonicDB(dataDir)` | Open an existing database (no bootstrap) |
+| `initializeDatabase(db)` | Initialize a PGLite instance with MnemonicDB schema |
+
+### Classes
+
+| Class | Description |
+|-------|-------------|
+| `MnemonicDB` | Main database class with all operations |
+
+### Types
+
+| Type | Description |
+|------|-------------|
+| `AttributeDefinition` | Attribute definition parameters |
+| `ViewDefinition` | View definition parameters |
+| `AttributeInfo` | Attribute metadata from schema |
+| `ViewInfo` | View metadata from schema |
+| `ValueType` | Union of valid value type strings |
+| `Cardinality` | Union of cardinality strings |
+| `Uniqueness` | Union of uniqueness constraint strings |
+
+### Re-exports
+
+| Export | Description |
+|--------|-------------|
+| `PGlite` | Re-exported from `@electric-sql/pglite` |
+
+## Next Steps
+
+- [MnemonicDB Class](/mnemonicdb/api/mnemonicdb/) - Full class reference
+- [Types](/mnemonicdb/api/types/) - TypeScript type definitions

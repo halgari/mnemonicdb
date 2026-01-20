@@ -1,0 +1,222 @@
+---
+title: Temporal Queries
+description: Query data as it existed at any point in time
+---
+
+MnemonicDB's immutable data model enables powerful temporal queries. Every fact is preserved with its transaction history, allowing you to query data as it existed at any point in time.
+
+## The RetractedBy Column
+
+The key to temporal queries is the `retracted_by` column on every datom:
+
+| retracted_by | Meaning |
+|--------------|---------|
+| NULL | Datom is current (not retracted) |
+| tx_id | Datom was retracted in transaction tx_id |
+
+This enables efficient filtering:
+
+```sql
+-- Current data: fact was asserted and not yet retracted
+WHERE retracted_by IS NULL
+
+-- Data as-of transaction 500: fact existed at that point
+WHERE tx <= 500 AND (retracted_by IS NULL OR retracted_by > 500)
+```
+
+## As-Of Queries
+
+An **as-of query** shows data as it existed at a specific transaction.
+
+### Using the TypeScript API
+
+```typescript
+// Query current state
+const currentPersons = await db.query('SELECT * FROM persons');
+
+// Query as-of a specific transaction
+const historicalPersons = await db.queryAsOf(
+  'SELECT * FROM persons',
+  [],
+  500n  // Transaction ID
+);
+```
+
+The `queryAsOf` method is safe for concurrent use—each query sets its own transaction-local context.
+
+### Using setAsOf for Multiple Queries
+
+For multiple queries at the same point in time:
+
+```typescript
+await db.setAsOf(500n);
+const persons = await db.query('SELECT * FROM persons');
+const departments = await db.query('SELECT * FROM departments');
+await db.setAsOf(null);  // Return to current state
+```
+
+Or use the `withAsOf` helper:
+
+```typescript
+await db.withAsOf(500n, async () => {
+  const persons = await db.query('SELECT * FROM persons');
+  const departments = await db.query('SELECT * FROM departments');
+  // Both queries see data as of tx 500
+});
+```
+
+### Use Cases
+
+**Auditing**: See what data looked like when a decision was made
+```typescript
+// What did we know about this customer when we approved their loan?
+const customer = await db.queryAsOf(
+  'SELECT * FROM customers WHERE id = $1',
+  [customerId],
+  loan.approvalTx
+);
+```
+
+**Debugging**: Reproduce bugs with historical data
+```typescript
+// What was the state when the error occurred?
+const state = await db.queryAsOf(
+  'SELECT * FROM orders WHERE id = $1',
+  [orderId],
+  errorLog.tx
+);
+```
+
+**Compliance**: Demonstrate historical state for regulators
+```typescript
+// Show account balances as of end of fiscal year
+const accounts = await db.queryAsOf(
+  'SELECT * FROM accounts',
+  [],
+  endOfYearTx
+);
+```
+
+## History Queries
+
+A **history query** shows all values an attribute has had over time.
+
+### Entity History
+
+```sql
+-- All historical values for a person's name
+SELECT
+  d.v AS name,
+  d.tx AS asserted_in,
+  d.retracted_by AS retracted_in
+FROM attr_person_name d
+WHERE d.e = 101
+ORDER BY d.tx;
+```
+
+Result:
+```
+name    | asserted_in | retracted_in
+Robert  | tx/1        | tx/5
+Bob     | tx/5        | tx/10
+Roberto | tx/10       | null
+```
+
+### Full Entity History
+
+Query the unified `datoms` parent table to see all changes to an entity:
+
+```sql
+SELECT
+  d.a AS attribute_id,
+  d.v_data AS value,
+  d.tx AS asserted_in,
+  d.retracted_by AS retracted_in
+FROM datoms d
+WHERE d.e = 101
+ORDER BY d.tx, d.a;
+```
+
+## Transaction Log
+
+Query the transaction log to see all changes:
+
+```sql
+-- Recent transactions
+SELECT id, tx_instant
+FROM transactions
+ORDER BY id DESC
+LIMIT 10;
+```
+
+### Finding Transaction by Time
+
+```sql
+-- Find transaction closest to a specific time
+SELECT id
+FROM transactions
+WHERE tx_instant <= '2024-01-15 10:30:00'
+ORDER BY tx_instant DESC
+LIMIT 1;
+```
+
+## Comparing Points in Time
+
+Compare entity state between two transactions:
+
+```typescript
+// Get state at two different points
+const before = await db.queryAsOf(
+  'SELECT * FROM persons WHERE id = $1',
+  [personId],
+  tx400
+);
+
+const after = await db.queryAsOf(
+  'SELECT * FROM persons WHERE id = $1',
+  [personId],
+  tx500
+);
+
+// Compare
+console.log('Name changed:', before[0].name !== after[0].name);
+```
+
+## Dual View Architecture
+
+MnemonicDB generates two versions of each view:
+
+1. **`_current` view**: Uses simple `retracted_by IS NULL` checks—optimal for current-state queries
+2. **`_history` view**: Uses `mnemonic_datom_visible()` function—supports temporal queries
+
+The base view routes to the appropriate variant based on whether `mnemonic.as_of_tx` is set.
+
+This architecture ensures:
+- Current-state queries have no temporal overhead
+- Temporal queries work correctly with any view
+
+## Performance Considerations
+
+### Indexes for Temporal Queries
+
+The standard indexes support efficient temporal queries:
+
+- `(e, retracted_by)` on attribute tables - Entity lookups
+- `(tx)` on datoms - Transaction log scans
+- `(v, retracted_by)` on attribute tables - Value lookups
+
+### As-Of Query Performance
+
+As-of queries add filtering overhead. For frequently-accessed historical snapshots, consider:
+
+1. **Caching**: Cache as-of query results for common timestamps
+2. **Materialized snapshots**: For critical audit dates, materialize the as-of state
+
+### Pruning (Future)
+
+For long-running systems, old history may be prunable:
+- Archive datoms older than retention period
+- Keep only latest state for non-audited attributes
+- Compact retracted datoms into summary records
+
+Pruning is destructive and should be used carefully—it removes the ability to query as-of before the pruning point.

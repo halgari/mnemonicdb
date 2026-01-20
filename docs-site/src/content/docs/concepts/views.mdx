@@ -1,0 +1,213 @@
+---
+title: Projection Views
+description: SQL views that present datom data in familiar tabular form
+---
+
+Projection views are the primary interface for applications. They present datom data in familiar tabular form, making MnemonicDB compatible with standard SQL tooling and ORMs.
+
+## View Structure
+
+A projection view joins datoms from multiple attribute tables to present an entity as a row:
+
+```sql
+-- Generated view for 'persons'
+CREATE VIEW persons AS
+SELECT
+  j1.e AS id,
+  j1.v AS name,
+  j2.v AS email,
+  j3.v AS age
+FROM attr_person_name j1
+INNER JOIN attr_person_email j2 ON j1.e = j2.e AND j2.retracted_by IS NULL
+LEFT JOIN attr_person_age j3 ON j1.e = j3.e AND j3.retracted_by IS NULL
+WHERE j1.retracted_by IS NULL;
+```
+
+### Implicit Columns
+
+Every view includes an implicit `id` column containing the entity ID. This is the primary key for the view.
+
+### NULL Handling
+
+LEFT JOINs for optional attributes ensure that entities appear even if they don't have all attributes. Missing attributes appear as NULL.
+
+## Defining Views
+
+Views are defined through the TypeScript API:
+
+```typescript
+await db.defineView({
+  name: 'persons',
+  attributes: ['person/name', 'person/email'],  // Required (INNER JOIN)
+  optionalAttributes: ['person/age'],           // Optional (LEFT JOIN)
+  doc: 'Person entities',
+});
+```
+
+The SQL view is created automatically—no need to call `regenerateViews()`.
+
+## INSTEAD OF Triggers
+
+Views support INSERT, UPDATE, and DELETE through `INSTEAD OF` triggers that translate operations into datom assertions and retractions.
+
+### INSERT Trigger
+
+```sql
+INSERT INTO persons (name, email, age)
+VALUES ('Alice', 'alice@example.com', 30);
+
+-- Internally becomes:
+-- 1. Allocate entity ID (e.g., 101)
+-- 2. Create transaction (e.g., tx/500)
+-- 3. Assert datoms:
+--    [101, :person/name, 'Alice', tx/500, null]
+--    [101, :person/email, 'alice@example.com', tx/500, null]
+--    [101, :person/age, 30, tx/500, null]
+```
+
+### UPDATE Trigger
+
+```sql
+UPDATE persons SET name = 'Alicia' WHERE id = 101;
+
+-- Internally becomes:
+-- 1. Create transaction (e.g., tx/501)
+-- 2. Retract old name:
+--    UPDATE attr_person_name SET retracted_by = tx/501
+--    WHERE e = 101 AND retracted_by IS NULL
+-- 3. Assert new name:
+--    [101, :person/name, 'Alicia', tx/501, null]
+```
+
+### DELETE Trigger
+
+```sql
+DELETE FROM persons WHERE id = 101;
+
+-- Internally retracts only the attributes in the 'persons' view:
+-- [101, :person/name, ...]   retracted
+-- [101, :person/email, ...]  retracted
+-- [101, :person/age, ...]    retracted
+-- [101, :person/tags, ...]   NOT retracted (not in view)
+```
+
+This behavior allows different views to manage different aspects of the same entity.
+
+## ORM Compatibility
+
+Projection views look like regular PostgreSQL tables to ORMs:
+
+### Drizzle
+
+```typescript
+import { pgTable, text, bigint, integer } from 'drizzle-orm/pg-core';
+
+export const persons = pgTable('persons', {
+  id: bigint('id', { mode: 'number' }).primaryKey(),
+  name: text('name'),
+  email: text('email'),
+  age: integer('age'),
+});
+
+// Works normally
+const alice = await db.insert(persons).values({
+  name: 'Alice',
+  email: 'alice@example.com',
+  age: 30,
+}).returning();
+
+await db.update(persons)
+  .set({ name: 'Alicia' })
+  .where(eq(persons.id, alice.id));
+```
+
+### Prisma
+
+```prisma
+model Person {
+  id    BigInt  @id
+  name  String?
+  email String?
+  age   Int?
+
+  @@map("persons")
+}
+```
+
+### Kysely
+
+```typescript
+interface Database {
+  persons: {
+    id: number;
+    name: string | null;
+    email: string | null;
+    age: number | null;
+  };
+}
+
+const db = new Kysely<Database>({ ... });
+
+await db.insertInto('persons')
+  .values({ name: 'Alice', email: 'alice@example.com', age: 30 })
+  .execute();
+```
+
+## TanStack Query Integration
+
+Views work with PGLite's live query features and TanStack Query:
+
+```typescript
+import { useLiveQuery } from '@electric-sql/pglite-react';
+
+function PersonList() {
+  const persons = useLiveQuery('SELECT * FROM persons ORDER BY name');
+
+  return (
+    <ul>
+      {persons?.rows.map(p => (
+        <li key={p.id}>{p.name}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+Changes made through the view (INSERT/UPDATE/DELETE) trigger reactive updates automatically.
+
+## Dual View Generation
+
+MnemonicDB generates two variants of each view:
+
+1. **`viewname_current`**: Optimized for current state (uses simple `retracted_by IS NULL`)
+2. **`viewname_history`**: Supports temporal queries (uses `mnemonic_datom_visible()`)
+
+The base view (`viewname`) dispatches to the appropriate variant based on whether `mnemonic.as_of_tx` is set.
+
+## View Limitations
+
+### No Direct Entity Creation
+
+You cannot insert a row without any column values:
+
+```sql
+-- This won't work meaningfully
+INSERT INTO persons DEFAULT VALUES;
+```
+
+At least one attribute value should be provided.
+
+### Cardinality-Many Attributes
+
+Cardinality-many attributes are expressed as PostgreSQL arrays:
+
+```sql
+-- A person with multiple tags
+SELECT * FROM persons;
+-- id | name  | email           | tags
+-- 1  | Bob   | bob@example.com | {developer,manager}
+```
+
+### Cross-View Updates
+
+An entity might appear in multiple views. Updates through one view only affect the attributes defined in that view.

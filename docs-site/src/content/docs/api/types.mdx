@@ -1,0 +1,265 @@
+---
+title: Types
+description: TypeScript type definitions for MnemonicDB
+---
+
+Complete reference for all TypeScript types exported by MnemonicDB.
+
+## Value Types
+
+### `ValueType`
+
+Union type of all valid value type identifiers.
+
+```typescript
+type ValueType =
+  | 'db.type/text'
+  | 'db.type/int4'
+  | 'db.type/int8'
+  | 'db.type/float4'
+  | 'db.type/float8'
+  | 'db.type/numeric'
+  | 'db.type/bool'
+  | 'db.type/timestamptz'
+  | 'db.type/date'
+  | 'db.type/uuid'
+  | 'db.type/bytea'
+  | 'db.type/jsonb'
+  | 'db.type/ref';
+```
+
+**PostgreSQL Mapping:**
+
+| Value Type | PostgreSQL Type | TypeScript Type |
+|------------|-----------------|-----------------|
+| `db.type/text` | `TEXT` | `string` |
+| `db.type/int4` | `INTEGER` | `number` |
+| `db.type/int8` | `BIGINT` | `bigint` or `string` |
+| `db.type/float4` | `REAL` | `number` |
+| `db.type/float8` | `DOUBLE PRECISION` | `number` |
+| `db.type/numeric` | `NUMERIC` | `string` or `number` |
+| `db.type/bool` | `BOOLEAN` | `boolean` |
+| `db.type/timestamptz` | `TIMESTAMPTZ` | `Date` or `string` |
+| `db.type/date` | `DATE` | `Date` or `string` |
+| `db.type/uuid` | `UUID` | `string` |
+| `db.type/bytea` | `BYTEA` | `Buffer` or `Uint8Array` |
+| `db.type/jsonb` | `JSONB` | `unknown` |
+| `db.type/ref` | `BIGINT` | `bigint` or `string` |
+
+### `Cardinality`
+
+Union type of cardinality values.
+
+```typescript
+type Cardinality = 'db.cardinality/one' | 'db.cardinality/many';
+```
+
+- **`db.cardinality/one`**: At most one value per entity
+- **`db.cardinality/many`**: Multiple values allowed per entity
+
+### `Uniqueness`
+
+Union type of uniqueness constraint values.
+
+```typescript
+type Uniqueness = 'db.unique/identity' | 'db.unique/value';
+```
+
+- **`db.unique/identity`**: Value uniquely identifies an entity (upsert key)
+- **`db.unique/value`**: Value must be unique (constraint only)
+
+## Definition Types
+
+### `AttributeDefinition`
+
+Parameters for defining a new attribute.
+
+```typescript
+interface AttributeDefinition {
+  /** Namespaced identifier (e.g., 'person/name') */
+  ident: string;
+
+  /** Value type */
+  valueType: ValueType;
+
+  /** Cardinality */
+  cardinality: Cardinality;
+
+  /** Optional uniqueness constraint */
+  unique?: Uniqueness;
+
+  /** Optional documentation */
+  doc?: string;
+}
+```
+
+**Example:**
+```typescript
+const attr: AttributeDefinition = {
+  ident: 'person/email',
+  valueType: 'db.type/text',
+  cardinality: 'db.cardinality/one',
+  unique: 'db.unique/identity',
+  doc: 'Unique email address for a person',
+};
+```
+
+### `ViewDefinition`
+
+Parameters for defining a new view.
+
+```typescript
+interface ViewDefinition {
+  /** View name (becomes SQL view name) */
+  name: string;
+
+  /** Required attributes (INNER JOIN) - at least one required */
+  attributes: string[];
+
+  /** Optional attributes (LEFT JOIN) */
+  optionalAttributes?: string[];
+
+  /** Optional documentation */
+  doc?: string;
+}
+```
+
+**Example:**
+```typescript
+const view: ViewDefinition = {
+  name: 'persons',
+  attributes: ['person/name', 'person/email'],
+  optionalAttributes: ['person/age', 'person/bio'],
+  doc: 'All person entities',
+};
+```
+
+## Metadata Types
+
+### `AttributeInfo`
+
+Attribute metadata returned by `listAttributes()`.
+
+```typescript
+interface AttributeInfo {
+  /** Entity ID of the attribute */
+  id: string;
+
+  /** Attribute identifier */
+  ident: string;
+
+  /** Value type identifier */
+  value_type: string;
+
+  /** Cardinality identifier */
+  cardinality: string;
+
+  /** Uniqueness constraint (if any) */
+  unique_constraint: string | null;
+
+  /** Documentation (if any) */
+  doc: string | null;
+}
+```
+
+**Example:**
+```typescript
+const attrs = await db.listAttributes();
+// [
+//   {
+//     id: '300',
+//     ident: 'person/name',
+//     value_type: 'db.type/text',
+//     cardinality: 'db.cardinality/one',
+//     unique_constraint: null,
+//     doc: 'Person full name'
+//   }
+// ]
+```
+
+### `ViewInfo`
+
+View metadata returned by `listViews()`.
+
+```typescript
+interface ViewInfo {
+  /** Entity ID of the view */
+  id: string;
+
+  /** View name */
+  name: string;
+
+  /** Documentation (if any) */
+  doc: string | null;
+}
+```
+
+**Example:**
+```typescript
+const views = await db.listViews();
+// [
+//   {
+//     id: '320',
+//     name: 'persons',
+//     doc: 'Person entities'
+//   }
+// ]
+```
+
+## SQL Types Reference
+
+When querying views, the returned row types depend on the attributes in the view:
+
+```typescript
+// Define your own interfaces for type-safe queries
+interface Person {
+  id: string;          // Always present (entity ID)
+  name: string;        // db.type/text
+  email: string;       // db.type/text
+  age: number | null;  // db.type/int4 (optional attribute)
+}
+
+const persons = await db.query<Person>('SELECT * FROM persons');
+```
+
+### BigInt Handling
+
+PGLite returns `BIGINT` values as strings by default. Use `BigInt()` to convert:
+
+```typescript
+interface PersonWithId {
+  id: string;  // Actually a bigint as string
+  name: string;
+}
+
+const persons = await db.query<PersonWithId>('SELECT * FROM persons');
+const entityId = BigInt(persons[0].id);
+```
+
+### Array Types (Cardinality Many)
+
+Cardinality-many attributes are returned as arrays:
+
+```typescript
+interface PersonWithTags {
+  id: string;
+  name: string;
+  tags: string[];  // db.cardinality/many
+}
+
+const persons = await db.query<PersonWithTags>('SELECT * FROM persons');
+console.log(persons[0].tags);  // ['developer', 'manager']
+```
+
+### Nullable Fields
+
+Optional attributes can be null:
+
+```typescript
+interface Person {
+  id: string;
+  name: string;           // Required attribute
+  age: number | null;     // Optional attribute
+  bio: string | null;     // Optional attribute
+}
+```

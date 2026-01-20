@@ -1,0 +1,172 @@
+---
+title: Data Model
+description: Understanding MnemonicDB's Entity-Attribute-Value-Transaction model
+---
+
+MnemonicDB follows Datomic's Entity-Attribute-Value-Transaction (EAVT) model with an additional retraction marker.
+
+## Datoms
+
+A **datom** is the atomic unit of information:
+
+```
+[Entity, Attribute, Value, Transaction, RetractedBy]
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| Entity (E) | bigint | The entity this fact is about |
+| Attribute (A) | bigint | The attribute (itself an entity ID) |
+| Value (V) | varies | The value (type depends on attribute's value type) |
+| Transaction (Tx) | bigint | Transaction ID when this fact was asserted |
+| RetractedBy | bigint? | Transaction ID when retracted, or NULL if current |
+
+### Example
+
+A person named "Alice" who works in Engineering:
+
+```
+[101, :person/name,       "Alice",      tx/1, null]
+[101, :person/department, dept/50,      tx/1, null]
+[50,  :department/name,   "Engineering", tx/1, null]
+```
+
+## Entity IDs
+
+Entity IDs are 64-bit integers with the **partition encoded in the high bits**. This allows:
+
+- Efficient range scans for entities in a partition
+- Predictable ID generation without coordination
+- Logical grouping of related entities
+
+### Partitions
+
+Predefined partitions:
+
+| Partition | Purpose |
+|-----------|---------|
+| `:db.part/db` | System schema (attributes, value types) |
+| `:db.part/tx` | Transaction entities |
+| `:db.part/user` | Application data |
+
+Entity IDs increment within their partition. A new user entity might be `0x0001_0000_0000_0042` where `0x0001` is the user partition.
+
+## Transactions
+
+Every mutation occurs within a **transaction**. Transactions are themselves entities in the `:db.part/tx` partition.
+
+A transaction entity always has a timestamp:
+
+```
+[tx/100, :db/txInstant, 2024-01-15T10:30:00Z, tx/100, null]
+```
+
+Applications can assert additional facts about transactions for audit trails:
+
+```
+[tx/100, :tx/user,   user/42,           tx/100, null]
+[tx/100, :tx/reason, "Updated profile", tx/100, null]
+```
+
+### Transaction Semantics
+
+Within a transaction:
+1. All assertions and retractions are atomic
+2. New entity IDs are allocated from partitions
+3. The transaction entity is created with `:db/txInstant`
+4. All datoms in the transaction share the same Tx value
+
+## Assertions and Retractions
+
+### Asserting Facts
+
+An **assertion** adds a new datom:
+
+```
+[entity, attribute, value, tx, null]
+```
+
+The `RetractedBy` is null, indicating this fact is current.
+
+### Retracting Facts
+
+A **retraction** marks an existing datom as no longer current by setting its `RetractedBy`:
+
+```
+-- Before: Alice's name is current
+[101, :person/name, "Alice", tx/1, null]
+
+-- After retraction in tx/5: no longer current
+[101, :person/name, "Alice", tx/1, tx/5]
+```
+
+The original datom is preserved—we can always see that Alice was once named "Alice" starting at tx/1 until tx/5.
+
+### Updates = Retract + Assert
+
+Changing a cardinality-one attribute is implemented as a retraction followed by an assertion:
+
+```sql
+-- User updates name from "Alice" to "Alicia" in tx/10
+-- 1. Retract old value
+[101, :person/name, "Alice",  tx/1, tx/10]  -- RetractedBy set to tx/10
+-- 2. Assert new value
+[101, :person/name, "Alicia", tx/10, null]  -- New current value
+```
+
+## Cardinality
+
+Attributes have a **cardinality** of either `one` or `many`.
+
+### Cardinality One
+
+An entity can have at most one value for this attribute at any time. Asserting a new value automatically retracts the previous value.
+
+```
+:person/name       cardinality: one
+:person/birthdate  cardinality: one
+```
+
+### Cardinality Many
+
+An entity can have multiple values simultaneously. Each value is a separate datom.
+
+```
+:person/email      cardinality: many
+:person/tag        cardinality: many
+```
+
+Multiple current values:
+```
+[101, :person/email, "alice@work.com",     tx/1, null]
+[101, :person/email, "alice@personal.com", tx/2, null]
+```
+
+## References
+
+Attributes with value type `ref` point to other entities:
+
+```
+[101, :person/department, 50, tx/1, null]
+```
+
+Entity 101's department is entity 50. This enables:
+
+- Graph traversal queries
+- Reverse lookups (find all persons in a department)
+- Referential semantics (the value is an entity, not just an ID)
+
+## Current vs Historical Data
+
+The `RetractedBy` field enables efficient queries for both current and historical data:
+
+```sql
+-- Current data only
+WHERE retracted_by IS NULL
+
+-- Data as of transaction 500
+WHERE tx <= 500 AND (retracted_by IS NULL OR retracted_by > 500)
+
+-- All history
+(no filter)
+```

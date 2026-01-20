@@ -1,0 +1,196 @@
+---
+title: Schema Evolution
+description: Interactive examples of evolving schema over time
+---
+
+import LiveExample from '../../../components/LiveExample.astro';
+
+MnemonicDB's "schema as data" approach makes schema evolution straightforward. Let's explore how to add attributes and update views.
+
+## Initial Schema
+
+Start with a simple person schema:
+
+<LiveExample
+  title="Create Initial Schema"
+  code={`-- Create person/name attribute
+INSERT INTO attr_db_ident (e, a, v_data, tx, retracted_by)
+VALUES (300, 1, '"person/name"', 0, NULL);
+INSERT INTO attr_db_valuetype (e, a, v_data, tx, retracted_by)
+VALUES (300, 2, '100', 0, NULL);
+INSERT INTO attr_db_cardinality (e, a, v_data, tx, retracted_by)
+VALUES (300, 3, '200', 0, NULL);
+CALL mnemonic_create_attr_table(300, 'person/name', 'db.type/text');
+
+-- Create person/email attribute
+INSERT INTO attr_db_ident (e, a, v_data, tx, retracted_by)
+VALUES (301, 1, '"person/email"', 0, NULL);
+INSERT INTO attr_db_valuetype (e, a, v_data, tx, retracted_by)
+VALUES (301, 2, '100', 0, NULL);
+INSERT INTO attr_db_cardinality (e, a, v_data, tx, retracted_by)
+VALUES (301, 3, '200', 0, NULL);
+CALL mnemonic_create_attr_table(301, 'person/email', 'db.type/text');
+
+-- Create persons view
+INSERT INTO mnemonic_defined_views (name, attributes, optional_attributes, doc)
+VALUES ('persons', ARRAY['person/name', 'person/email'], '{}', 'Person entities');
+
+-- Add some data
+INSERT INTO persons (name, email) VALUES ('Alice', 'alice@example.com');
+INSERT INTO persons (name, email) VALUES ('Bob', 'bob@example.com');
+
+-- View schema and data
+SELECT * FROM mnemonic_attributes WHERE ident LIKE 'person/%'`}
+/>
+
+## Check Current Data
+
+<LiveExample
+  title="View Current Persons"
+  code={`SELECT * FROM persons ORDER BY name`}
+/>
+
+## Adding a New Attribute
+
+Business requirements change—we need to track phone numbers:
+
+<LiveExample
+  title="Add Phone Attribute"
+  code={`-- Create person/phone attribute
+INSERT INTO attr_db_ident (e, a, v_data, tx, retracted_by)
+VALUES (302, 1, '"person/phone"', 0, NULL);
+INSERT INTO attr_db_valuetype (e, a, v_data, tx, retracted_by)
+VALUES (302, 2, '100', 0, NULL);
+INSERT INTO attr_db_cardinality (e, a, v_data, tx, retracted_by)
+VALUES (302, 3, '200', 0, NULL);
+CALL mnemonic_create_attr_table(302, 'person/phone', 'db.type/text');
+
+-- Verify attribute was created
+SELECT * FROM mnemonic_attributes WHERE ident = 'person/phone'`}
+/>
+
+## Updating the View
+
+Now update the view to include the new attribute as optional:
+
+<LiveExample
+  title="Update Persons View"
+  code={`-- Update the view to include phone as optional
+UPDATE mnemonic_defined_views
+SET optional_attributes = ARRAY['person/phone']
+WHERE name = 'persons';
+
+-- View is automatically regenerated!
+-- Existing data still works
+SELECT * FROM persons ORDER BY name`}
+/>
+
+## Adding Data to New Attribute
+
+<LiveExample
+  title="Add Phone Numbers"
+  code={`-- Add phone number to Alice
+UPDATE persons SET phone = '555-1234' WHERE name = 'Alice';
+
+-- View all data
+SELECT * FROM persons ORDER BY name`}
+/>
+
+## Adding Required Attributes
+
+What if we want a new required attribute? We need to provide values for existing entities:
+
+<LiveExample
+  title="Add Required Attribute"
+  code={`-- Create person/status attribute
+INSERT INTO attr_db_ident (e, a, v_data, tx, retracted_by)
+VALUES (303, 1, '"person/status"', 0, NULL);
+INSERT INTO attr_db_valuetype (e, a, v_data, tx, retracted_by)
+VALUES (303, 2, '100', 0, NULL);
+INSERT INTO attr_db_cardinality (e, a, v_data, tx, retracted_by)
+VALUES (303, 3, '200', 0, NULL);
+CALL mnemonic_create_attr_table(303, 'person/status', 'db.type/text');
+
+-- First, add the attribute as optional
+UPDATE mnemonic_defined_views
+SET optional_attributes = ARRAY['person/phone', 'person/status']
+WHERE name = 'persons';
+
+-- Backfill existing entities with a default status
+UPDATE persons SET status = 'active';
+
+SELECT * FROM persons ORDER BY name`}
+/>
+
+## Making the Attribute Required
+
+Now that all entities have the attribute, we can make it required:
+
+<LiveExample
+  title="Promote to Required"
+  code={`-- Move status from optional to required
+UPDATE mnemonic_defined_views
+SET
+  attributes = ARRAY['person/name', 'person/email', 'person/status'],
+  optional_attributes = ARRAY['person/phone']
+WHERE name = 'persons';
+
+-- Data still intact
+SELECT * FROM persons ORDER BY name`}
+/>
+
+## Creating a New View
+
+Create a specialized view for a different use case:
+
+<LiveExample
+  title="Create Contact View"
+  code={`-- Create a contacts view with just communication info
+INSERT INTO mnemonic_defined_views (name, attributes, optional_attributes, doc)
+VALUES (
+  'contacts',
+  ARRAY['person/name', 'person/email'],
+  ARRAY['person/phone'],
+  'Contact information for persons'
+);
+
+-- Same data, different projection
+SELECT * FROM contacts ORDER BY name`}
+/>
+
+## Viewing Schema Evolution
+
+Since schema is data, we can query schema history:
+
+<LiveExample
+  title="View Schema History"
+  code={`-- See all defined views
+SELECT * FROM mnemonic_views;
+
+-- See view attributes
+SELECT * FROM mnemonic_view_attributes ORDER BY view_name, attribute_ident`}
+/>
+
+## Deleting a View
+
+Views can be removed without affecting underlying data:
+
+<LiveExample
+  title="Delete a View"
+  code={`-- Delete the contacts view
+DELETE FROM mnemonic_defined_views WHERE name = 'contacts';
+
+-- Data still accessible through persons view
+SELECT * FROM persons ORDER BY name`}
+/>
+
+## Key Takeaways
+
+1. **Additive by default**: New attributes can be added anytime
+2. **Optional first**: Add new attributes as optional, backfill, then promote to required
+3. **View flexibility**: Multiple views can project the same entities differently
+4. **Auto-regeneration**: Views automatically update when definitions change
+5. **No data loss**: Removing views doesn't affect underlying datoms
+6. **Schema history**: Schema changes are recorded as datoms too
+
+Schema evolution in MnemonicDB is safe and reversible—the immutable foundation ensures you never lose data.

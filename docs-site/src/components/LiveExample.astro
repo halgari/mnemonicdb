@@ -1,0 +1,12 @@
+---
+import CodeRunner from './CodeRunner';
+
+interface Props {
+  code: string;
+  title?: string;
+}
+
+const { code, title } = Astro.props;
+---
+
+<CodeRunner client:visible initialCode={code} title={title} />

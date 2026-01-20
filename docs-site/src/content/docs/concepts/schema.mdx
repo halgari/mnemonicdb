@@ -1,0 +1,151 @@
+---
+title: Schema
+description: Schema as data - defining attributes and views in MnemonicDB
+---
+
+In MnemonicDB, **schema is data**. Attributes and views are stored as datoms in the database itself, making the system self-describing and enabling dynamic schema operations via stored procedures.
+
+## Attributes
+
+An **attribute** defines a property that can be asserted about entities. Attributes are themselves entities in the `:db.part/db` partition.
+
+### Attribute Properties
+
+Each attribute has the following properties:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `:db/ident` | string | Namespaced keyword identifier (e.g., `person/name`) |
+| `:db/valueType` | ref | Reference to a value type entity |
+| `:db/cardinality` | ref | `:db.cardinality/one` or `:db.cardinality/many` |
+| `:db/unique` | ref? | `:db.unique/identity` or `:db.unique/value` (optional) |
+| `:db/doc` | string? | Documentation string (optional) |
+
+### Example: Defining an Attribute
+
+As datoms:
+
+```
+[attr/1, :db/ident,       "person/name",           tx/1, null]
+[attr/1, :db/valueType,   :db.type/text,           tx/1, null]
+[attr/1, :db/cardinality, :db.cardinality/one,     tx/1, null]
+[attr/1, :db/doc,         "A person's full name",  tx/1, null]
+```
+
+## Value Types
+
+MnemonicDB supports one value type for each PostgreSQL data type, plus references:
+
+| Value Type | PostgreSQL Type | Description |
+|------------|-----------------|-------------|
+| `db.type/text` | text | Variable-length strings |
+| `db.type/int4` | integer | 32-bit integers |
+| `db.type/int8` | bigint | 64-bit integers |
+| `db.type/float4` | real | Single precision floats |
+| `db.type/float8` | double precision | Double precision floats |
+| `db.type/numeric` | numeric | Arbitrary precision |
+| `db.type/bool` | boolean | True/false |
+| `db.type/timestamptz` | timestamp with time zone | Timestamps |
+| `db.type/date` | date | Calendar dates |
+| `db.type/uuid` | uuid | UUIDs |
+| `db.type/bytea` | bytea | Binary data |
+| `db.type/jsonb` | jsonb | JSON data |
+| `db.type/ref` | bigint (entity ID) | References to other entities |
+
+## Uniqueness
+
+Attributes can have uniqueness constraints:
+
+### `:db.unique/identity`
+
+The attribute's value uniquely identifies an entity. Used for natural keys like email addresses or external IDs. Upserting by this value will find or create the entity.
+
+### `:db.unique/value`
+
+The attribute's value must be unique across all entities, but is not used for identity resolution. Used for constraints like "department code must be unique."
+
+## Defining Attributes via TypeScript API
+
+The recommended way to define attributes is through the MnemonicDB TypeScript API:
+
+```typescript
+await db.defineAttribute({
+  ident: 'person/name',
+  valueType: 'db.type/text',
+  cardinality: 'db.cardinality/one',
+  doc: 'A person\'s full name',
+});
+
+await db.defineAttribute({
+  ident: 'person/email',
+  valueType: 'db.type/text',
+  cardinality: 'db.cardinality/one',
+  unique: 'db.unique/identity',
+});
+```
+
+## Querying Schema
+
+Since schema is data, you can query it:
+
+```sql
+-- List all user-defined attributes
+SELECT * FROM mnemonic_attributes;
+
+-- Returns:
+-- id | ident        | value_type     | cardinality         | unique_constraint | doc
+-- 300| person/name  | db.type/text   | db.cardinality/one  | null              | A person's full name
+-- 301| person/email | db.type/text   | db.cardinality/one  | db.unique/identity| null
+```
+
+## View Definitions
+
+Views are also entities with attributes:
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `:db.view/ident` | text | View name (e.g., `persons`) |
+| `:db.view/doc` | text | Documentation |
+| `:db.view/attributes` | ref (many) | Required attributes (INNER JOIN) |
+| `:db.view/optional-attributes` | ref (many) | Optional attributes (LEFT JOIN) |
+
+```
+[view/1, :db.view/ident,      "persons",            tx/1, null]
+[view/1, :db.view/doc,        "Person entities",   tx/1, null]
+[view/1, :db.view/attributes, attr/person-name,    tx/1, null]
+[view/1, :db.view/attributes, attr/person-email,   tx/1, null]
+```
+
+## Schema Evolution
+
+Attributes can be added at any time. Modifications to existing attributes require migrations:
+
+### Safe Changes (no migration needed)
+- Adding new attributes
+- Adding new views
+- Changing `:db/doc`
+
+### Changes Requiring Migration
+- Changing `:db/valueType` (requires data conversion)
+- Changing `:db/cardinality` from many to one (requires picking one value)
+- Changing `:db/unique` (requires uniqueness validation)
+
+### Removing Attributes
+
+Attributes are never truly removed—they can be marked deprecated. Existing datoms remain queryable for historical analysis.
+
+## Regenerating Views
+
+Views auto-regenerate when you use the `defineView`, `updateView`, or `deleteView` API methods. For manual regeneration:
+
+```sql
+CALL mnemonic_regenerate_views();
+```
+
+This procedure:
+1. Queries all view entities and their attributes
+2. Drops existing projection views
+3. Creates new views with appropriate columns and joins
+4. Creates `INSTEAD OF` triggers for INSERT/UPDATE/DELETE
+
+This enables runtime schema changes: add a new attribute to a view definition, and the view is updated automatically.

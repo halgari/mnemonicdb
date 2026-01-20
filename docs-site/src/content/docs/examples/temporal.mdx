@@ -1,0 +1,173 @@
+---
+title: Temporal Queries
+description: Interactive examples of querying data at different points in time
+---
+
+import LiveExample from '../../../components/LiveExample.astro';
+
+MnemonicDB preserves complete history. Let's explore how to query data as it existed at any point in time.
+
+## Setup: Create Schema and Data
+
+First, let's set up a schema and create some data with multiple changes:
+
+<LiveExample
+  title="Setup Schema and Initial Data"
+  code={`-- Create person attributes
+INSERT INTO attr_db_ident (e, a, v_data, tx, retracted_by)
+VALUES (300, 1, '"person/name"', 0, NULL);
+INSERT INTO attr_db_valuetype (e, a, v_data, tx, retracted_by)
+VALUES (300, 2, '100', 0, NULL);
+INSERT INTO attr_db_cardinality (e, a, v_data, tx, retracted_by)
+VALUES (300, 3, '200', 0, NULL);
+CALL mnemonic_create_attr_table(300, 'person/name', 'db.type/text');
+
+INSERT INTO attr_db_ident (e, a, v_data, tx, retracted_by)
+VALUES (301, 1, '"person/title"', 0, NULL);
+INSERT INTO attr_db_valuetype (e, a, v_data, tx, retracted_by)
+VALUES (301, 2, '100', 0, NULL);
+INSERT INTO attr_db_cardinality (e, a, v_data, tx, retracted_by)
+VALUES (301, 3, '200', 0, NULL);
+CALL mnemonic_create_attr_table(301, 'person/title', 'db.type/text');
+
+-- Create view
+INSERT INTO mnemonic_defined_views (name, attributes, optional_attributes, doc)
+VALUES ('persons', ARRAY['person/name'], ARRAY['person/title'], 'Person entities');
+
+-- Insert initial data
+INSERT INTO persons (name, title) VALUES ('Alice', 'Developer');
+
+SELECT 'Schema created' as status`}
+/>
+
+## Make Changes Over Time
+
+Now let's make several changes to create some history:
+
+<LiveExample
+  title="Make Multiple Changes"
+  code={`-- Get Alice's ID
+SELECT id FROM persons WHERE name = 'Alice';
+
+-- Promote Alice to Senior Developer
+UPDATE persons SET title = 'Senior Developer' WHERE name = 'Alice';
+
+-- Add another person
+INSERT INTO persons (name, title) VALUES ('Bob', 'Manager');
+
+-- Promote Alice again
+UPDATE persons SET title = 'Tech Lead' WHERE name = 'Alice';
+
+-- See current state
+SELECT * FROM persons ORDER BY name`}
+/>
+
+## Viewing Transaction History
+
+Let's see what transactions were created:
+
+<LiveExample
+  title="View Transactions"
+  code={`-- See recent transactions
+SELECT id, tx_instant
+FROM transactions
+ORDER BY id DESC
+LIMIT 10`}
+/>
+
+## Viewing Entity History
+
+See all historical values for an entity:
+
+<LiveExample
+  title="View Alice's History"
+  code={`-- Get Alice's entity ID first
+-- Then see all title changes
+SELECT
+  p.v AS title,
+  p.tx AS asserted_in_tx,
+  p.retracted_by AS retracted_in_tx,
+  t1.tx_instant AS asserted_at,
+  t2.tx_instant AS retracted_at
+FROM attr_person_title p
+JOIN attr_person_name n ON p.e = n.e AND n.retracted_by IS NULL
+LEFT JOIN transactions t1 ON p.tx = t1.id
+LEFT JOIN transactions t2 ON p.retracted_by = t2.id
+WHERE n.v = 'Alice'
+ORDER BY p.tx`}
+/>
+
+## As-Of Queries
+
+Query the database as it existed at a specific transaction:
+
+<LiveExample
+  title="As-Of Query Setup"
+  code={`-- First, find an early transaction
+SELECT id, tx_instant
+FROM transactions
+WHERE id > 0
+ORDER BY id
+LIMIT 5`}
+/>
+
+<LiveExample
+  title="Query Historical State"
+  code={`-- Set the as-of context (use a transaction ID from above)
+-- This queries the _history view with temporal filtering
+SELECT set_config('mnemonic.as_of_tx', '281474976710657', true);
+
+-- Query through the dispatching view
+SELECT * FROM persons ORDER BY name`}
+/>
+
+<LiveExample
+  title="Return to Current State"
+  code={`-- Clear the as-of context
+SELECT set_config('mnemonic.as_of_tx', '', true);
+
+-- Query current state
+SELECT * FROM persons ORDER BY name`}
+/>
+
+## Comparing Points in Time
+
+Compare data between two transactions:
+
+<LiveExample
+  title="Compare Historical States"
+  code={`-- Get transaction IDs
+SELECT id, tx_instant FROM transactions ORDER BY id;
+
+-- This example shows the concept - in practice you'd use
+-- specific transaction IDs from your history`}
+/>
+
+## Complete History Dump
+
+See all datoms for comprehensive history:
+
+<LiveExample
+  title="All Historical Datoms"
+  code={`-- See all datoms with full history
+SELECT
+  d.e AS entity,
+  d.a AS attribute_id,
+  d.v_data AS value,
+  d.tx AS asserted_tx,
+  d.retracted_by,
+  CASE WHEN d.retracted_by IS NULL THEN 'current' ELSE 'retracted' END AS status
+FROM datoms d
+WHERE d.e > 100  -- Skip system entities
+ORDER BY d.e, d.tx`}
+/>
+
+## Key Takeaways
+
+1. **Complete history**: Every change is preserved with transaction IDs
+2. **As-of queries**: Set `mnemonic.as_of_tx` to view historical state
+3. **Dual views**: `_current` for fast queries, `_history` for temporal
+4. **Transaction timestamps**: Each transaction has a timestamp for time-based lookups
+5. **Entity history**: Query attribute tables directly to see all historical values
+
+The immutable design means you can always reconstruct the exact state at any point in time.

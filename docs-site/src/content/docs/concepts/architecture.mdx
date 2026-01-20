@@ -1,0 +1,241 @@
+---
+title: Architecture
+description: Physical storage layout, indexing strategy, and stored procedures
+---
+
+This document describes MnemonicDB's physical storage layout, indexing strategy, and stored procedures.
+
+## Table Structure
+
+### Unified Datoms Table
+
+MnemonicDB uses a unified JSONB storage with per-attribute inherited tables:
+
+```sql
+-- Parent table for all datoms
+CREATE TABLE datoms (
+  e            BIGINT NOT NULL,      -- Entity ID
+  a            BIGINT NOT NULL,      -- Attribute ID
+  v_data       JSONB NOT NULL,       -- Value (JSONB)
+  tx           BIGINT NOT NULL,      -- Transaction ID (assertion)
+  retracted_by BIGINT,               -- Transaction ID (retraction) or NULL
+  CONSTRAINT datoms_pk PRIMARY KEY (e, a, v_data, tx)
+);
+```
+
+### Per-Attribute Tables
+
+Each attribute gets an inherited table with a typed `v` column:
+
+```sql
+-- Example: person/name attribute (text)
+CREATE TABLE attr_person_name (
+  v TEXT GENERATED ALWAYS AS ((v_data #>> '{}')) STORED,
+  CHECK (a = 300)  -- attribute ID
+) INHERITS (datoms);
+
+-- Example: person/age attribute (integer)
+CREATE TABLE attr_person_age (
+  v INTEGER GENERATED ALWAYS AS ((v_data #>> '{}')::integer) STORED,
+  CHECK (a = 301)
+) INHERITS (datoms);
+```
+
+This architecture provides:
+- Type-safe queries on the generated `v` column
+- Efficient indexes per attribute
+- Unified querying via the parent `datoms` table when needed
+
+### Transactions Table
+
+```sql
+CREATE TABLE transactions (
+  id          BIGINT PRIMARY KEY,   -- Transaction ID (from :db.part/tx partition)
+  tx_instant  TIMESTAMPTZ NOT NULL  -- When transaction was committed
+);
+```
+
+Transaction metadata (user, reason, etc.) can be stored as datoms referencing the transaction entity.
+
+### Entity Allocation
+
+```sql
+CREATE TABLE partitions (
+  id          INTEGER PRIMARY KEY,  -- Partition ID (encoded in high bits)
+  ident       TEXT UNIQUE NOT NULL, -- e.g., 'db', 'tx', 'user'
+  next_id     BIGINT NOT NULL       -- Next available entity ID
+);
+```
+
+Partitions:
+- **db (0)**: System schema entities
+- **tx (1)**: Transaction entities
+- **user (2)**: Application data
+
+## Indexes
+
+### Per-Attribute Indexes
+
+Each attribute table has optimized indexes:
+
+```sql
+-- Value lookup (for finding entities by attribute value)
+CREATE INDEX attr_person_name_v ON attr_person_name (v)
+  WHERE retracted_by IS NULL;
+
+-- Entity lookup (for view generation)
+CREATE INDEX attr_person_name_e ON attr_person_name (e)
+  WHERE retracted_by IS NULL;
+
+-- Reverse reference lookup (for ref types only)
+CREATE INDEX attr_person_dept_vaet ON attr_person_department (v, e)
+  WHERE retracted_by IS NULL;
+```
+
+The partial index (`WHERE retracted_by IS NULL`) keeps indexes small by excluding historical data.
+
+### Parent Table Indexes
+
+```sql
+CREATE INDEX datoms_e ON datoms (e) WHERE retracted_by IS NULL;
+CREATE INDEX datoms_tx ON datoms (tx);
+```
+
+## Stored Procedures
+
+### Core Functions
+
+#### `mnemonic_allocate_entity(partition_ident TEXT) -> BIGINT`
+
+Allocates a new entity ID from the specified partition:
+
+```sql
+SELECT mnemonic_allocate_entity('user');
+-- Returns: 562949953421313 (0x0002_0000_0000_0001)
+```
+
+The partition ID is encoded in the high 16 bits.
+
+#### `mnemonic_new_transaction() -> BIGINT`
+
+Creates a new transaction and returns its ID:
+
+```sql
+SELECT mnemonic_new_transaction();
+-- Returns: 281474976710657 (0x0001_0000_0000_0001)
+```
+
+#### `mnemonic_attr_id(ident TEXT) -> BIGINT`
+
+Returns the entity ID for an attribute by its ident:
+
+```sql
+SELECT mnemonic_attr_id('person/name');
+-- Returns: 300
+```
+
+### Temporal Functions
+
+#### `mnemonic_set_as_of(tx_id BIGINT)`
+
+Sets the temporal context for subsequent queries:
+
+```sql
+SELECT mnemonic_set_as_of(500);
+-- Now all view queries will show data as-of transaction 500
+
+SELECT mnemonic_set_as_of(NULL);
+-- Return to current state
+```
+
+#### `mnemonic_get_as_of() -> BIGINT`
+
+Returns the current temporal context:
+
+```sql
+SELECT mnemonic_get_as_of();
+-- Returns: 500 (if set) or NULL (current state)
+```
+
+#### `mnemonic_datom_visible(tx, retracted_by) -> BOOLEAN`
+
+Checks if a datom is visible in the current temporal context:
+
+```sql
+-- Used internally by _history views
+WHERE mnemonic_datom_visible(d.tx, d.retracted_by)
+```
+
+### View Generation
+
+#### `mnemonic_regenerate_view(view_name TEXT)`
+
+Regenerates a single view:
+
+```sql
+CALL mnemonic_regenerate_view('persons');
+```
+
+Creates three views:
+- `persons_current` - Optimized for current state
+- `persons_history` - Supports temporal queries
+- `persons` - Dispatches to appropriate variant
+
+#### `mnemonic_regenerate_views()`
+
+Regenerates all views:
+
+```sql
+CALL mnemonic_regenerate_views();
+```
+
+## Bootstrap Schema
+
+System attributes are defined at database initialization:
+
+| Entity ID | Ident | Purpose |
+|-----------|-------|---------|
+| 1 | db/ident | Attribute identifier |
+| 2 | db/valueType | Value type reference |
+| 3 | db/cardinality | Cardinality reference |
+| 4 | db/unique | Uniqueness constraint |
+| 5 | db/doc | Documentation |
+| 10 | db.view/ident | View name |
+| 11 | db.view/attributes | Required view attributes |
+| 12 | db.view/doc | View documentation |
+| 13 | db.view/optional-attributes | Optional view attributes |
+| 100-112 | db.type/* | Value type entities |
+| 200-201 | db.cardinality/* | Cardinality entities |
+| 210-211 | db.unique/* | Uniqueness entities |
+
+## Query Planner Optimization
+
+MnemonicDB configures PostgreSQL for optimal performance:
+
+```sql
+SET random_page_cost = 1.1;  -- Favor index scans
+SET enable_bitmapscan = off; -- Prefer index scans over bitmap scans
+```
+
+These settings help the query planner choose efficient access paths for the view joins.
+
+## Performance Verification
+
+To verify query planner behavior:
+
+```sql
+-- Check query plan for view access
+EXPLAIN ANALYZE SELECT * FROM persons WHERE id = 12345;
+
+-- Check query plan for value lookup
+EXPLAIN ANALYZE SELECT * FROM persons WHERE email = 'test@example.com';
+
+-- Check query plan for temporal query
+SET mnemonic.as_of_tx = '500';
+EXPLAIN ANALYZE SELECT * FROM persons;
+```
+
+Key things to verify:
+- Index scans (not sequential scans) on attribute tables
+- Efficient join strategies for view projections
+- Reasonable row estimates from the planner

@@ -1,0 +1,383 @@
+---
+title: MnemonicDB Class
+description: Complete reference for the MnemonicDB class
+---
+
+The `MnemonicDB` class is the main interface for interacting with the database. It provides methods for schema definition, querying, and temporal operations.
+
+## Constructor
+
+```typescript
+class MnemonicDB {
+  constructor(public readonly db: PGlite)
+}
+```
+
+The constructor takes a PGLite instance. Use the factory functions to create properly initialized instances:
+
+```typescript
+// Recommended: use factory functions
+const db = await createMnemonicDB();        // In-memory
+const db = await createMnemonicDB('./data'); // Persistent
+const db = await openMnemonicDB('./data');   // Open existing
+```
+
+## Properties
+
+### `db: PGlite`
+
+The underlying PGLite instance. Provides direct access to PGLite features when needed.
+
+```typescript
+// Direct PGLite access
+const result = await db.db.query('SELECT 1');
+```
+
+## Query Methods
+
+### `query<T>(sql, params?)`
+
+Execute a SQL query and return results.
+
+```typescript
+async query<T = unknown>(sql: string, params?: unknown[]): Promise<T[]>
+```
+
+**Parameters:**
+- `sql` - SQL query string
+- `params` - Optional array of parameters (use `$1`, `$2`, etc. in query)
+
+**Returns:** Array of row objects
+
+**Example:**
+```typescript
+interface Person {
+  id: string;
+  name: string;
+  age: number;
+}
+
+const persons = await db.query<Person>('SELECT * FROM persons');
+const alice = await db.query<Person>(
+  'SELECT * FROM persons WHERE name = $1',
+  ['Alice']
+);
+```
+
+### `queryAsOf<T>(sql, params, asOf)`
+
+Execute a query at a specific point in time. Safe for concurrent use.
+
+```typescript
+async queryAsOf<T = unknown>(
+  sql: string,
+  params: unknown[] = [],
+  asOf: bigint | null
+): Promise<T[]>
+```
+
+**Parameters:**
+- `sql` - SQL query string
+- `params` - Query parameters
+- `asOf` - Transaction ID to query as-of, or `null` for current state
+
+**Returns:** Array of row objects
+
+**Example:**
+```typescript
+// Query current state
+const current = await db.queryAsOf('SELECT * FROM persons', [], null);
+
+// Query historical state
+const historical = await db.queryAsOf(
+  'SELECT * FROM persons WHERE id = $1',
+  [personId],
+  500n
+);
+```
+
+### `exec(sql)`
+
+Execute raw SQL statements (for mutations).
+
+```typescript
+async exec(sql: string): Promise<void>
+```
+
+**Parameters:**
+- `sql` - SQL statement(s) to execute
+
+**Example:**
+```typescript
+await db.exec("INSERT INTO persons (name, age) VALUES ('Bob', 25)");
+await db.exec(`
+  UPDATE persons SET age = 26 WHERE name = 'Bob';
+  DELETE FROM persons WHERE age > 100;
+`);
+```
+
+## Transaction Methods
+
+### `newTransaction()`
+
+Create a new transaction and return its ID.
+
+```typescript
+async newTransaction(): Promise<bigint>
+```
+
+**Returns:** Transaction ID (bigint)
+
+**Example:**
+```typescript
+const txId = await db.newTransaction();
+console.log(`Created transaction: ${txId}`);
+```
+
+### `allocateEntity(partition?)`
+
+Allocate a new entity ID from a partition.
+
+```typescript
+async allocateEntity(partition: string = 'user'): Promise<bigint>
+```
+
+**Parameters:**
+- `partition` - Partition name (`'db'`, `'tx'`, or `'user'`)
+
+**Returns:** Entity ID (bigint)
+
+**Example:**
+```typescript
+const entityId = await db.allocateEntity('user');
+console.log(`New entity: ${entityId}`);
+```
+
+## Schema Methods
+
+### `defineAttribute(attr)`
+
+Define a new attribute in the schema.
+
+```typescript
+async defineAttribute(attr: AttributeDefinition): Promise<bigint>
+```
+
+**Parameters:**
+- `attr` - Attribute definition object
+
+**Returns:** Attribute entity ID
+
+**Example:**
+```typescript
+const attrId = await db.defineAttribute({
+  ident: 'person/email',
+  valueType: 'db.type/text',
+  cardinality: 'db.cardinality/one',
+  unique: 'db.unique/identity',
+  doc: 'Person email address',
+});
+```
+
+### `defineView(view)`
+
+Define a new view in the schema. Automatically creates the SQL view.
+
+```typescript
+async defineView(view: ViewDefinition): Promise<bigint>
+```
+
+**Parameters:**
+- `view` - View definition object
+
+**Returns:** View entity ID
+
+**Example:**
+```typescript
+const viewId = await db.defineView({
+  name: 'persons',
+  attributes: ['person/name', 'person/email'],
+  optionalAttributes: ['person/age', 'person/bio'],
+  doc: 'Person entities',
+});
+```
+
+### `updateView(name, view)`
+
+Update an existing view definition. Automatically regenerates the SQL view.
+
+```typescript
+async updateView(name: string, view: Partial<ViewDefinition>): Promise<void>
+```
+
+**Parameters:**
+- `name` - Current view name
+- `view` - Partial view definition with fields to update
+
+**Example:**
+```typescript
+await db.updateView('persons', {
+  attributes: ['person/name', 'person/email', 'person/phone'],
+});
+```
+
+### `deleteView(name)`
+
+Delete a view definition. Automatically drops the SQL view.
+
+```typescript
+async deleteView(name: string): Promise<void>
+```
+
+**Parameters:**
+- `name` - View name to delete
+
+**Example:**
+```typescript
+await db.deleteView('persons');
+```
+
+### `regenerateViews()`
+
+Manually regenerate all projection views from schema definitions.
+
+```typescript
+async regenerateViews(): Promise<void>
+```
+
+**Example:**
+```typescript
+await db.regenerateViews();
+```
+
+## Schema Query Methods
+
+### `attrId(ident)`
+
+Get the entity ID for an attribute by its ident.
+
+```typescript
+async attrId(ident: string): Promise<bigint | null>
+```
+
+**Parameters:**
+- `ident` - Attribute identifier (e.g., `'person/name'`)
+
+**Returns:** Entity ID or `null` if not found
+
+**Example:**
+```typescript
+const id = await db.attrId('person/name');
+if (id) {
+  console.log(`person/name has ID: ${id}`);
+}
+```
+
+### `listAttributes()`
+
+List all user-defined attributes.
+
+```typescript
+async listAttributes(): Promise<AttributeInfo[]>
+```
+
+**Returns:** Array of attribute metadata objects
+
+**Example:**
+```typescript
+const attrs = await db.listAttributes();
+for (const attr of attrs) {
+  console.log(`${attr.ident}: ${attr.value_type}`);
+}
+```
+
+### `listViews()`
+
+List all defined views.
+
+```typescript
+async listViews(): Promise<ViewInfo[]>
+```
+
+**Returns:** Array of view metadata objects
+
+**Example:**
+```typescript
+const views = await db.listViews();
+for (const view of views) {
+  console.log(`View: ${view.name}`);
+}
+```
+
+## Temporal Methods
+
+### `setAsOf(txId)`
+
+Set the as-of transaction for temporal queries.
+
+```typescript
+async setAsOf(txId: bigint | null): Promise<void>
+```
+
+**Parameters:**
+- `txId` - Transaction ID, or `null` for current state
+
+**Example:**
+```typescript
+await db.setAsOf(500n);
+const historical = await db.query('SELECT * FROM persons');
+await db.setAsOf(null);  // Return to current state
+```
+
+### `getAsOf()`
+
+Get the current as-of transaction.
+
+```typescript
+async getAsOf(): Promise<bigint | null>
+```
+
+**Returns:** Current as-of transaction ID, or `null` if viewing current state
+
+**Example:**
+```typescript
+const asOf = await db.getAsOf();
+console.log(asOf ? `Viewing as-of: ${asOf}` : 'Viewing current state');
+```
+
+### `withAsOf<T>(txId, fn)`
+
+Execute a function with a specific as-of context, then restore the previous context.
+
+```typescript
+async withAsOf<T>(txId: bigint | null, fn: () => Promise<T>): Promise<T>
+```
+
+**Parameters:**
+- `txId` - Transaction ID for the context
+- `fn` - Async function to execute
+
+**Returns:** Result of the function
+
+**Example:**
+```typescript
+const historicalPersons = await db.withAsOf(500n, async () => {
+  return db.query('SELECT * FROM persons');
+});
+// Context is automatically restored
+```
+
+## Lifecycle Methods
+
+### `close()`
+
+Close the database connection.
+
+```typescript
+async close(): Promise<void>
+```
+
+**Example:**
+```typescript
+await db.close();
+```
