@@ -1,0 +1,37 @@
+{
+  "name": "mnemonicdb",
+  "version": "0.1.0",
+  "description": "Immutable temporal tuplestore built on pglite",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest",
+    "lint": "eslint src/"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^2.0.0"
+  },
+  "keywords": [
+    "database",
+    "pglite",
+    "immutable",
+    "temporal",
+    "datomic",
+    "tuplestore"
+  ],
+  "license": "MIT"
+}

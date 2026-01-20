@@ -1,0 +1,64 @@
+# MnemonicDB Overview
+
+MnemonicDB is an immutable temporal tuplestore built on [pglite](https://pglite.dev/), bringing Datomic-style semantics to embedded PostgreSQL. It combines the power of immutable, time-aware data with the ubiquity of SQL.
+
+## Why MnemonicDB?
+
+**Immutability by default**: Every change is recorded as a new fact. Data is never overwritten or deleted—only new facts are asserted or existing facts are retracted. This provides a complete audit trail and enables powerful temporal queries.
+
+**SQL-native**: Unlike Datomic's Datalog, MnemonicDB exposes data through standard SQL views. This means compatibility with existing ORMs (Drizzle, Prisma, Kysely), query builders, and reactive libraries like TanStack Query.
+
+**Embedded**: Built on pglite, MnemonicDB runs in-process—in Node.js, Bun, or the browser. No separate database server required, with persistence to filesystem or IndexedDB.
+
+**Self-describing**: The schema itself is stored as data within the database. Views, attributes, and their relationships are all queryable datoms, and projection views are generated dynamically via stored procedures.
+
+## Core Concepts
+
+### Datoms
+
+The fundamental unit of data is the **datom** (data atom): a 5-tuple of `[Entity, Attribute, Value, Transaction, RetractedBy]`.
+
+- **Entity**: A unique identifier for a thing (encoded with partition in high bits)
+- **Attribute**: What property is being described (itself an entity)
+- **Value**: The value of that property (stored in type-specific tables)
+- **Transaction**: The transaction ID when this fact was asserted
+- **RetractedBy**: The transaction ID when this fact was retracted (null if current)
+
+### Facts, Not Places
+
+Traditional databases update values "in place." MnemonicDB treats data as an accumulation of facts over time:
+
+```
+[person/1, :person/name, "Bob",    tx/100, null]    # Current name is Bob
+[person/1, :person/name, "Robert", tx/50,  tx/100]  # Was Robert, retracted at tx/100
+```
+
+### Projection Views
+
+While datoms are the storage format, most applications work with **projection views**—SQL views that present entity data in familiar tabular form:
+
+```sql
+SELECT * FROM persons;
+-- id | name  | email           | department
+-- 1  | Bob   | bob@example.com | 5
+```
+
+These views support INSERT, UPDATE, and DELETE via `INSTEAD OF` triggers that translate operations into datom assertions and retractions.
+
+## Design Goals
+
+1. **ORM Compatibility**: Views should look like regular tables. Drizzle, Prisma, and other ORMs should work without modification.
+
+2. **Reactive Queries**: Full compatibility with TanStack Query's reactive/incremental update patterns.
+
+3. **Temporal Queries**: Easy "as-of" queries to see data at any point in time.
+
+4. **Schema as Data**: Attributes and views are themselves stored as datoms, queryable and modifiable at runtime.
+
+5. **SQL-First**: Minimize abstraction layers. The database does the heavy lifting. Use any migration tool you prefer, and let ORMs introspect the generated views.
+
+## What MnemonicDB Is Not
+
+- **Not a distributed database**: It's embedded, single-process
+- **Not a Datalog engine**: Queries are SQL, not Datalog
+- **Not bitemporal**: Only transaction time is tracked, not valid time
