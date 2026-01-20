@@ -13,7 +13,10 @@ Start with a simple person schema:
 
 <LiveExample
   title="Create Initial Schema"
-  code={`-- Create person/name attribute using the admin view
+  code={`-- Start a transaction
+CALL mnemonic_begin_tx();
+
+-- Create person/name attribute using the admin view
 INSERT INTO mnemonic_defined_attributes (ident, value_type, cardinality)
 VALUES ('person/name', 'db.type/text', 'db.cardinality/one');
 
@@ -28,6 +31,9 @@ VALUES ('persons', ARRAY['person/name', 'person/email'], '{}', 'Person entities'
 -- Add some data
 INSERT INTO persons (name, email) VALUES ('Alice', 'alice@example.com');
 INSERT INTO persons (name, email) VALUES ('Bob', 'bob@example.com');
+
+-- Commit the transaction
+CALL mnemonic_commit_tx();
 
 -- View schema and data
 SELECT * FROM mnemonic_defined_attributes WHERE ident LIKE 'person/%'`}
@@ -46,9 +52,15 @@ Business requirements change—we need to track phone numbers:
 
 <LiveExample
   title="Add Phone Attribute"
-  code={`-- Create person/phone attribute using the admin view
+  code={`-- Start a transaction
+CALL mnemonic_begin_tx();
+
+-- Create person/phone attribute using the admin view
 INSERT INTO mnemonic_defined_attributes (ident, value_type, cardinality)
 VALUES ('person/phone', 'db.type/text', 'db.cardinality/one');
+
+-- Commit the transaction
+CALL mnemonic_commit_tx();
 
 -- Verify attribute was created
 SELECT * FROM mnemonic_defined_attributes WHERE ident = 'person/phone'`}
@@ -60,10 +72,16 @@ Now update the view to include the new attribute as optional:
 
 <LiveExample
   title="Update Persons View"
-  code={`-- Update the view to include phone as optional
+  code={`-- Start a transaction
+CALL mnemonic_begin_tx();
+
+-- Update the view to include phone as optional
 UPDATE mnemonic_defined_views
 SET optional_attributes = ARRAY['person/phone']
 WHERE name = 'persons';
+
+-- Commit the transaction
+CALL mnemonic_commit_tx();
 
 -- View is automatically regenerated!
 -- Existing data still works
@@ -74,8 +92,14 @@ SELECT * FROM persons ORDER BY name`}
 
 <LiveExample
   title="Add Phone Numbers"
-  code={`-- Add phone number to Alice
+  code={`-- Start a transaction
+CALL mnemonic_begin_tx();
+
+-- Add phone number to Alice
 UPDATE persons SET phone = '555-1234' WHERE name = 'Alice';
+
+-- Commit the transaction
+CALL mnemonic_commit_tx();
 
 -- View all data
 SELECT * FROM persons ORDER BY name`}
@@ -87,7 +111,10 @@ What if we want a new required attribute? We need to provide values for existing
 
 <LiveExample
   title="Add Required Attribute"
-  code={`-- Create person/status attribute using the admin view
+  code={`-- Start a transaction
+CALL mnemonic_begin_tx();
+
+-- Create person/status attribute using the admin view
 INSERT INTO mnemonic_defined_attributes (ident, value_type, cardinality)
 VALUES ('person/status', 'db.type/text', 'db.cardinality/one');
 
@@ -99,6 +126,9 @@ WHERE name = 'persons';
 -- Backfill existing entities with a default status
 UPDATE persons SET status = 'active';
 
+-- Commit the transaction
+CALL mnemonic_commit_tx();
+
 SELECT * FROM persons ORDER BY name`}
 />
 
@@ -108,12 +138,18 @@ Now that all entities have the attribute, we can make it required:
 
 <LiveExample
   title="Promote to Required"
-  code={`-- Move status from optional to required
+  code={`-- Start a transaction
+CALL mnemonic_begin_tx();
+
+-- Move status from optional to required
 UPDATE mnemonic_defined_views
 SET
   attributes = ARRAY['person/name', 'person/email', 'person/status'],
   optional_attributes = ARRAY['person/phone']
 WHERE name = 'persons';
+
+-- Commit the transaction
+CALL mnemonic_commit_tx();
 
 -- Data still intact
 SELECT * FROM persons ORDER BY name`}
@@ -125,7 +161,10 @@ Create a specialized view for a different use case:
 
 <LiveExample
   title="Create Contact View"
-  code={`-- Create a contacts view with just communication info
+  code={`-- Start a transaction
+CALL mnemonic_begin_tx();
+
+-- Create a contacts view with just communication info
 INSERT INTO mnemonic_defined_views (name, attributes, optional_attributes, doc)
 VALUES (
   'contacts',
@@ -133,6 +172,9 @@ VALUES (
   ARRAY['person/phone'],
   'Contact information for persons'
 );
+
+-- Commit the transaction
+CALL mnemonic_commit_tx();
 
 -- Same data, different projection
 SELECT * FROM contacts ORDER BY name`}
@@ -157,8 +199,14 @@ Views can be removed without affecting underlying data:
 
 <LiveExample
   title="Delete a View"
-  code={`-- Delete the contacts view
+  code={`-- Start a transaction
+CALL mnemonic_begin_tx();
+
+-- Delete the contacts view
 DELETE FROM mnemonic_defined_views WHERE name = 'contacts';
+
+-- Commit the transaction
+CALL mnemonic_commit_tx();
 
 -- Data still accessible through persons view
 SELECT * FROM persons ORDER BY name`}

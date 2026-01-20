@@ -31,6 +31,8 @@ function randomBirthYear() {
   return 1950 + Math.floor(Math.random() * 60); // 1950-2009
 }
 
+const BATCH_SIZE = 1000; // Rows per transaction
+
 async function benchmark() {
   console.log("=".repeat(60));
   console.log("MnemonicDB Benchmark");
@@ -42,55 +44,65 @@ async function benchmark() {
   let start = performance.now();
   const db = await createMnemonicDB();
 
-  // Define schema
-  await db.defineAttribute({
-    ident: "user/name",
-    valueType: "db.type/text",
-    cardinality: "db.cardinality/one",
-  });
-  await db.defineAttribute({
-    ident: "user/email",
-    valueType: "db.type/text",
-    cardinality: "db.cardinality/one",
-  });
-  await db.defineAttribute({
-    ident: "user/birth-year",
-    valueType: "db.type/int4",
-    cardinality: "db.cardinality/one",
-  });
+  // Define schema (wrapped in transaction)
+  await db.withTransaction(async () => {
+    await db.defineAttribute({
+      ident: "user/name",
+      valueType: "db.type/text",
+      cardinality: "db.cardinality/one",
+    });
+    await db.defineAttribute({
+      ident: "user/email",
+      valueType: "db.type/text",
+      cardinality: "db.cardinality/one",
+    });
+    await db.defineAttribute({
+      ident: "user/birth-year",
+      valueType: "db.type/int4",
+      cardinality: "db.cardinality/one",
+    });
 
-  await db.defineView({
-    name: "users",
-    attributes: ["user/name", "user/email", "user/birth-year"],
+    await db.defineView({
+      name: "users",
+      attributes: ["user/name", "user/email", "user/birth-year"],
+    });
   });
 
   console.log(`Schema setup: ${(performance.now() - start).toFixed(2)}ms`);
   console.log();
 
-  // Insert users
-  console.log(`Inserting ${NUM_USERS.toLocaleString()} users...`);
+  // Insert users (batched in transactions)
+  console.log(`Inserting ${NUM_USERS.toLocaleString()} users (batch size: ${BATCH_SIZE})...`);
   start = performance.now();
 
   const userIds = [];
   const userNames = [];
 
-  for (let i = 0; i < NUM_USERS; i++) {
-    const name = randomName();
-    const email = randomEmail(name, i);
-    const birthYear = randomBirthYear();
+  for (let i = 0; i < NUM_USERS; i += BATCH_SIZE) {
+    const batchEnd = Math.min(i + BATCH_SIZE, NUM_USERS);
 
-    userNames.push(name);
+    await db.beginTransaction();
 
-    const result = await db.query(
-      `INSERT INTO users (name, email, birth_year) VALUES ($1, $2, $3) RETURNING id`,
-      [name, email, birthYear]
-    );
-    userIds.push(result[0].id);
+    for (let j = i; j < batchEnd; j++) {
+      const name = randomName();
+      const email = randomEmail(name, j);
+      const birthYear = randomBirthYear();
 
-    if ((i + 1) % 5000 === 0) {
+      userNames.push(name);
+
+      const result = await db.query(
+        `INSERT INTO users (name, email, birth_year) VALUES ($1, $2, $3) RETURNING id`,
+        [name, email, birthYear]
+      );
+      userIds.push(result[0].id);
+    }
+
+    await db.commitTransaction();
+
+    if (batchEnd % 5000 === 0 || batchEnd === NUM_USERS) {
       const elapsed = performance.now() - start;
-      const rate = (i + 1) / (elapsed / 1000);
-      console.log(`  ${i + 1} inserted (${rate.toFixed(0)} rows/sec)`);
+      const rate = batchEnd / (elapsed / 1000);
+      console.log(`  ${batchEnd} inserted (${rate.toFixed(0)} rows/sec)`);
     }
   }
 

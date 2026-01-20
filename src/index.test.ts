@@ -86,6 +86,49 @@ describe("MnemonicDB", () => {
       );
       expect(txs.length).toBe(1);
     });
+
+    it("should begin and commit transactions", async () => {
+      await db.beginTransaction();
+
+      const inTx = await db.inTransaction();
+      expect(inTx).toBe(true);
+
+      await db.commitTransaction();
+
+      const afterCommit = await db.inTransaction();
+      expect(afterCommit).toBe(false);
+    });
+
+    it("should throw when beginning transaction while one is active", async () => {
+      await db.beginTransaction();
+      await expect(db.beginTransaction()).rejects.toThrow(/Transaction already active/);
+      await db.commitTransaction();
+    });
+
+    it("should throw when committing without active transaction", async () => {
+      await expect(db.commitTransaction()).rejects.toThrow(/No active MnemonicDB transaction/);
+    });
+
+    it("should execute withTransaction and commit on success", async () => {
+      const result = await db.withTransaction(async () => {
+        const inTx = await db.inTransaction();
+        expect(inTx).toBe(true);
+        return "success";
+      });
+
+      expect(result).toBe("success");
+      expect(await db.inTransaction()).toBe(false);
+    });
+
+    it("should clear transaction context on withTransaction error", async () => {
+      await expect(
+        db.withTransaction(async () => {
+          throw new Error("test error");
+        })
+      ).rejects.toThrow("test error");
+
+      expect(await db.inTransaction()).toBe(false);
+    });
   });
 
   describe("schema introspection", () => {
@@ -101,10 +144,12 @@ describe("MnemonicDB", () => {
 
   describe("attribute definition", () => {
     it("should define a new attribute", async () => {
-      await db.defineAttribute({
-        ident: "person/name",
-        valueType: "db.type/text",
-        cardinality: "db.cardinality/one",
+      await db.withTransaction(async () => {
+        await db.defineAttribute({
+          ident: "person/name",
+          valueType: "db.type/text",
+          cardinality: "db.cardinality/one",
+        });
       });
 
       const attrId = await db.attrId("person/name");
@@ -118,38 +163,52 @@ describe("MnemonicDB", () => {
     });
 
     it("should define attribute with uniqueness", async () => {
-      await db.defineAttribute({
-        ident: "person/email",
-        valueType: "db.type/text",
-        cardinality: "db.cardinality/one",
-        unique: "db.unique/identity",
+      await db.withTransaction(async () => {
+        await db.defineAttribute({
+          ident: "person/email",
+          valueType: "db.type/text",
+          cardinality: "db.cardinality/one",
+          unique: "db.unique/identity",
+        });
       });
 
       const attrs = await db.listAttributes();
       const email = attrs.find((a) => a.ident === "person/email");
       expect(email?.unique_constraint).toBe("db.unique/identity");
     });
+
+    it("should throw when defining attribute without active transaction", async () => {
+      await expect(
+        db.defineAttribute({
+          ident: "person/name",
+          valueType: "db.type/text",
+          cardinality: "db.cardinality/one",
+        })
+      ).rejects.toThrow(/No active MnemonicDB transaction/);
+    });
   });
 
   describe("view definition", () => {
     it("should define a view with attributes and auto-create SQL view", async () => {
-      // Define attributes first
-      await db.defineAttribute({
-        ident: "person/name",
-        valueType: "db.type/text",
-        cardinality: "db.cardinality/one",
-      });
-      await db.defineAttribute({
-        ident: "person/age",
-        valueType: "db.type/int4",
-        cardinality: "db.cardinality/one",
-      });
+      await db.withTransaction(async () => {
+        // Define attributes first
+        await db.defineAttribute({
+          ident: "person/name",
+          valueType: "db.type/text",
+          cardinality: "db.cardinality/one",
+        });
+        await db.defineAttribute({
+          ident: "person/age",
+          valueType: "db.type/int4",
+          cardinality: "db.cardinality/one",
+        });
 
-      // Define view - SQL view should be created automatically
-      await db.defineView({
-        name: "persons",
-        attributes: ["person/name", "person/age"],
-        doc: "Person entities",
+        // Define view - SQL view should be created automatically
+        await db.defineView({
+          name: "persons",
+          attributes: ["person/name", "person/age"],
+          doc: "Person entities",
+        });
       });
 
       const views = await db.listViews();
@@ -172,34 +231,40 @@ describe("MnemonicDB", () => {
     });
 
     it("should update view definition and auto-regenerate SQL view", async () => {
-      await db.defineAttribute({
-        ident: "person/name",
-        valueType: "db.type/text",
-        cardinality: "db.cardinality/one",
-      });
-      await db.defineAttribute({
-        ident: "person/age",
-        valueType: "db.type/int4",
-        cardinality: "db.cardinality/one",
-      });
-      await db.defineAttribute({
-        ident: "person/email",
-        valueType: "db.type/text",
-        cardinality: "db.cardinality/one",
+      await db.withTransaction(async () => {
+        await db.defineAttribute({
+          ident: "person/name",
+          valueType: "db.type/text",
+          cardinality: "db.cardinality/one",
+        });
+        await db.defineAttribute({
+          ident: "person/age",
+          valueType: "db.type/int4",
+          cardinality: "db.cardinality/one",
+        });
+        await db.defineAttribute({
+          ident: "person/email",
+          valueType: "db.type/text",
+          cardinality: "db.cardinality/one",
+        });
+
+        // Create view with just name and age
+        await db.defineView({
+          name: "persons",
+          attributes: ["person/name", "person/age"],
+        });
       });
 
-      // Create view with just name and age
-      await db.defineView({
-        name: "persons",
-        attributes: ["person/name", "person/age"],
+      // Insert a person (separate transaction)
+      await db.withTransaction(async () => {
+        await db.exec("INSERT INTO persons (name, age) VALUES ('Test', 25)");
       });
 
-      // Insert a person
-      await db.exec("INSERT INTO persons (name, age) VALUES ('Test', 25)");
-
-      // Update view to add email column
-      await db.updateView("persons", {
-        attributes: ["person/name", "person/age", "person/email"],
+      // Update view to add email column (separate transaction)
+      await db.withTransaction(async () => {
+        await db.updateView("persons", {
+          attributes: ["person/name", "person/age", "person/email"],
+        });
       });
 
       // New column should exist
@@ -211,22 +276,26 @@ describe("MnemonicDB", () => {
     });
 
     it("should delete view definition and drop SQL view", async () => {
-      await db.defineAttribute({
-        ident: "person/name",
-        valueType: "db.type/text",
-        cardinality: "db.cardinality/one",
-      });
-      await db.defineView({
-        name: "persons",
-        attributes: ["person/name"],
+      await db.withTransaction(async () => {
+        await db.defineAttribute({
+          ident: "person/name",
+          valueType: "db.type/text",
+          cardinality: "db.cardinality/one",
+        });
+        await db.defineView({
+          name: "persons",
+          attributes: ["person/name"],
+        });
       });
 
       // View should exist
       let views = await db.listViews();
       expect(views.find((v) => v.name === "persons")).toBeDefined();
 
-      // Delete view
-      await db.deleteView("persons");
+      // Delete view (requires transaction)
+      await db.withTransaction(async () => {
+        await db.deleteView("persons");
+      });
 
       // View definition should be gone
       views = await db.listViews();
@@ -240,25 +309,29 @@ describe("MnemonicDB", () => {
   describe("view DML operations", () => {
     beforeEach(async () => {
       // Define schema - views auto-create now
-      await db.defineAttribute({
-        ident: "person/name",
-        valueType: "db.type/text",
-        cardinality: "db.cardinality/one",
-      });
-      await db.defineAttribute({
-        ident: "person/age",
-        valueType: "db.type/int4",
-        cardinality: "db.cardinality/one",
-      });
-      await db.defineView({
-        name: "persons",
-        attributes: ["person/name", "person/age"],
+      await db.withTransaction(async () => {
+        await db.defineAttribute({
+          ident: "person/name",
+          valueType: "db.type/text",
+          cardinality: "db.cardinality/one",
+        });
+        await db.defineAttribute({
+          ident: "person/age",
+          valueType: "db.type/int4",
+          cardinality: "db.cardinality/one",
+        });
+        await db.defineView({
+          name: "persons",
+          attributes: ["person/name", "person/age"],
+        });
       });
       // No regenerateViews() needed!
     });
 
     it("should INSERT via view", async () => {
-      await db.exec("INSERT INTO persons (name, age) VALUES ('Alice', 30)");
+      await db.withTransaction(async () => {
+        await db.exec("INSERT INTO persons (name, age) VALUES ('Alice', 30)");
+      });
 
       const persons = await db.query<{ id: string; name: string; age: number }>(
         "SELECT * FROM persons"
@@ -270,7 +343,9 @@ describe("MnemonicDB", () => {
     });
 
     it("should create datoms on INSERT", async () => {
-      await db.exec("INSERT INTO persons (name, age) VALUES ('Bob', 25)");
+      await db.withTransaction(async () => {
+        await db.exec("INSERT INTO persons (name, age) VALUES ('Bob', 25)");
+      });
 
       // Check datoms were created (now in attribute-specific tables)
       const nameDatoms = await db.query<{ e: string; v: string }>(
@@ -289,12 +364,16 @@ describe("MnemonicDB", () => {
     });
 
     it("should UPDATE via view", async () => {
-      await db.exec("INSERT INTO persons (name, age) VALUES ('Charlie', 35)");
+      await db.withTransaction(async () => {
+        await db.exec("INSERT INTO persons (name, age) VALUES ('Charlie', 35)");
+      });
 
       const before = await db.query<{ id: string }>("SELECT id FROM persons");
       const id = before[0].id;
 
-      await db.exec(`UPDATE persons SET name = 'Charles', age = 36 WHERE id = ${id}`);
+      await db.withTransaction(async () => {
+        await db.exec(`UPDATE persons SET name = 'Charles', age = 36 WHERE id = ${id}`);
+      });
 
       const after = await db.query<{ name: string; age: number }>(
         `SELECT name, age FROM persons WHERE id = ${id}`
@@ -304,12 +383,16 @@ describe("MnemonicDB", () => {
     });
 
     it("should retract old values on UPDATE", async () => {
-      await db.exec("INSERT INTO persons (name, age) VALUES ('Dave', 40)");
+      await db.withTransaction(async () => {
+        await db.exec("INSERT INTO persons (name, age) VALUES ('Dave', 40)");
+      });
 
       const before = await db.query<{ id: string }>("SELECT id FROM persons");
       const id = before[0].id;
 
-      await db.exec(`UPDATE persons SET name = 'David' WHERE id = ${id}`);
+      await db.withTransaction(async () => {
+        await db.exec(`UPDATE persons SET name = 'David' WHERE id = ${id}`);
+      });
 
       // Old name should be retracted (now in attribute-specific table)
       const retractedNames = await db.query<{ v: string; retracted_by: string }>(
@@ -331,25 +414,33 @@ describe("MnemonicDB", () => {
     });
 
     it("should DELETE via view", async () => {
-      await db.exec("INSERT INTO persons (name, age) VALUES ('Eve', 28)");
+      await db.withTransaction(async () => {
+        await db.exec("INSERT INTO persons (name, age) VALUES ('Eve', 28)");
+      });
 
       const before = await db.query<{ id: string }>("SELECT id FROM persons");
       expect(before.length).toBe(1);
       const id = before[0].id;
 
-      await db.exec(`DELETE FROM persons WHERE id = ${id}`);
+      await db.withTransaction(async () => {
+        await db.exec(`DELETE FROM persons WHERE id = ${id}`);
+      });
 
       const after = await db.query("SELECT * FROM persons");
       expect(after.length).toBe(0);
     });
 
     it("should retract datoms on DELETE", async () => {
-      await db.exec("INSERT INTO persons (name, age) VALUES ('Frank', 50)");
+      await db.withTransaction(async () => {
+        await db.exec("INSERT INTO persons (name, age) VALUES ('Frank', 50)");
+      });
 
       const before = await db.query<{ id: string }>("SELECT id FROM persons");
       const id = before[0].id;
 
-      await db.exec(`DELETE FROM persons WHERE id = ${id}`);
+      await db.withTransaction(async () => {
+        await db.exec(`DELETE FROM persons WHERE id = ${id}`);
+      });
 
       // All datoms should be retracted - check each attribute table
       const currentNameDatoms = await db.query(
@@ -370,6 +461,12 @@ describe("MnemonicDB", () => {
       );
       expect(retractedNameDatoms.length).toBe(1); // name
       expect(retractedAgeDatoms.length).toBe(1); // age
+    });
+
+    it("should throw when INSERT without active transaction", async () => {
+      await expect(
+        db.exec("INSERT INTO persons (name, age) VALUES ('Test', 99)")
+      ).rejects.toThrow(/No active MnemonicDB transaction/);
     });
   });
 });

@@ -157,7 +157,7 @@ BEGIN
 END;
 $$;
 
--- Create a new transaction
+-- Create a new transaction (internal - use mnemonic_begin_tx() instead)
 CREATE FUNCTION mnemonic_new_transaction()
 RETURNS BIGINT
 LANGUAGE plpgsql
@@ -168,6 +168,68 @@ BEGIN
   tx_id := mnemonic_allocate_entity('tx');
   INSERT INTO transactions (id, tx_instant) VALUES (tx_id, NOW());
   RETURN tx_id;
+END;
+$$;
+
+--------------------------------------------------------------------------------
+-- TRANSACTION MANAGEMENT
+--------------------------------------------------------------------------------
+
+-- Begin a new MnemonicDB transaction
+-- All subsequent datom operations will use this transaction until commit
+CREATE PROCEDURE mnemonic_begin_tx()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  tx_id BIGINT;
+  current_tx TEXT;
+BEGIN
+  -- Check if there's already an active transaction
+  current_tx := current_setting('mnemonic.current_tx', true);
+  IF current_tx IS NOT NULL AND current_tx != '' THEN
+    RAISE EXCEPTION 'Transaction already active: %. CALL mnemonic_commit_tx() first.', current_tx;
+  END IF;
+
+  -- Create new transaction and store in session
+  tx_id := mnemonic_new_transaction();
+  PERFORM set_config('mnemonic.current_tx', tx_id::TEXT, false);
+END;
+$$;
+
+-- Get the current active transaction ID
+-- Raises an exception if no transaction is active
+CREATE FUNCTION mnemonic_current_tx()
+RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  current_tx TEXT;
+BEGIN
+  current_tx := current_setting('mnemonic.current_tx', true);
+  IF current_tx IS NULL OR current_tx = '' THEN
+    RAISE EXCEPTION 'No active MnemonicDB transaction. CALL mnemonic_begin_tx() first.';
+  END IF;
+  RETURN current_tx::BIGINT;
+END;
+$$;
+
+-- Check if there's an active transaction (doesn't raise error)
+CREATE FUNCTION mnemonic_in_tx()
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT COALESCE(NULLIF(current_setting('mnemonic.current_tx', true), ''), NULL) IS NOT NULL;
+$$;
+
+-- Commit the current MnemonicDB transaction
+-- This clears the transaction context (actual durability is handled by PostgreSQL)
+CREATE PROCEDURE mnemonic_commit_tx()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  PERFORM mnemonic_current_tx();  -- Will raise if no transaction
+  PERFORM set_config('mnemonic.current_tx', '', false);
 END;
 $$;
 
@@ -748,8 +810,8 @@ DECLARE
   table_name TEXT;
   jsonb_val JSONB;
 BEGIN
+  tx_id := mnemonic_current_tx();  -- Requires active transaction
   new_entity := mnemonic_allocate_entity('user');
-  tx_id := mnemonic_new_transaction();
 
   FOR attr IN SELECT * FROM mnemonic_view_attributes WHERE view_name = p_view_name
   LOOP
@@ -786,7 +848,7 @@ DECLARE
   table_name TEXT;
   jsonb_val JSONB;
 BEGIN
-  tx_id := mnemonic_new_transaction();
+  tx_id := mnemonic_current_tx();  -- Requires active transaction
 
   FOR attr IN SELECT * FROM mnemonic_view_attributes WHERE view_name = p_view_name
   LOOP
@@ -828,7 +890,7 @@ DECLARE
   attr RECORD;
   table_name TEXT;
 BEGIN
-  tx_id := mnemonic_new_transaction();
+  tx_id := mnemonic_current_tx();  -- Requires active transaction
 
   FOR attr IN SELECT * FROM mnemonic_view_attributes WHERE view_name = p_view_name
   LOOP
@@ -921,9 +983,9 @@ BEGIN
     END IF;
   END IF;
 
-  -- Allocate new entity and transaction
+  -- Get current transaction and allocate entity
+  tx_id := mnemonic_current_tx();  -- Requires active transaction
   attr_id := mnemonic_allocate_entity('db');
-  tx_id := mnemonic_new_transaction();
 
   -- Insert attribute datoms
   INSERT INTO attr_db_ident (e, a, v_data, tx, retracted_by)
@@ -994,8 +1056,8 @@ BEGIN
     RAISE EXCEPTION 'View must have at least one required attribute';
   END IF;
 
+  tx_id := mnemonic_current_tx();  -- Requires active transaction
   view_id := mnemonic_allocate_entity('db');
-  tx_id := mnemonic_new_transaction();
 
   INSERT INTO attr_db_view_ident (e, a, v_data, tx, retracted_by)
   VALUES (view_id, 10, to_jsonb(NEW.name), tx_id, NULL);
@@ -1047,7 +1109,7 @@ BEGIN
     RAISE EXCEPTION 'View must have at least one required attribute';
   END IF;
 
-  tx_id := mnemonic_new_transaction();
+  tx_id := mnemonic_current_tx();  -- Requires active transaction
 
   IF NEW.name IS DISTINCT FROM OLD.name THEN
     UPDATE attr_db_view_ident SET retracted_by = tx_id
@@ -1117,7 +1179,7 @@ AS $$
 DECLARE
   tx_id BIGINT;
 BEGIN
-  tx_id := mnemonic_new_transaction();
+  tx_id := mnemonic_current_tx();  -- Requires active transaction
 
   UPDATE attr_db_view_ident SET retracted_by = tx_id
   WHERE e = OLD.id AND retracted_by IS NULL;

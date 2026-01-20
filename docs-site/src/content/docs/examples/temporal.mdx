@@ -13,7 +13,10 @@ First, let's set up a schema and create some data with multiple changes:
 
 <LiveExample
   title="Setup Schema and Initial Data"
-  code={`-- Create person attributes using the admin view
+  code={`-- Start a transaction
+CALL mnemonic_begin_tx();
+
+-- Create person attributes using the admin view
 INSERT INTO mnemonic_defined_attributes (ident, value_type, cardinality)
 VALUES ('person/name', 'db.type/text', 'db.cardinality/one');
 
@@ -27,6 +30,9 @@ VALUES ('persons', ARRAY['person/name'], ARRAY['person/title'], 'Person entities
 -- Insert initial data
 INSERT INTO persons (name, title) VALUES ('Alice', 'Developer');
 
+-- Commit the transaction
+CALL mnemonic_commit_tx();
+
 SELECT 'Schema created' as status`}
 />
 
@@ -39,14 +45,20 @@ Now let's make several changes to create some history:
   code={`-- Get Alice's ID
 SELECT id FROM persons WHERE name = 'Alice';
 
--- Promote Alice to Senior Developer
+-- Transaction 1: Promote Alice to Senior Developer
+CALL mnemonic_begin_tx();
 UPDATE persons SET title = 'Senior Developer' WHERE name = 'Alice';
+CALL mnemonic_commit_tx();
 
--- Add another person
+-- Transaction 2: Add another person
+CALL mnemonic_begin_tx();
 INSERT INTO persons (name, title) VALUES ('Bob', 'Manager');
+CALL mnemonic_commit_tx();
 
--- Promote Alice again
+-- Transaction 3: Promote Alice again
+CALL mnemonic_begin_tx();
 UPDATE persons SET title = 'Tech Lead' WHERE name = 'Alice';
+CALL mnemonic_commit_tx();
 
 -- See current state
 SELECT * FROM persons ORDER BY name`}

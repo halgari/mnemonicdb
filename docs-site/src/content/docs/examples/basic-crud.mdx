@@ -13,13 +13,19 @@ First, let's define some attributes for a "person" entity:
 
 <LiveExample
   title="Define Person Attributes"
-  code={`-- Define person/name attribute using the admin view
+  code={`-- Start a transaction
+CALL mnemonic_begin_tx();
+
+-- Define person/name attribute using the admin view
 INSERT INTO mnemonic_defined_attributes (ident, value_type, cardinality)
 VALUES ('person/name', 'db.type/text', 'db.cardinality/one');
 
 -- Define person/age attribute
 INSERT INTO mnemonic_defined_attributes (ident, value_type, cardinality)
 VALUES ('person/age', 'db.type/int4', 'db.cardinality/one');
+
+-- Commit the transaction
+CALL mnemonic_commit_tx();
 
 -- Verify attributes were created
 SELECT * FROM mnemonic_defined_attributes WHERE ident LIKE 'person/%'`}
@@ -31,9 +37,15 @@ Now let's create a view that combines our attributes:
 
 <LiveExample
   title="Create Persons View"
-  code={`-- Create the persons view using the admin table
+  code={`-- Start a transaction
+CALL mnemonic_begin_tx();
+
+-- Create the persons view using the admin table
 INSERT INTO mnemonic_defined_views (name, attributes, optional_attributes, doc)
 VALUES ('persons', ARRAY['person/name', 'person/age'], '{}', 'Person entities');
+
+-- Commit the transaction
+CALL mnemonic_commit_tx();
 
 -- Verify the view was created
 SELECT * FROM mnemonic_views`}
@@ -45,10 +57,16 @@ Insert data through the view—triggers handle datom creation:
 
 <LiveExample
   title="Insert Persons"
-  code={`-- Insert some people
+  code={`-- Start a transaction
+CALL mnemonic_begin_tx();
+
+-- Insert some people
 INSERT INTO persons (name, age) VALUES ('Alice', 30);
 INSERT INTO persons (name, age) VALUES ('Bob', 25);
 INSERT INTO persons (name, age) VALUES ('Charlie', 35);
+
+-- Commit the transaction
+CALL mnemonic_commit_tx();
 
 -- Query all persons
 SELECT * FROM persons ORDER BY name`}
@@ -70,8 +88,14 @@ Update data through the view—old values are retracted, new values asserted:
 
 <LiveExample
   title="Update a Person"
-  code={`-- Update Alice's age
+  code={`-- Start a transaction
+CALL mnemonic_begin_tx();
+
+-- Update Alice's age
 UPDATE persons SET age = 31 WHERE name = 'Alice';
+
+-- Commit the transaction
+CALL mnemonic_commit_tx();
 
 -- Verify the update
 SELECT * FROM persons WHERE name = 'Alice'`}
@@ -99,8 +123,14 @@ Delete through the view—all datoms for that entity are retracted:
 
 <LiveExample
   title="Delete a Person"
-  code={`-- Delete Bob
+  code={`-- Start a transaction
+CALL mnemonic_begin_tx();
+
+-- Delete Bob
 DELETE FROM persons WHERE name = 'Bob';
+
+-- Commit the transaction
+CALL mnemonic_commit_tx();
 
 -- Verify deletion
 SELECT * FROM persons ORDER BY name`}
@@ -127,6 +157,6 @@ WHERE retracted_by IS NOT NULL`}
 1. **Views look like tables**: Standard SQL INSERT/UPDATE/DELETE work
 2. **Data is never deleted**: Updates create new datoms and retract old ones
 3. **Full history preserved**: You can query retracted datoms for audit trails
-4. **Atomic transactions**: Each operation creates a new transaction
+4. **Explicit transactions**: Use `CALL mnemonic_begin_tx()` and `CALL mnemonic_commit_tx()` to group operations
 
 Try modifying the examples above—the database resets when you click "Reset DB".

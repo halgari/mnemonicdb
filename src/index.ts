@@ -95,12 +95,63 @@ export class MnemonicDB {
 
   /**
    * Create a new transaction and return its ID.
+   * @deprecated Use beginTransaction() instead for managed transaction context.
    */
   async newTransaction(): Promise<bigint> {
     const result = await this.db.query<{ mnemonic_new_transaction: string }>(
       "SELECT mnemonic_new_transaction()"
     );
     return BigInt(result.rows[0].mnemonic_new_transaction);
+  }
+
+  /**
+   * Begin a new MnemonicDB transaction and set it as the active transaction context.
+   * All subsequent inserts/updates/deletes will use this transaction until commit.
+   * Throws if a transaction is already active.
+   */
+  async beginTransaction(): Promise<void> {
+    await this.db.exec("CALL mnemonic_begin_tx()");
+  }
+
+  /**
+   * Commit the current MnemonicDB transaction and clear the transaction context.
+   * Throws if no transaction is active.
+   */
+  async commitTransaction(): Promise<void> {
+    await this.db.exec("CALL mnemonic_commit_tx()");
+  }
+
+  /**
+   * Check if there is an active MnemonicDB transaction.
+   */
+  async inTransaction(): Promise<boolean> {
+    const result = await this.db.query<{ mnemonic_in_tx: boolean }>(
+      "SELECT mnemonic_in_tx()"
+    );
+    return result.rows[0].mnemonic_in_tx;
+  }
+
+  /**
+   * Execute a function within a transaction context.
+   * Automatically begins a transaction, executes the function, and commits.
+   * If the function throws, the transaction context is cleared (but note that
+   * MnemonicDB transactions are append-only, so partial writes may persist).
+   */
+  async withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+    await this.beginTransaction();
+    try {
+      const result = await fn();
+      await this.commitTransaction();
+      return result;
+    } catch (error) {
+      // Clear the transaction context on error
+      try {
+        await this.db.exec("SELECT set_config('mnemonic.current_tx', '', false)");
+      } catch {
+        // Ignore errors clearing context
+      }
+      throw error;
+    }
   }
 
   /**
