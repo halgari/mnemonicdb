@@ -366,11 +366,16 @@ INSERT INTO datoms_text (e, a, v, tx, retracted_by) VALUES (12, 1, 'db.view/doc'
 INSERT INTO datoms_ref (e, a, v, tx, retracted_by) VALUES (12, 2, 100, 0, NULL);  -- text
 INSERT INTO datoms_ref (e, a, v, tx, retracted_by) VALUES (12, 3, 200, 0, NULL);  -- one
 
+-- db.view/optional-attributes (entity 13) - refs to optional attributes (LEFT JOIN)
+INSERT INTO datoms_text (e, a, v, tx, retracted_by) VALUES (13, 1, 'db.view/optional-attributes', 0, NULL);
+INSERT INTO datoms_ref (e, a, v, tx, retracted_by) VALUES (13, 2, 112, 0, NULL);  -- ref
+INSERT INTO datoms_ref (e, a, v, tx, retracted_by) VALUES (13, 3, 201, 0, NULL);  -- many
+
 --------------------------------------------------------------------------------
 -- UPDATE PARTITION COUNTERS
 --------------------------------------------------------------------------------
 
--- Set next_id for db partition (we used 1-5, 10-12, 100-112, 200-201, 210-211)
+-- Set next_id for db partition (we used 1-5, 10-13, 100-112, 200-201, 210-211)
 UPDATE partitions SET next_id = 300 WHERE ident = 'db';
 
 -- Set next_id for tx partition (we used 0 for bootstrap)
@@ -414,15 +419,36 @@ WHERE ident.a = 10
   AND ident.retracted_by IS NULL;
 
 -- View attributes in each view (with full attribute metadata)
+-- Combines required attributes (entity 11) and optional attributes (entity 13)
 CREATE VIEW mnemonic_view_attributes AS
+-- Required attributes (db.view/attributes - entity 11)
 SELECT
   view_ident.v AS view_name,
   attr_ident.v AS attribute_ident,
   attr_ident.e AS attribute_id,
   vtype_ident.v AS value_type,
-  card_ident.v AS cardinality
+  card_ident.v AS cardinality,
+  true AS required
 FROM datoms_text view_ident
 JOIN datoms_ref view_attrs ON view_ident.e = view_attrs.e AND view_attrs.a = 11 AND view_attrs.retracted_by IS NULL
+JOIN datoms_text attr_ident ON view_attrs.v = attr_ident.e AND attr_ident.a = 1 AND attr_ident.retracted_by IS NULL
+JOIN datoms_ref vtype ON attr_ident.e = vtype.e AND vtype.a = 2 AND vtype.retracted_by IS NULL
+JOIN datoms_text vtype_ident ON vtype.v = vtype_ident.e AND vtype_ident.a = 1 AND vtype_ident.retracted_by IS NULL
+JOIN datoms_ref card ON attr_ident.e = card.e AND card.a = 3 AND card.retracted_by IS NULL
+JOIN datoms_text card_ident ON card.v = card_ident.e AND card_ident.a = 1 AND card_ident.retracted_by IS NULL
+WHERE view_ident.a = 10
+  AND view_ident.retracted_by IS NULL
+UNION ALL
+-- Optional attributes (db.view/optional-attributes - entity 13)
+SELECT
+  view_ident.v AS view_name,
+  attr_ident.v AS attribute_ident,
+  attr_ident.e AS attribute_id,
+  vtype_ident.v AS value_type,
+  card_ident.v AS cardinality,
+  false AS required
+FROM datoms_text view_ident
+JOIN datoms_ref view_attrs ON view_ident.e = view_attrs.e AND view_attrs.a = 13 AND view_attrs.retracted_by IS NULL
 JOIN datoms_text attr_ident ON view_attrs.v = attr_ident.e AND attr_ident.a = 1 AND attr_ident.retracted_by IS NULL
 JOIN datoms_ref vtype ON attr_ident.e = vtype.e AND vtype.a = 2 AND vtype.retracted_by IS NULL
 JOIN datoms_text vtype_ident ON vtype.v = vtype_ident.e AND vtype_ident.a = 1 AND vtype_ident.retracted_by IS NULL
@@ -469,51 +495,77 @@ AS $$
   END;
 $$;
 
--- Regenerate a single view
+-- Regenerate a single view using join-based approach:
+-- First required attribute = base table
+-- Other required attributes = INNER JOIN
+-- Optional attributes = LEFT JOIN
 CREATE PROCEDURE mnemonic_regenerate_view(p_view_name TEXT)
 LANGUAGE plpgsql
 AS $$
 DECLARE
   attr RECORD;
-  select_cols TEXT := 'base_entity.e AS id';
-  from_clause TEXT := '';
-  base_entity_unions TEXT := '';
+  select_cols TEXT;
+  from_clause TEXT;
+  where_clause TEXT;
   join_idx INTEGER := 0;
   col_name TEXT;
   table_name TEXT;
   alias TEXT;
-  used_tables TEXT[] := '{}';
+  join_type TEXT;
+  is_first BOOLEAN := true;
+  base_alias TEXT;
 BEGIN
   -- Drop existing view and triggers if they exist
   EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', p_view_name);
 
-  -- Build SELECT and FROM clauses, tracking which tables are used
+  -- Process attributes: required first (ordered), then optional
   FOR attr IN
-    SELECT * FROM mnemonic_view_attributes WHERE view_name = p_view_name
+    SELECT * FROM mnemonic_view_attributes
+    WHERE view_name = p_view_name
+    ORDER BY required DESC, attribute_ident  -- required first, then by name
   LOOP
     join_idx := join_idx + 1;
     alias := 'j' || join_idx;
     col_name := mnemonic_attr_to_column(attr.attribute_ident);
     table_name := mnemonic_value_type_table(attr.value_type);
 
-    -- Track unique tables used
-    IF NOT table_name = ANY(used_tables) THEN
-      used_tables := used_tables || table_name;
-    END IF;
+    IF is_first THEN
+      -- First required attribute is the base table
+      base_alias := alias;
+      select_cols := format('%I.e AS id', alias);
+      from_clause := format('%I %I', table_name, alias);
+      where_clause := format('%I.a = %s AND %I.retracted_by IS NULL',
+        alias, attr.attribute_id, alias);
+      is_first := false;
 
-    IF attr.cardinality = 'db.cardinality/one' THEN
-      select_cols := select_cols || format(', %I.v AS %I', alias, col_name);
-      from_clause := from_clause || format(
-        ' LEFT JOIN %I %I ON base_entity.e = %I.e AND %I.a = %s AND %I.retracted_by IS NULL',
-        table_name, alias, alias, alias, attr.attribute_id, alias
-      );
+      IF attr.cardinality = 'db.cardinality/one' THEN
+        select_cols := select_cols || format(', %I.v AS %I', alias, col_name);
+      ELSE
+        -- Cardinality many for base - need lateral
+        select_cols := select_cols || format(', %I_arr.v AS %I', alias, col_name);
+        from_clause := from_clause || format(
+          ' LEFT JOIN LATERAL (SELECT ARRAY_AGG(v) AS v FROM %I WHERE e = %I.e AND a = %s AND retracted_by IS NULL) %I_arr ON true',
+          table_name, base_alias, attr.attribute_id, alias
+        );
+      END IF;
     ELSE
-      -- Cardinality many: aggregate into array
-      select_cols := select_cols || format(', %I.v AS %I', alias, col_name);
-      from_clause := from_clause || format(
-        ' LEFT JOIN LATERAL (SELECT ARRAY_AGG(v) AS v FROM %I WHERE e = base_entity.e AND a = %s AND retracted_by IS NULL) %I ON true',
-        table_name, attr.attribute_id, alias
-      );
+      -- Subsequent attributes: INNER JOIN for required, LEFT JOIN for optional
+      join_type := CASE WHEN attr.required THEN 'INNER JOIN' ELSE 'LEFT JOIN' END;
+
+      IF attr.cardinality = 'db.cardinality/one' THEN
+        select_cols := select_cols || format(', %I.v AS %I', alias, col_name);
+        from_clause := from_clause || format(
+          ' %s %I %I ON %I.e = %I.e AND %I.a = %s AND %I.retracted_by IS NULL',
+          join_type, table_name, alias, base_alias, alias, alias, attr.attribute_id, alias
+        );
+      ELSE
+        -- Cardinality many: use lateral subquery for array aggregation
+        select_cols := select_cols || format(', %I.v AS %I', alias, col_name);
+        from_clause := from_clause || format(
+          ' LEFT JOIN LATERAL (SELECT ARRAY_AGG(v) AS v FROM %I WHERE e = %I.e AND a = %s AND retracted_by IS NULL) %I ON true',
+          table_name, base_alias, attr.attribute_id, alias
+        );
+      END IF;
     END IF;
   END LOOP;
 
@@ -523,25 +575,13 @@ BEGIN
     RETURN;
   END IF;
 
-  -- Build base_entity UNION only for tables actually used
-  FOR i IN 1..array_length(used_tables, 1)
-  LOOP
-    IF base_entity_unions != '' THEN
-      base_entity_unions := base_entity_unions || ' UNION ';
-    END IF;
-    base_entity_unions := base_entity_unions || format(
-      'SELECT DISTINCT e FROM %I WHERE a IN (SELECT attribute_id FROM mnemonic_view_attributes WHERE view_name = %L) AND retracted_by IS NULL',
-      used_tables[i], p_view_name
-    );
-  END LOOP;
-
   -- Create the view
   EXECUTE format(
-    'CREATE VIEW %I AS SELECT DISTINCT %s FROM (%s) base_entity %s',
+    'CREATE VIEW %I AS SELECT %s FROM %s WHERE %s',
     p_view_name,
     select_cols,
-    base_entity_unions,
-    from_clause
+    from_clause,
+    where_clause
   );
 
   -- Create triggers
@@ -705,23 +745,25 @@ $$;
 -- SELF-MANAGING VIEW DEFINITIONS
 --------------------------------------------------------------------------------
 
--- Admin view showing view definitions with attributes as array
+-- Admin view showing view definitions with required and optional attributes
 CREATE VIEW mnemonic_defined_views AS
 SELECT
-  view_ident.e AS id,
-  view_ident.v AS name,
-  ARRAY_AGG(attr_ident.v ORDER BY attr_ident.v) AS attributes,
-  doc.v AS doc
-FROM datoms_text view_ident
-LEFT JOIN datoms_ref view_attrs ON view_ident.e = view_attrs.e
-  AND view_attrs.a = 11 AND view_attrs.retracted_by IS NULL
-LEFT JOIN datoms_text attr_ident ON view_attrs.v = attr_ident.e
-  AND attr_ident.a = 1 AND attr_ident.retracted_by IS NULL
-LEFT JOIN datoms_text doc ON view_ident.e = doc.e
-  AND doc.a = 12 AND doc.retracted_by IS NULL
-WHERE view_ident.a = 10
-  AND view_ident.retracted_by IS NULL
-GROUP BY view_ident.e, view_ident.v, doc.v;
+  v.id,
+  v.name,
+  v.doc,
+  COALESCE(req.attributes, '{}') AS attributes,
+  COALESCE(opt.attributes, '{}') AS optional_attributes
+FROM mnemonic_views v
+LEFT JOIN LATERAL (
+  SELECT ARRAY_AGG(va.attribute_ident ORDER BY va.attribute_ident) AS attributes
+  FROM mnemonic_view_attributes va
+  WHERE va.view_name = v.name AND va.required = true
+) req ON true
+LEFT JOIN LATERAL (
+  SELECT ARRAY_AGG(va.attribute_ident ORDER BY va.attribute_ident) AS attributes
+  FROM mnemonic_view_attributes va
+  WHERE va.view_name = v.name AND va.required = false
+) opt ON true;
 
 -- INSERT trigger for mnemonic_defined_views
 CREATE FUNCTION mnemonic_defined_views_insert()
@@ -734,6 +776,11 @@ DECLARE
   attr_ident TEXT;
   attr_id BIGINT;
 BEGIN
+  -- Validate: at least one required attribute
+  IF NEW.attributes IS NULL OR array_length(NEW.attributes, 1) IS NULL THEN
+    RAISE EXCEPTION 'View must have at least one required attribute';
+  END IF;
+
   -- Allocate view entity and transaction
   view_id := mnemonic_allocate_entity('db');
   tx_id := mnemonic_new_transaction();
@@ -742,16 +789,27 @@ BEGIN
   INSERT INTO datoms_text (e, a, v, tx, retracted_by)
   VALUES (view_id, 10, NEW.name, tx_id, NULL);
 
-  -- Assert each attribute reference
-  IF NEW.attributes IS NOT NULL THEN
-    FOREACH attr_ident IN ARRAY NEW.attributes
+  -- Assert required attribute refs (entity 11)
+  FOREACH attr_ident IN ARRAY NEW.attributes
+  LOOP
+    attr_id := mnemonic_attr_id(attr_ident);
+    IF attr_id IS NULL THEN
+      RAISE EXCEPTION 'Unknown attribute: %', attr_ident;
+    END IF;
+    INSERT INTO datoms_ref (e, a, v, tx, retracted_by)
+    VALUES (view_id, 11, attr_id, tx_id, NULL);
+  END LOOP;
+
+  -- Assert optional attribute refs (entity 13)
+  IF NEW.optional_attributes IS NOT NULL AND array_length(NEW.optional_attributes, 1) IS NOT NULL THEN
+    FOREACH attr_ident IN ARRAY NEW.optional_attributes
     LOOP
       attr_id := mnemonic_attr_id(attr_ident);
       IF attr_id IS NULL THEN
         RAISE EXCEPTION 'Unknown attribute: %', attr_ident;
       END IF;
       INSERT INTO datoms_ref (e, a, v, tx, retracted_by)
-      VALUES (view_id, 11, attr_id, tx_id, NULL);
+      VALUES (view_id, 13, attr_id, tx_id, NULL);
     END LOOP;
   END IF;
 
@@ -778,10 +836,13 @@ DECLARE
   tx_id BIGINT;
   attr_ident TEXT;
   attr_id BIGINT;
-  old_name TEXT;
 BEGIN
+  -- Validate: at least one required attribute
+  IF NEW.attributes IS NULL OR array_length(NEW.attributes, 1) IS NULL THEN
+    RAISE EXCEPTION 'View must have at least one required attribute';
+  END IF;
+
   tx_id := mnemonic_new_transaction();
-  old_name := OLD.name;
 
   -- If name changed, retract old and assert new
   IF NEW.name IS DISTINCT FROM OLD.name THEN
@@ -795,22 +856,36 @@ BEGIN
     EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', OLD.name);
   END IF;
 
-  -- If attributes changed, retract all old refs and add new ones
+  -- If required attributes changed
   IF NEW.attributes IS DISTINCT FROM OLD.attributes THEN
-    -- Retract all old attribute refs
     UPDATE datoms_ref SET retracted_by = tx_id
     WHERE e = OLD.id AND a = 11 AND retracted_by IS NULL;
 
-    -- Add new attribute refs
-    IF NEW.attributes IS NOT NULL THEN
-      FOREACH attr_ident IN ARRAY NEW.attributes
+    FOREACH attr_ident IN ARRAY NEW.attributes
+    LOOP
+      attr_id := mnemonic_attr_id(attr_ident);
+      IF attr_id IS NULL THEN
+        RAISE EXCEPTION 'Unknown attribute: %', attr_ident;
+      END IF;
+      INSERT INTO datoms_ref (e, a, v, tx, retracted_by)
+      VALUES (OLD.id, 11, attr_id, tx_id, NULL);
+    END LOOP;
+  END IF;
+
+  -- If optional attributes changed
+  IF NEW.optional_attributes IS DISTINCT FROM OLD.optional_attributes THEN
+    UPDATE datoms_ref SET retracted_by = tx_id
+    WHERE e = OLD.id AND a = 13 AND retracted_by IS NULL;
+
+    IF NEW.optional_attributes IS NOT NULL AND array_length(NEW.optional_attributes, 1) IS NOT NULL THEN
+      FOREACH attr_ident IN ARRAY NEW.optional_attributes
       LOOP
         attr_id := mnemonic_attr_id(attr_ident);
         IF attr_id IS NULL THEN
           RAISE EXCEPTION 'Unknown attribute: %', attr_ident;
         END IF;
         INSERT INTO datoms_ref (e, a, v, tx, retracted_by)
-        VALUES (OLD.id, 11, attr_id, tx_id, NULL);
+        VALUES (OLD.id, 13, attr_id, tx_id, NULL);
       END LOOP;
     END IF;
   END IF;
@@ -847,9 +922,13 @@ BEGIN
   UPDATE datoms_text SET retracted_by = tx_id
   WHERE e = OLD.id AND a = 10 AND retracted_by IS NULL;
 
-  -- Retract all attribute refs
+  -- Retract required attribute refs
   UPDATE datoms_ref SET retracted_by = tx_id
   WHERE e = OLD.id AND a = 11 AND retracted_by IS NULL;
+
+  -- Retract optional attribute refs
+  UPDATE datoms_ref SET retracted_by = tx_id
+  WHERE e = OLD.id AND a = 13 AND retracted_by IS NULL;
 
   -- Retract doc
   UPDATE datoms_text SET retracted_by = tx_id

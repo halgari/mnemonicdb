@@ -184,10 +184,10 @@ export class MnemonicDB {
   async defineView(view: ViewDefinition): Promise<bigint> {
     // Use the self-managing admin view - it handles datom creation and SQL view generation
     const result = await this.db.query<{ id: string }>(
-      `INSERT INTO mnemonic_defined_views (name, attributes, doc)
-       VALUES ($1, $2, $3)
+      `INSERT INTO mnemonic_defined_views (name, attributes, optional_attributes, doc)
+       VALUES ($1, $2, $3, $4)
        RETURNING id`,
-      [view.name, view.attributes, view.doc ?? null]
+      [view.name, view.attributes, view.optionalAttributes ?? [], view.doc ?? null]
     );
     return BigInt(result.rows[0].id);
   }
@@ -208,6 +208,10 @@ export class MnemonicDB {
     if (view.attributes !== undefined) {
       setClauses.push(`attributes = $${paramIdx++}`);
       params.push(view.attributes);
+    }
+    if (view.optionalAttributes !== undefined) {
+      setClauses.push(`optional_attributes = $${paramIdx++}`);
+      params.push(view.optionalAttributes);
     }
     if (view.doc !== undefined) {
       setClauses.push(`doc = $${paramIdx++}`);
@@ -287,7 +291,10 @@ export interface AttributeDefinition {
 
 export interface ViewDefinition {
   name: string;
+  /** Required attributes (INNER JOIN) - at least one required */
   attributes: string[];
+  /** Optional attributes (LEFT JOIN) */
+  optionalAttributes?: string[];
   doc?: string;
 }
 
