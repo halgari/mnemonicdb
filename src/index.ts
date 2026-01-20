@@ -50,6 +50,43 @@ export class MnemonicDB {
   }
 
   /**
+   * Execute a query at a specific point in time (as-of query).
+   * This is safe for concurrent use - each query sets its own transaction-local context.
+   *
+   * @param sql - The SQL query to execute
+   * @param params - Query parameters (as-of tx will be prepended as $1)
+   * @param asOf - Transaction ID to query as of, or null for current state
+   */
+  async queryAsOf<T = unknown>(
+    sql: string,
+    params: unknown[] = [],
+    asOf: bigint | null
+  ): Promise<T[]> {
+    if (asOf === null) {
+      // Current state - just run the query normally
+      return this.query<T>(sql, params);
+    }
+
+    // First shift params in the original query: $1 becomes $2, $2 becomes $3, etc.
+    const shiftedOriginal = sql.replace(
+      /\$(\d+)/g,
+      (_, n) => `$${parseInt(n) + 1}`
+    );
+
+    // Then wrap with CTE using $1 for asOf
+    // LATERAL is required to ensure the subquery sees the config set by the CTE
+    const wrappedSql = `
+      WITH _mnemonic_asof AS (
+        SELECT set_config('mnemonic.as_of_tx', $1::text, true)
+      )
+      SELECT __inner__.* FROM _mnemonic_asof, LATERAL (${shiftedOriginal}) __inner__
+    `;
+
+    const result = await this.db.query<T>(wrappedSql, [asOf.toString(), ...params]);
+    return result.rows;
+  }
+
+  /**
    * Execute raw SQL (for mutations).
    */
   async exec(sql: string): Promise<void> {
