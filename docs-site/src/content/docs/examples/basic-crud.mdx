@@ -13,29 +13,16 @@ First, let's define some attributes for a "person" entity:
 
 <LiveExample
   title="Define Person Attributes"
-  code={`-- Define person/name attribute
-INSERT INTO attr_db_ident (e, a, v_data, tx, retracted_by)
-VALUES (300, 1, '"person/name"', 0, NULL);
-INSERT INTO attr_db_valuetype (e, a, v_data, tx, retracted_by)
-VALUES (300, 2, '100', 0, NULL);
-INSERT INTO attr_db_cardinality (e, a, v_data, tx, retracted_by)
-VALUES (300, 3, '200', 0, NULL);
-
--- Create the attribute table
-CALL mnemonic_create_attr_table(300, 'person/name', 'db.type/text');
+  code={`-- Define person/name attribute using the admin view
+INSERT INTO mnemonic_defined_attributes (ident, value_type, cardinality)
+VALUES ('person/name', 'db.type/text', 'db.cardinality/one');
 
 -- Define person/age attribute
-INSERT INTO attr_db_ident (e, a, v_data, tx, retracted_by)
-VALUES (301, 1, '"person/age"', 0, NULL);
-INSERT INTO attr_db_valuetype (e, a, v_data, tx, retracted_by)
-VALUES (301, 2, '101', 0, NULL);
-INSERT INTO attr_db_cardinality (e, a, v_data, tx, retracted_by)
-VALUES (301, 3, '200', 0, NULL);
-
-CALL mnemonic_create_attr_table(301, 'person/age', 'db.type/int4');
+INSERT INTO mnemonic_defined_attributes (ident, value_type, cardinality)
+VALUES ('person/age', 'db.type/int4', 'db.cardinality/one');
 
 -- Verify attributes were created
-SELECT * FROM mnemonic_attributes WHERE ident LIKE 'person/%'`}
+SELECT * FROM mnemonic_defined_attributes WHERE ident LIKE 'person/%'`}
 />
 
 ## Creating a View

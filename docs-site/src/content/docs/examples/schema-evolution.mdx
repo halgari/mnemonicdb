@@ -13,23 +13,13 @@ Start with a simple person schema:
 
 <LiveExample
   title="Create Initial Schema"
-  code={`-- Create person/name attribute
-INSERT INTO attr_db_ident (e, a, v_data, tx, retracted_by)
-VALUES (300, 1, '"person/name"', 0, NULL);
-INSERT INTO attr_db_valuetype (e, a, v_data, tx, retracted_by)
-VALUES (300, 2, '100', 0, NULL);
-INSERT INTO attr_db_cardinality (e, a, v_data, tx, retracted_by)
-VALUES (300, 3, '200', 0, NULL);
-CALL mnemonic_create_attr_table(300, 'person/name', 'db.type/text');
+  code={`-- Create person/name attribute using the admin view
+INSERT INTO mnemonic_defined_attributes (ident, value_type, cardinality)
+VALUES ('person/name', 'db.type/text', 'db.cardinality/one');
 
 -- Create person/email attribute
-INSERT INTO attr_db_ident (e, a, v_data, tx, retracted_by)
-VALUES (301, 1, '"person/email"', 0, NULL);
-INSERT INTO attr_db_valuetype (e, a, v_data, tx, retracted_by)
-VALUES (301, 2, '100', 0, NULL);
-INSERT INTO attr_db_cardinality (e, a, v_data, tx, retracted_by)
-VALUES (301, 3, '200', 0, NULL);
-CALL mnemonic_create_attr_table(301, 'person/email', 'db.type/text');
+INSERT INTO mnemonic_defined_attributes (ident, value_type, cardinality)
+VALUES ('person/email', 'db.type/text', 'db.cardinality/one');
 
 -- Create persons view
 INSERT INTO mnemonic_defined_views (name, attributes, optional_attributes, doc)
@@ -40,7 +30,7 @@ INSERT INTO persons (name, email) VALUES ('Alice', 'alice@example.com');
 INSERT INTO persons (name, email) VALUES ('Bob', 'bob@example.com');
 
 -- View schema and data
-SELECT * FROM mnemonic_attributes WHERE ident LIKE 'person/%'`}
+SELECT * FROM mnemonic_defined_attributes WHERE ident LIKE 'person/%'`}
 />
 
 ## Check Current Data
@@ -56,17 +46,12 @@ Business requirements change—we need to track phone numbers:
 
 <LiveExample
   title="Add Phone Attribute"
-  code={`-- Create person/phone attribute
-INSERT INTO attr_db_ident (e, a, v_data, tx, retracted_by)
-VALUES (302, 1, '"person/phone"', 0, NULL);
-INSERT INTO attr_db_valuetype (e, a, v_data, tx, retracted_by)
-VALUES (302, 2, '100', 0, NULL);
-INSERT INTO attr_db_cardinality (e, a, v_data, tx, retracted_by)
-VALUES (302, 3, '200', 0, NULL);
-CALL mnemonic_create_attr_table(302, 'person/phone', 'db.type/text');
+  code={`-- Create person/phone attribute using the admin view
+INSERT INTO mnemonic_defined_attributes (ident, value_type, cardinality)
+VALUES ('person/phone', 'db.type/text', 'db.cardinality/one');
 
 -- Verify attribute was created
-SELECT * FROM mnemonic_attributes WHERE ident = 'person/phone'`}
+SELECT * FROM mnemonic_defined_attributes WHERE ident = 'person/phone'`}
 />
 
 ## Updating the View
@@ -102,14 +87,9 @@ What if we want a new required attribute? We need to provide values for existing
 
 <LiveExample
   title="Add Required Attribute"
-  code={`-- Create person/status attribute
-INSERT INTO attr_db_ident (e, a, v_data, tx, retracted_by)
-VALUES (303, 1, '"person/status"', 0, NULL);
-INSERT INTO attr_db_valuetype (e, a, v_data, tx, retracted_by)
-VALUES (303, 2, '100', 0, NULL);
-INSERT INTO attr_db_cardinality (e, a, v_data, tx, retracted_by)
-VALUES (303, 3, '200', 0, NULL);
-CALL mnemonic_create_attr_table(303, 'person/status', 'db.type/text');
+  code={`-- Create person/status attribute using the admin view
+INSERT INTO mnemonic_defined_attributes (ident, value_type, cardinality)
+VALUES ('person/status', 'db.type/text', 'db.cardinality/one');
 
 -- First, add the attribute as optional
 UPDATE mnemonic_defined_views

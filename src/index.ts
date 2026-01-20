@@ -189,66 +189,14 @@ export class MnemonicDB {
    * Creates the attribute metadata and an inherited table for the attribute's data.
    */
   async defineAttribute(attr: AttributeDefinition): Promise<bigint> {
-    const txId = await this.newTransaction();
-    const attrId = await this.allocateEntity("db");
-
-    // Get value type entity ID
-    const valueTypeId = await this.attrId(attr.valueType);
-    if (!valueTypeId) {
-      throw new Error(`Unknown value type: ${attr.valueType}`);
-    }
-
-    // Get cardinality entity ID
-    const cardinalityId = await this.attrId(attr.cardinality);
-    if (!cardinalityId) {
-      throw new Error(`Unknown cardinality: ${attr.cardinality}`);
-    }
-
-    // Assert ident (using attr_db_ident table)
-    await this.db.query(
-      `INSERT INTO attr_db_ident (e, a, v_data, tx, retracted_by) VALUES ($1, 1, to_jsonb($2::text), $3, NULL)`,
-      [attrId.toString(), attr.ident, txId.toString()]
+    // Use the self-managing admin view - it handles datom creation and table generation
+    const result = await this.db.query<{ id: string }>(
+      `INSERT INTO mnemonic_defined_attributes (ident, value_type, cardinality, unique_constraint, doc)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [attr.ident, attr.valueType, attr.cardinality, attr.unique ?? null, attr.doc ?? null]
     );
-
-    // Assert valueType (using attr_db_valuetype table)
-    await this.db.query(
-      `INSERT INTO attr_db_valuetype (e, a, v_data, tx, retracted_by) VALUES ($1, 2, to_jsonb($2::bigint), $3, NULL)`,
-      [attrId.toString(), valueTypeId.toString(), txId.toString()]
-    );
-
-    // Assert cardinality (using attr_db_cardinality table)
-    await this.db.query(
-      `INSERT INTO attr_db_cardinality (e, a, v_data, tx, retracted_by) VALUES ($1, 3, to_jsonb($2::bigint), $3, NULL)`,
-      [attrId.toString(), cardinalityId.toString(), txId.toString()]
-    );
-
-    // Assert unique if provided (using attr_db_unique table)
-    if (attr.unique) {
-      const uniqueId = await this.attrId(attr.unique);
-      if (!uniqueId) {
-        throw new Error(`Unknown uniqueness: ${attr.unique}`);
-      }
-      await this.db.query(
-        `INSERT INTO attr_db_unique (e, a, v_data, tx, retracted_by) VALUES ($1, 4, to_jsonb($2::bigint), $3, NULL)`,
-        [attrId.toString(), uniqueId.toString(), txId.toString()]
-      );
-    }
-
-    // Assert doc if provided (using attr_db_doc table)
-    if (attr.doc) {
-      await this.db.query(
-        `INSERT INTO attr_db_doc (e, a, v_data, tx, retracted_by) VALUES ($1, 5, to_jsonb($2::text), $3, NULL)`,
-        [attrId.toString(), attr.doc, txId.toString()]
-      );
-    }
-
-    // Create the inherited table for this attribute
-    await this.db.query(
-      `CALL mnemonic_create_attr_table($1, $2, $3)`,
-      [attrId.toString(), attr.ident, attr.valueType]
-    );
-
-    return attrId;
+    return BigInt(result.rows[0].id);
   }
 
   /**

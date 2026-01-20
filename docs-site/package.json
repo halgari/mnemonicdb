@@ -3,6 +3,8 @@
   "type": "module",
   "version": "0.0.1",
   "scripts": {
+    "prebuild": "cp ../sql/bootstrap.sql public/bootstrap.sql",
+    "predev": "cp ../sql/bootstrap.sql public/bootstrap.sql",
     "dev": "astro dev",
     "start": "astro dev",
     "build": "astro build",

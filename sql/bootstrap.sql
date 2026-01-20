@@ -844,6 +844,120 @@ END;
 $$;
 
 --------------------------------------------------------------------------------
+-- SELF-MANAGING ATTRIBUTE DEFINITIONS
+--------------------------------------------------------------------------------
+
+-- View for creating and managing attributes
+CREATE VIEW mnemonic_defined_attributes AS
+SELECT
+  ident.e AS id,
+  ident.v AS ident,
+  vtype_ident.v AS value_type,
+  card_ident.v AS cardinality,
+  uniq_ident.v AS unique_constraint,
+  doc.v AS doc
+FROM attr_db_ident ident
+JOIN attr_db_valuetype vtype ON ident.e = vtype.e AND vtype.retracted_by IS NULL
+JOIN attr_db_ident vtype_ident ON vtype.v = vtype_ident.e AND vtype_ident.retracted_by IS NULL
+JOIN attr_db_cardinality card ON ident.e = card.e AND card.retracted_by IS NULL
+JOIN attr_db_ident card_ident ON card.v = card_ident.e AND card_ident.retracted_by IS NULL
+LEFT JOIN attr_db_unique uniq ON ident.e = uniq.e AND uniq.retracted_by IS NULL
+LEFT JOIN attr_db_ident uniq_ident ON uniq.v = uniq_ident.e AND uniq_ident.retracted_by IS NULL
+LEFT JOIN attr_db_doc doc ON ident.e = doc.e AND doc.retracted_by IS NULL
+WHERE ident.retracted_by IS NULL
+  AND ident.v LIKE '%/%'
+  AND ident.v NOT LIKE 'db%';
+
+-- Lookup entity ID by ident
+CREATE FUNCTION mnemonic_ident_to_id(p_ident TEXT)
+RETURNS BIGINT
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT e FROM attr_db_ident
+  WHERE v = p_ident AND retracted_by IS NULL
+  LIMIT 1;
+$$;
+
+CREATE FUNCTION mnemonic_defined_attributes_insert()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  tx_id BIGINT;
+  attr_id BIGINT;
+  vtype_id BIGINT;
+  card_id BIGINT;
+  uniq_id BIGINT;
+BEGIN
+  -- Validate required fields
+  IF NEW.ident IS NULL THEN
+    RAISE EXCEPTION 'Attribute ident is required';
+  END IF;
+  IF NEW.value_type IS NULL THEN
+    RAISE EXCEPTION 'Attribute value_type is required';
+  END IF;
+  IF NEW.cardinality IS NULL THEN
+    RAISE EXCEPTION 'Attribute cardinality is required';
+  END IF;
+
+  -- Lookup value type entity ID
+  vtype_id := mnemonic_ident_to_id(NEW.value_type);
+  IF vtype_id IS NULL THEN
+    RAISE EXCEPTION 'Unknown value type: %', NEW.value_type;
+  END IF;
+
+  -- Lookup cardinality entity ID
+  card_id := mnemonic_ident_to_id(NEW.cardinality);
+  IF card_id IS NULL THEN
+    RAISE EXCEPTION 'Unknown cardinality: %', NEW.cardinality;
+  END IF;
+
+  -- Lookup unique constraint entity ID if provided
+  IF NEW.unique_constraint IS NOT NULL THEN
+    uniq_id := mnemonic_ident_to_id(NEW.unique_constraint);
+    IF uniq_id IS NULL THEN
+      RAISE EXCEPTION 'Unknown unique constraint: %', NEW.unique_constraint;
+    END IF;
+  END IF;
+
+  -- Allocate new entity and transaction
+  attr_id := mnemonic_allocate_entity('db');
+  tx_id := mnemonic_new_transaction();
+
+  -- Insert attribute datoms
+  INSERT INTO attr_db_ident (e, a, v_data, tx, retracted_by)
+  VALUES (attr_id, 1, to_jsonb(NEW.ident), tx_id, NULL);
+
+  INSERT INTO attr_db_valuetype (e, a, v_data, tx, retracted_by)
+  VALUES (attr_id, 2, to_jsonb(vtype_id), tx_id, NULL);
+
+  INSERT INTO attr_db_cardinality (e, a, v_data, tx, retracted_by)
+  VALUES (attr_id, 3, to_jsonb(card_id), tx_id, NULL);
+
+  IF uniq_id IS NOT NULL THEN
+    INSERT INTO attr_db_unique (e, a, v_data, tx, retracted_by)
+    VALUES (attr_id, 4, to_jsonb(uniq_id), tx_id, NULL);
+  END IF;
+
+  IF NEW.doc IS NOT NULL THEN
+    INSERT INTO attr_db_doc (e, a, v_data, tx, retracted_by)
+    VALUES (attr_id, 5, to_jsonb(NEW.doc), tx_id, NULL);
+  END IF;
+
+  -- Create the attribute table
+  CALL mnemonic_create_attr_table(attr_id, NEW.ident, NEW.value_type);
+
+  NEW.id := attr_id;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER mnemonic_defined_attributes_insert_trigger
+  INSTEAD OF INSERT ON mnemonic_defined_attributes
+  FOR EACH ROW EXECUTE FUNCTION mnemonic_defined_attributes_insert();
+
+--------------------------------------------------------------------------------
 -- SELF-MANAGING VIEW DEFINITIONS
 --------------------------------------------------------------------------------
 

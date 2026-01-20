@@ -1,0 +1,8 @@
+# Build output
+dist/
+
+# Dependencies
+node_modules/
+
+# Copied from parent - always regenerated
+public/bootstrap.sql
