@@ -477,15 +477,17 @@ DECLARE
   attr RECORD;
   select_cols TEXT := 'base_entity.e AS id';
   from_clause TEXT := '';
+  base_entity_unions TEXT := '';
   join_idx INTEGER := 0;
   col_name TEXT;
   table_name TEXT;
   alias TEXT;
+  used_tables TEXT[] := '{}';
 BEGIN
   -- Drop existing view and triggers if they exist
   EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', p_view_name);
 
-  -- Build SELECT and FROM clauses
+  -- Build SELECT and FROM clauses, tracking which tables are used
   FOR attr IN
     SELECT * FROM mnemonic_view_attributes WHERE view_name = p_view_name
   LOOP
@@ -493,6 +495,11 @@ BEGIN
     alias := 'j' || join_idx;
     col_name := mnemonic_attr_to_column(attr.attribute_ident);
     table_name := mnemonic_value_type_table(attr.value_type);
+
+    -- Track unique tables used
+    IF NOT table_name = ANY(used_tables) THEN
+      used_tables := used_tables || table_name;
+    END IF;
 
     IF attr.cardinality = 'db.cardinality/one' THEN
       select_cols := select_cols || format(', %I.v AS %I', alias, col_name);
@@ -516,28 +523,24 @@ BEGIN
     RETURN;
   END IF;
 
+  -- Build base_entity UNION only for tables actually used
+  FOR i IN 1..array_length(used_tables, 1)
+  LOOP
+    IF base_entity_unions != '' THEN
+      base_entity_unions := base_entity_unions || ' UNION ';
+    END IF;
+    base_entity_unions := base_entity_unions || format(
+      'SELECT DISTINCT e FROM %I WHERE a IN (SELECT attribute_id FROM mnemonic_view_attributes WHERE view_name = %L) AND retracted_by IS NULL',
+      used_tables[i], p_view_name
+    );
+  END LOOP;
+
   -- Create the view
-  -- base_entity comes from finding all entities that have at least one of the view's attributes
   EXECUTE format(
-    'CREATE VIEW %I AS SELECT DISTINCT %s FROM (
-      SELECT DISTINCT e FROM datoms_text WHERE a IN (SELECT attribute_id FROM mnemonic_view_attributes WHERE view_name = %L) AND retracted_by IS NULL
-      UNION SELECT DISTINCT e FROM datoms_int4 WHERE a IN (SELECT attribute_id FROM mnemonic_view_attributes WHERE view_name = %L) AND retracted_by IS NULL
-      UNION SELECT DISTINCT e FROM datoms_int8 WHERE a IN (SELECT attribute_id FROM mnemonic_view_attributes WHERE view_name = %L) AND retracted_by IS NULL
-      UNION SELECT DISTINCT e FROM datoms_float4 WHERE a IN (SELECT attribute_id FROM mnemonic_view_attributes WHERE view_name = %L) AND retracted_by IS NULL
-      UNION SELECT DISTINCT e FROM datoms_float8 WHERE a IN (SELECT attribute_id FROM mnemonic_view_attributes WHERE view_name = %L) AND retracted_by IS NULL
-      UNION SELECT DISTINCT e FROM datoms_numeric WHERE a IN (SELECT attribute_id FROM mnemonic_view_attributes WHERE view_name = %L) AND retracted_by IS NULL
-      UNION SELECT DISTINCT e FROM datoms_bool WHERE a IN (SELECT attribute_id FROM mnemonic_view_attributes WHERE view_name = %L) AND retracted_by IS NULL
-      UNION SELECT DISTINCT e FROM datoms_timestamptz WHERE a IN (SELECT attribute_id FROM mnemonic_view_attributes WHERE view_name = %L) AND retracted_by IS NULL
-      UNION SELECT DISTINCT e FROM datoms_date WHERE a IN (SELECT attribute_id FROM mnemonic_view_attributes WHERE view_name = %L) AND retracted_by IS NULL
-      UNION SELECT DISTINCT e FROM datoms_uuid WHERE a IN (SELECT attribute_id FROM mnemonic_view_attributes WHERE view_name = %L) AND retracted_by IS NULL
-      UNION SELECT DISTINCT e FROM datoms_bytea WHERE a IN (SELECT attribute_id FROM mnemonic_view_attributes WHERE view_name = %L) AND retracted_by IS NULL
-      UNION SELECT DISTINCT e FROM datoms_jsonb WHERE a IN (SELECT attribute_id FROM mnemonic_view_attributes WHERE view_name = %L) AND retracted_by IS NULL
-      UNION SELECT DISTINCT e FROM datoms_ref WHERE a IN (SELECT attribute_id FROM mnemonic_view_attributes WHERE view_name = %L) AND retracted_by IS NULL
-    ) base_entity %s',
+    'CREATE VIEW %I AS SELECT DISTINCT %s FROM (%s) base_entity %s',
     p_view_name,
     select_cols,
-    p_view_name, p_view_name, p_view_name, p_view_name, p_view_name, p_view_name,
-    p_view_name, p_view_name, p_view_name, p_view_name, p_view_name, p_view_name, p_view_name,
+    base_entity_unions,
     from_clause
   );
 
