@@ -1,4 +1,4 @@
-import { createMnemonicDB } from "./dist/index.js";
+import { createMnemonicDB } from "../dist/index.js";
 
 const NUM_USERS = 20_000;
 
