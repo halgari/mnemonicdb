@@ -293,19 +293,28 @@ AS $$
   LIMIT 1;
 $$;
 
+-- Get the current as-of transaction (cached per query since STABLE with no args)
+CREATE FUNCTION mnemonic_as_of_tx_cached()
+RETURNS BIGINT
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT NULLIF(current_setting('mnemonic.as_of_tx', true), '')::bigint;
+$$;
+
 -- Check if a datom is visible given the current temporal context
+-- Uses mnemonic_as_of_tx_cached() which PostgreSQL evaluates once per query
 CREATE FUNCTION mnemonic_datom_visible(datom_tx BIGINT, datom_retracted_by BIGINT)
 RETURNS BOOLEAN
 LANGUAGE sql
 STABLE
 AS $$
   SELECT CASE
-    WHEN COALESCE(NULLIF(current_setting('mnemonic.as_of_tx', true), ''), '') = '' THEN
+    WHEN mnemonic_as_of_tx_cached() IS NULL THEN
       datom_retracted_by IS NULL
     ELSE
-      datom_tx <= current_setting('mnemonic.as_of_tx', true)::BIGINT
-      AND (datom_retracted_by IS NULL
-           OR datom_retracted_by > current_setting('mnemonic.as_of_tx', true)::BIGINT)
+      datom_tx <= mnemonic_as_of_tx_cached()
+      AND (datom_retracted_by IS NULL OR datom_retracted_by > mnemonic_as_of_tx_cached())
   END;
 $$;
 
@@ -519,14 +528,20 @@ WHERE view_ident.retracted_by IS NULL;
 -- VIEW REGENERATION
 --------------------------------------------------------------------------------
 
-CREATE PROCEDURE mnemonic_regenerate_view(p_view_name TEXT)
+-- Generate a view with specified visibility check
+-- p_use_temporal: false = simple "retracted_by IS NULL", true = full temporal check
+CREATE PROCEDURE mnemonic_generate_view_sql(
+  p_view_name TEXT,
+  p_actual_view_name TEXT,
+  p_use_temporal BOOLEAN,
+  OUT p_select_cols TEXT,
+  OUT p_from_clause TEXT,
+  OUT p_where_clause TEXT
+)
 LANGUAGE plpgsql
 AS $$
 DECLARE
   attr RECORD;
-  select_cols TEXT;
-  from_clause TEXT;
-  where_clause TEXT;
   join_idx INTEGER := 0;
   col_name TEXT;
   table_name TEXT;
@@ -534,8 +549,11 @@ DECLARE
   join_type TEXT;
   is_first BOOLEAN := true;
   base_alias TEXT;
+  visibility_check TEXT;
 BEGIN
-  EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', p_view_name);
+  p_select_cols := '';
+  p_from_clause := '';
+  p_where_clause := '';
 
   FOR attr IN
     SELECT * FROM mnemonic_view_attributes
@@ -547,51 +565,141 @@ BEGIN
     col_name := mnemonic_attr_to_column(attr.attribute_ident);
     table_name := mnemonic_attr_table_name(attr.attribute_ident);
 
+    -- Choose visibility check based on temporal flag
+    IF p_use_temporal THEN
+      visibility_check := format('mnemonic_datom_visible(%I.tx, %I.retracted_by)', alias, alias);
+    ELSE
+      visibility_check := format('%I.retracted_by IS NULL', alias);
+    END IF;
+
     IF is_first THEN
       base_alias := alias;
-      select_cols := format('%I.e AS id', alias);
-      from_clause := format('%I %I', table_name, alias);
-      where_clause := format('mnemonic_datom_visible(%I.tx, %I.retracted_by)', alias, alias);
+      p_select_cols := format('%I.e AS id', alias);
+      p_from_clause := format('%I %I', table_name, alias);
+      p_where_clause := visibility_check;
       is_first := false;
 
       IF attr.cardinality = 'db.cardinality/one' THEN
-        select_cols := select_cols || format(', %I.v AS %I', alias, col_name);
+        p_select_cols := p_select_cols || format(', %I.v AS %I', alias, col_name);
       ELSE
-        select_cols := select_cols || format(', %I_arr.v AS %I', alias, col_name);
-        from_clause := from_clause || format(
-          ' LEFT JOIN LATERAL (SELECT ARRAY_AGG(v) AS v FROM %I WHERE e = %I.e AND mnemonic_datom_visible(tx, retracted_by)) %I_arr ON true',
-          table_name, base_alias, alias
-        );
+        p_select_cols := p_select_cols || format(', %I_arr.v AS %I', alias, col_name);
+        IF p_use_temporal THEN
+          p_from_clause := p_from_clause || format(
+            ' LEFT JOIN LATERAL (SELECT ARRAY_AGG(v) AS v FROM %I WHERE e = %I.e AND mnemonic_datom_visible(tx, retracted_by)) %I_arr ON true',
+            table_name, base_alias, alias
+          );
+        ELSE
+          p_from_clause := p_from_clause || format(
+            ' LEFT JOIN LATERAL (SELECT ARRAY_AGG(v) AS v FROM %I WHERE e = %I.e AND retracted_by IS NULL) %I_arr ON true',
+            table_name, base_alias, alias
+          );
+        END IF;
       END IF;
     ELSE
       join_type := CASE WHEN attr.required THEN 'INNER JOIN' ELSE 'LEFT JOIN' END;
 
       IF attr.cardinality = 'db.cardinality/one' THEN
-        select_cols := select_cols || format(', %I.v AS %I', alias, col_name);
-        from_clause := from_clause || format(
-          ' %s %I %I ON %I.e = %I.e AND mnemonic_datom_visible(%I.tx, %I.retracted_by)',
-          join_type, table_name, alias, base_alias, alias, alias, alias
-        );
+        p_select_cols := p_select_cols || format(', %I.v AS %I', alias, col_name);
+        IF p_use_temporal THEN
+          p_from_clause := p_from_clause || format(
+            ' %s %I %I ON %I.e = %I.e AND mnemonic_datom_visible(%I.tx, %I.retracted_by)',
+            join_type, table_name, alias, base_alias, alias, alias, alias
+          );
+        ELSE
+          p_from_clause := p_from_clause || format(
+            ' %s %I %I ON %I.e = %I.e AND %I.retracted_by IS NULL',
+            join_type, table_name, alias, base_alias, alias, alias
+          );
+        END IF;
       ELSE
-        select_cols := select_cols || format(', %I.v AS %I', alias, col_name);
-        from_clause := from_clause || format(
-          ' LEFT JOIN LATERAL (SELECT ARRAY_AGG(v) AS v FROM %I WHERE e = %I.e AND mnemonic_datom_visible(tx, retracted_by)) %I ON true',
-          table_name, base_alias, alias
-        );
+        p_select_cols := p_select_cols || format(', %I.v AS %I', alias, col_name);
+        IF p_use_temporal THEN
+          p_from_clause := p_from_clause || format(
+            ' LEFT JOIN LATERAL (SELECT ARRAY_AGG(v) AS v FROM %I WHERE e = %I.e AND mnemonic_datom_visible(tx, retracted_by)) %I ON true',
+            table_name, base_alias, alias
+          );
+        ELSE
+          p_from_clause := p_from_clause || format(
+            ' LEFT JOIN LATERAL (SELECT ARRAY_AGG(v) AS v FROM %I WHERE e = %I.e AND retracted_by IS NULL) %I ON true',
+            table_name, base_alias, alias
+          );
+        END IF;
       END IF;
     END IF;
   END LOOP;
+END;
+$$;
 
-  IF join_idx = 0 THEN
+-- Regenerate both _current and _history views for a view definition
+CREATE PROCEDURE mnemonic_regenerate_view(p_view_name TEXT)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  select_cols TEXT;
+  from_clause TEXT;
+  where_clause TEXT;
+  current_view_name TEXT;
+  history_view_name TEXT;
+BEGIN
+  current_view_name := p_view_name || '_current';
+  history_view_name := p_view_name || '_history';
+
+  -- Drop existing views
+  EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', current_view_name);
+  EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', history_view_name);
+
+  -- Generate _current view (fast, simple retracted_by IS NULL)
+  CALL mnemonic_generate_view_sql(p_view_name, current_view_name, false, select_cols, from_clause, where_clause);
+
+  IF select_cols = '' THEN
     RAISE NOTICE 'View % has no attributes, skipping', p_view_name;
     RETURN;
   END IF;
 
   EXECUTE format(
     'CREATE VIEW %I AS SELECT %s FROM %s WHERE %s',
-    p_view_name, select_cols, from_clause, where_clause
+    current_view_name, select_cols, from_clause, where_clause
   );
 
+  -- Add DML triggers to _current view
+  EXECUTE format(
+    'CREATE TRIGGER %I_insert INSTEAD OF INSERT ON %I FOR EACH ROW EXECUTE FUNCTION mnemonic_view_insert(%L)',
+    current_view_name, current_view_name, p_view_name
+  );
+
+  EXECUTE format(
+    'CREATE TRIGGER %I_update INSTEAD OF UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION mnemonic_view_update(%L)',
+    current_view_name, current_view_name, p_view_name
+  );
+
+  EXECUTE format(
+    'CREATE TRIGGER %I_delete INSTEAD OF DELETE ON %I FOR EACH ROW EXECUTE FUNCTION mnemonic_view_delete(%L)',
+    current_view_name, current_view_name, p_view_name
+  );
+
+  -- Generate _history view (temporal, uses mnemonic_datom_visible)
+  CALL mnemonic_generate_view_sql(p_view_name, history_view_name, true, select_cols, from_clause, where_clause);
+
+  EXECUTE format(
+    'CREATE VIEW %I AS SELECT %s FROM %s WHERE %s',
+    history_view_name, select_cols, from_clause, where_clause
+  );
+
+  -- Generate dispatching view (base name) that routes to _current or _history
+  -- based on whether mnemonic.as_of_tx is set
+  -- The UNION ALL with mutually exclusive conditions allows the optimizer to prune
+  EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', p_view_name);
+  EXECUTE format(
+    'CREATE VIEW %I AS
+     SELECT * FROM %I
+     WHERE COALESCE(NULLIF(current_setting(''mnemonic.as_of_tx'', true), ''''), '''') = ''''
+     UNION ALL
+     SELECT * FROM %I
+     WHERE COALESCE(NULLIF(current_setting(''mnemonic.as_of_tx'', true), ''''), '''') != ''''',
+    p_view_name, current_view_name, history_view_name
+  );
+
+  -- Add DML triggers to base view (routes to _current for writes)
   EXECUTE format(
     'CREATE TRIGGER %I_insert INSTEAD OF INSERT ON %I FOR EACH ROW EXECUTE FUNCTION mnemonic_view_insert(%L)',
     p_view_name, p_view_name, p_view_name
@@ -834,7 +942,10 @@ BEGIN
     INSERT INTO attr_db_view_ident (e, a, v_data, tx, retracted_by)
     VALUES (OLD.id, 10, to_jsonb(NEW.name), tx_id, NULL);
 
+    -- Drop all three views (base, _current, _history)
     EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', OLD.name);
+    EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', OLD.name || '_current');
+    EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', OLD.name || '_history');
   END IF;
 
   IF NEW.attributes IS DISTINCT FROM OLD.attributes THEN
@@ -906,7 +1017,10 @@ BEGIN
   UPDATE attr_db_view_doc SET retracted_by = tx_id
   WHERE e = OLD.id AND retracted_by IS NULL;
 
+  -- Drop all three views (base, _current, _history)
   EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', OLD.name);
+  EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', OLD.name || '_current');
+  EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', OLD.name || '_history');
 
   RETURN OLD;
 END;
