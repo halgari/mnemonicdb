@@ -179,47 +179,64 @@ export class MnemonicDB {
 
   /**
    * Define a new view in the schema.
+   * Automatically creates the SQL view via the mnemonic_defined_views admin table.
    */
   async defineView(view: ViewDefinition): Promise<bigint> {
-    const txId = await this.newTransaction();
-    const viewId = await this.allocateEntity("db");
-
-    // View attribute IDs (from bootstrap)
-    const dbViewIdent = 10n;
-    const dbViewAttributes = 11n;
-    const dbViewDoc = 12n;
-
-    // Assert view ident
-    await this.db.query(
-      `INSERT INTO datoms_text (e, a, v, tx, retracted_by) VALUES ($1, $2, $3, $4, NULL)`,
-      [viewId.toString(), dbViewIdent.toString(), view.name, txId.toString()]
+    // Use the self-managing admin view - it handles datom creation and SQL view generation
+    const result = await this.db.query<{ id: string }>(
+      `INSERT INTO mnemonic_defined_views (name, attributes, doc)
+       VALUES ($1, $2, $3)
+       RETURNING id`,
+      [view.name, view.attributes, view.doc ?? null]
     );
+    return BigInt(result.rows[0].id);
+  }
 
-    // Assert each attribute reference
-    for (const attrIdent of view.attributes) {
-      const attrId = await this.attrId(attrIdent);
-      if (!attrId) {
-        throw new Error(`Unknown attribute: ${attrIdent}`);
-      }
-      await this.db.query(
-        `INSERT INTO datoms_ref (e, a, v, tx, retracted_by) VALUES ($1, $2, $3, $4, NULL)`,
-        [viewId.toString(), dbViewAttributes.toString(), attrId.toString(), txId.toString()]
-      );
+  /**
+   * Update an existing view definition.
+   * Automatically regenerates the SQL view.
+   */
+  async updateView(name: string, view: Partial<ViewDefinition>): Promise<void> {
+    const setClauses: string[] = [];
+    const params: unknown[] = [];
+    let paramIdx = 1;
+
+    if (view.name !== undefined) {
+      setClauses.push(`name = $${paramIdx++}`);
+      params.push(view.name);
+    }
+    if (view.attributes !== undefined) {
+      setClauses.push(`attributes = $${paramIdx++}`);
+      params.push(view.attributes);
+    }
+    if (view.doc !== undefined) {
+      setClauses.push(`doc = $${paramIdx++}`);
+      params.push(view.doc);
     }
 
-    // Assert doc if provided
-    if (view.doc) {
-      await this.db.query(
-        `INSERT INTO datoms_text (e, a, v, tx, retracted_by) VALUES ($1, $2, $3, $4, NULL)`,
-        [viewId.toString(), dbViewDoc.toString(), view.doc, txId.toString()]
-      );
-    }
+    if (setClauses.length === 0) return;
 
-    return viewId;
+    params.push(name);
+    await this.db.query(
+      `UPDATE mnemonic_defined_views SET ${setClauses.join(", ")} WHERE name = $${paramIdx}`,
+      params
+    );
+  }
+
+  /**
+   * Delete a view definition.
+   * Automatically drops the SQL view.
+   */
+  async deleteView(name: string): Promise<void> {
+    await this.db.query(
+      `DELETE FROM mnemonic_defined_views WHERE name = $1`,
+      [name]
+    );
   }
 
   /**
    * Regenerate all projection views from schema definitions.
+   * Usually not needed since views auto-regenerate, but useful for manual sync.
    */
   async regenerateViews(): Promise<void> {
     await this.db.exec("CALL mnemonic_regenerate_views()");

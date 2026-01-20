@@ -697,3 +697,177 @@ BEGIN
   RETURN OLD;
 END;
 $$;
+
+--------------------------------------------------------------------------------
+-- SELF-MANAGING VIEW DEFINITIONS
+--------------------------------------------------------------------------------
+
+-- Admin view showing view definitions with attributes as array
+CREATE VIEW mnemonic_defined_views AS
+SELECT
+  view_ident.e AS id,
+  view_ident.v AS name,
+  ARRAY_AGG(attr_ident.v ORDER BY attr_ident.v) AS attributes,
+  doc.v AS doc
+FROM datoms_text view_ident
+LEFT JOIN datoms_ref view_attrs ON view_ident.e = view_attrs.e
+  AND view_attrs.a = 11 AND view_attrs.retracted_by IS NULL
+LEFT JOIN datoms_text attr_ident ON view_attrs.v = attr_ident.e
+  AND attr_ident.a = 1 AND attr_ident.retracted_by IS NULL
+LEFT JOIN datoms_text doc ON view_ident.e = doc.e
+  AND doc.a = 12 AND doc.retracted_by IS NULL
+WHERE view_ident.a = 10
+  AND view_ident.retracted_by IS NULL
+GROUP BY view_ident.e, view_ident.v, doc.v;
+
+-- INSERT trigger for mnemonic_defined_views
+CREATE FUNCTION mnemonic_defined_views_insert()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  tx_id BIGINT;
+  view_id BIGINT;
+  attr_ident TEXT;
+  attr_id BIGINT;
+BEGIN
+  -- Allocate view entity and transaction
+  view_id := mnemonic_allocate_entity('db');
+  tx_id := mnemonic_new_transaction();
+
+  -- Assert view ident
+  INSERT INTO datoms_text (e, a, v, tx, retracted_by)
+  VALUES (view_id, 10, NEW.name, tx_id, NULL);
+
+  -- Assert each attribute reference
+  IF NEW.attributes IS NOT NULL THEN
+    FOREACH attr_ident IN ARRAY NEW.attributes
+    LOOP
+      attr_id := mnemonic_attr_id(attr_ident);
+      IF attr_id IS NULL THEN
+        RAISE EXCEPTION 'Unknown attribute: %', attr_ident;
+      END IF;
+      INSERT INTO datoms_ref (e, a, v, tx, retracted_by)
+      VALUES (view_id, 11, attr_id, tx_id, NULL);
+    END LOOP;
+  END IF;
+
+  -- Assert doc if provided
+  IF NEW.doc IS NOT NULL THEN
+    INSERT INTO datoms_text (e, a, v, tx, retracted_by)
+    VALUES (view_id, 12, NEW.doc, tx_id, NULL);
+  END IF;
+
+  -- Regenerate the SQL view
+  CALL mnemonic_regenerate_view(NEW.name);
+
+  NEW.id := view_id;
+  RETURN NEW;
+END;
+$$;
+
+-- UPDATE trigger for mnemonic_defined_views
+CREATE FUNCTION mnemonic_defined_views_update()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  tx_id BIGINT;
+  attr_ident TEXT;
+  attr_id BIGINT;
+  old_name TEXT;
+BEGIN
+  tx_id := mnemonic_new_transaction();
+  old_name := OLD.name;
+
+  -- If name changed, retract old and assert new
+  IF NEW.name IS DISTINCT FROM OLD.name THEN
+    UPDATE datoms_text SET retracted_by = tx_id
+    WHERE e = OLD.id AND a = 10 AND retracted_by IS NULL;
+
+    INSERT INTO datoms_text (e, a, v, tx, retracted_by)
+    VALUES (OLD.id, 10, NEW.name, tx_id, NULL);
+
+    -- Drop the old SQL view
+    EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', OLD.name);
+  END IF;
+
+  -- If attributes changed, retract all old refs and add new ones
+  IF NEW.attributes IS DISTINCT FROM OLD.attributes THEN
+    -- Retract all old attribute refs
+    UPDATE datoms_ref SET retracted_by = tx_id
+    WHERE e = OLD.id AND a = 11 AND retracted_by IS NULL;
+
+    -- Add new attribute refs
+    IF NEW.attributes IS NOT NULL THEN
+      FOREACH attr_ident IN ARRAY NEW.attributes
+      LOOP
+        attr_id := mnemonic_attr_id(attr_ident);
+        IF attr_id IS NULL THEN
+          RAISE EXCEPTION 'Unknown attribute: %', attr_ident;
+        END IF;
+        INSERT INTO datoms_ref (e, a, v, tx, retracted_by)
+        VALUES (OLD.id, 11, attr_id, tx_id, NULL);
+      END LOOP;
+    END IF;
+  END IF;
+
+  -- If doc changed
+  IF NEW.doc IS DISTINCT FROM OLD.doc THEN
+    UPDATE datoms_text SET retracted_by = tx_id
+    WHERE e = OLD.id AND a = 12 AND retracted_by IS NULL;
+
+    IF NEW.doc IS NOT NULL THEN
+      INSERT INTO datoms_text (e, a, v, tx, retracted_by)
+      VALUES (OLD.id, 12, NEW.doc, tx_id, NULL);
+    END IF;
+  END IF;
+
+  -- Regenerate the SQL view
+  CALL mnemonic_regenerate_view(NEW.name);
+
+  RETURN NEW;
+END;
+$$;
+
+-- DELETE trigger for mnemonic_defined_views
+CREATE FUNCTION mnemonic_defined_views_delete()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  tx_id BIGINT;
+BEGIN
+  tx_id := mnemonic_new_transaction();
+
+  -- Retract view ident
+  UPDATE datoms_text SET retracted_by = tx_id
+  WHERE e = OLD.id AND a = 10 AND retracted_by IS NULL;
+
+  -- Retract all attribute refs
+  UPDATE datoms_ref SET retracted_by = tx_id
+  WHERE e = OLD.id AND a = 11 AND retracted_by IS NULL;
+
+  -- Retract doc
+  UPDATE datoms_text SET retracted_by = tx_id
+  WHERE e = OLD.id AND a = 12 AND retracted_by IS NULL;
+
+  -- Drop the SQL view
+  EXECUTE format('DROP VIEW IF EXISTS %I CASCADE', OLD.name);
+
+  RETURN OLD;
+END;
+$$;
+
+-- Create triggers on mnemonic_defined_views
+CREATE TRIGGER mnemonic_defined_views_insert_trigger
+  INSTEAD OF INSERT ON mnemonic_defined_views
+  FOR EACH ROW EXECUTE FUNCTION mnemonic_defined_views_insert();
+
+CREATE TRIGGER mnemonic_defined_views_update_trigger
+  INSTEAD OF UPDATE ON mnemonic_defined_views
+  FOR EACH ROW EXECUTE FUNCTION mnemonic_defined_views_update();
+
+CREATE TRIGGER mnemonic_defined_views_delete_trigger
+  INSTEAD OF DELETE ON mnemonic_defined_views
+  FOR EACH ROW EXECUTE FUNCTION mnemonic_defined_views_delete();

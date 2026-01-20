@@ -132,7 +132,7 @@ describe("MnemonicDB", () => {
   });
 
   describe("view definition", () => {
-    it("should define a view with attributes", async () => {
+    it("should define a view with attributes and auto-create SQL view", async () => {
       // Define attributes first
       await db.defineAttribute({
         ident: "person/name",
@@ -145,7 +145,7 @@ describe("MnemonicDB", () => {
         cardinality: "db.cardinality/one",
       });
 
-      // Define view
+      // Define view - SQL view should be created automatically
       await db.defineView({
         name: "persons",
         attributes: ["person/name", "person/age"],
@@ -165,12 +165,81 @@ describe("MnemonicDB", () => {
         "person/age",
         "person/name",
       ]);
+
+      // SQL view should already exist - no regenerateViews() needed!
+      const result = await db.query("SELECT * FROM persons");
+      expect(result).toEqual([]);
+    });
+
+    it("should update view definition and auto-regenerate SQL view", async () => {
+      await db.defineAttribute({
+        ident: "person/name",
+        valueType: "db.type/text",
+        cardinality: "db.cardinality/one",
+      });
+      await db.defineAttribute({
+        ident: "person/age",
+        valueType: "db.type/int4",
+        cardinality: "db.cardinality/one",
+      });
+      await db.defineAttribute({
+        ident: "person/email",
+        valueType: "db.type/text",
+        cardinality: "db.cardinality/one",
+      });
+
+      // Create view with just name and age
+      await db.defineView({
+        name: "persons",
+        attributes: ["person/name", "person/age"],
+      });
+
+      // Insert a person
+      await db.exec("INSERT INTO persons (name, age) VALUES ('Test', 25)");
+
+      // Update view to add email column
+      await db.updateView("persons", {
+        attributes: ["person/name", "person/age", "person/email"],
+      });
+
+      // New column should exist
+      const cols = await db.query<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_name = 'persons' ORDER BY column_name`
+      );
+      expect(cols.map((c) => c.column_name).sort()).toEqual(["age", "email", "id", "name"]);
+    });
+
+    it("should delete view definition and drop SQL view", async () => {
+      await db.defineAttribute({
+        ident: "person/name",
+        valueType: "db.type/text",
+        cardinality: "db.cardinality/one",
+      });
+      await db.defineView({
+        name: "persons",
+        attributes: ["person/name"],
+      });
+
+      // View should exist
+      let views = await db.listViews();
+      expect(views.find((v) => v.name === "persons")).toBeDefined();
+
+      // Delete view
+      await db.deleteView("persons");
+
+      // View definition should be gone
+      views = await db.listViews();
+      expect(views.find((v) => v.name === "persons")).toBeUndefined();
+
+      // SQL view should be dropped
+      await expect(db.query("SELECT * FROM persons")).rejects.toThrow();
     });
   });
 
-  describe("view regeneration and DML", () => {
+  describe("view DML operations", () => {
     beforeEach(async () => {
-      // Define schema
+      // Define schema - views auto-create now
       await db.defineAttribute({
         ident: "person/name",
         valueType: "db.type/text",
@@ -185,13 +254,7 @@ describe("MnemonicDB", () => {
         name: "persons",
         attributes: ["person/name", "person/age"],
       });
-      await db.regenerateViews();
-    });
-
-    it("should create SQL view from schema", async () => {
-      // View should exist and be queryable
-      const result = await db.query("SELECT * FROM persons");
-      expect(result).toEqual([]);
+      // No regenerateViews() needed!
     });
 
     it("should INSERT via view", async () => {
