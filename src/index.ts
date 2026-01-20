@@ -111,6 +111,43 @@ export class MnemonicDB {
   }
 
   /**
+   * Set the as-of transaction for temporal queries.
+   * All subsequent queries will see the database as of this transaction.
+   * Pass null to return to current (latest) view.
+   */
+  async setAsOf(txId: bigint | null): Promise<void> {
+    await this.db.query("SELECT mnemonic_set_as_of($1)", [
+      txId?.toString() ?? null,
+    ]);
+  }
+
+  /**
+   * Get the current as-of transaction.
+   * Returns null if viewing current (latest) state.
+   */
+  async getAsOf(): Promise<bigint | null> {
+    const result = await this.db.query<{ mnemonic_get_as_of: string | null }>(
+      "SELECT mnemonic_get_as_of()"
+    );
+    const value = result.rows[0].mnemonic_get_as_of;
+    return value ? BigInt(value) : null;
+  }
+
+  /**
+   * Execute a function with a specific as-of context, then restore the previous context.
+   * Useful for temporarily viewing historical data.
+   */
+  async withAsOf<T>(txId: bigint | null, fn: () => Promise<T>): Promise<T> {
+    const previousAsOf = await this.getAsOf();
+    try {
+      await this.setAsOf(txId);
+      return await fn();
+    } finally {
+      await this.setAsOf(previousAsOf);
+    }
+  }
+
+  /**
    * Define a new attribute in the schema.
    */
   async defineAttribute(attr: AttributeDefinition): Promise<bigint> {

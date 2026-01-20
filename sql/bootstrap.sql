@@ -495,10 +495,65 @@ AS $$
   END;
 $$;
 
+-- Check if a datom is visible given the current temporal context
+-- This function is called at query time, not view creation time
+-- If mnemonic.as_of_tx is set, uses as-of semantics
+-- Otherwise uses current-only semantics (retracted_by IS NULL)
+CREATE FUNCTION mnemonic_datom_visible(datom_tx BIGINT, datom_retracted_by BIGINT)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT CASE
+    -- No as_of set: current view (only non-retracted datoms)
+    WHEN COALESCE(NULLIF(current_setting('mnemonic.as_of_tx', true), ''), '') = '' THEN
+      datom_retracted_by IS NULL
+    -- as_of set: datom existed at that transaction
+    ELSE
+      datom_tx <= current_setting('mnemonic.as_of_tx', true)::BIGINT
+      AND (datom_retracted_by IS NULL
+           OR datom_retracted_by > current_setting('mnemonic.as_of_tx', true)::BIGINT)
+  END;
+$$;
+
+-- Helper to set the as-of transaction for temporal queries
+CREATE FUNCTION mnemonic_set_as_of(tx_id BIGINT)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF tx_id IS NULL THEN
+    -- Clear the setting to return to current view
+    PERFORM set_config('mnemonic.as_of_tx', '', false);
+  ELSE
+    PERFORM set_config('mnemonic.as_of_tx', tx_id::TEXT, false);
+  END IF;
+END;
+$$;
+
+-- Helper to get the current as-of transaction (NULL = current)
+CREATE FUNCTION mnemonic_get_as_of()
+RETURNS BIGINT
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  as_of_tx TEXT;
+BEGIN
+  as_of_tx := current_setting('mnemonic.as_of_tx', true);
+  IF as_of_tx IS NULL OR as_of_tx = '' THEN
+    RETURN NULL;
+  ELSE
+    RETURN as_of_tx::BIGINT;
+  END IF;
+END;
+$$;
+
 -- Regenerate a single view using join-based approach:
 -- First required attribute = base table
 -- Other required attributes = INNER JOIN
 -- Optional attributes = LEFT JOIN
+-- NOTE: Views use mnemonic_temporal_filter() which respects mnemonic.as_of_tx session variable
 CREATE PROCEDURE mnemonic_regenerate_view(p_view_name TEXT)
 LANGUAGE plpgsql
 AS $$
@@ -534,8 +589,8 @@ BEGIN
       base_alias := alias;
       select_cols := format('%I.e AS id', alias);
       from_clause := format('%I %I', table_name, alias);
-      where_clause := format('%I.a = %s AND %I.retracted_by IS NULL',
-        alias, attr.attribute_id, alias);
+      where_clause := format('%I.a = %s AND mnemonic_datom_visible(%I.tx, %I.retracted_by)',
+        alias, attr.attribute_id, alias, alias);
       is_first := false;
 
       IF attr.cardinality = 'db.cardinality/one' THEN
@@ -544,7 +599,7 @@ BEGIN
         -- Cardinality many for base - need lateral
         select_cols := select_cols || format(', %I_arr.v AS %I', alias, col_name);
         from_clause := from_clause || format(
-          ' LEFT JOIN LATERAL (SELECT ARRAY_AGG(v) AS v FROM %I WHERE e = %I.e AND a = %s AND retracted_by IS NULL) %I_arr ON true',
+          ' LEFT JOIN LATERAL (SELECT ARRAY_AGG(v) AS v FROM %I WHERE e = %I.e AND a = %s AND mnemonic_datom_visible(tx, retracted_by)) %I_arr ON true',
           table_name, base_alias, attr.attribute_id, alias
         );
       END IF;
@@ -555,14 +610,14 @@ BEGIN
       IF attr.cardinality = 'db.cardinality/one' THEN
         select_cols := select_cols || format(', %I.v AS %I', alias, col_name);
         from_clause := from_clause || format(
-          ' %s %I %I ON %I.e = %I.e AND %I.a = %s AND %I.retracted_by IS NULL',
-          join_type, table_name, alias, base_alias, alias, alias, attr.attribute_id, alias
+          ' %s %I %I ON %I.e = %I.e AND %I.a = %s AND mnemonic_datom_visible(%I.tx, %I.retracted_by)',
+          join_type, table_name, alias, base_alias, alias, alias, attr.attribute_id, alias, alias
         );
       ELSE
         -- Cardinality many: use lateral subquery for array aggregation
         select_cols := select_cols || format(', %I.v AS %I', alias, col_name);
         from_clause := from_clause || format(
-          ' LEFT JOIN LATERAL (SELECT ARRAY_AGG(v) AS v FROM %I WHERE e = %I.e AND a = %s AND retracted_by IS NULL) %I ON true',
+          ' LEFT JOIN LATERAL (SELECT ARRAY_AGG(v) AS v FROM %I WHERE e = %I.e AND a = %s AND mnemonic_datom_visible(tx, retracted_by)) %I ON true',
           table_name, base_alias, attr.attribute_id, alias
         );
       END IF;
