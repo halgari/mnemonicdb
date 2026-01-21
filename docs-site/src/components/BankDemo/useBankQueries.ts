@@ -131,3 +131,22 @@ export async function recordStepTx(step: number): Promise<string> {
   await db.exec(QUERIES.recordStep(step, txId));
   return txId;
 }
+
+// Types for datom counts
+export interface DatomCounts {
+  total_datoms: number;
+  current_datoms: number;
+}
+
+// Hook to fetch datom counts (always queries current state, not as-of)
+export function useDatomCounts(enabled: boolean = true) {
+  return useQuery({
+    queryKey: ['datomCounts'],
+    queryFn: async (): Promise<DatomCounts> => {
+      const result = await executeQuery<DatomCounts>(QUERIES.getDatomCounts);
+      return result.rows[0] || { total_datoms: 0, current_datoms: 0 };
+    },
+    enabled,
+    staleTime: 0,
+  });
+}

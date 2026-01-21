@@ -51,4 +51,6 @@ export interface PerformanceStats {
   lastQueryTimeMs: number | null;
   avgInsertTimeMs: number | null;
   avgQueryTimeMs: number | null;
+  totalDatoms: number | null;
+  currentDatoms: number | null;
 }

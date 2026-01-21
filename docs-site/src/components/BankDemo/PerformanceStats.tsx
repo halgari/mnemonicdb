@@ -1,6 +1,6 @@
 import type { FC } from 'react';
 import type { PerformanceStats as PerformanceStatsType } from './types';
-import { Database, Search } from 'lucide-react';
+import { Database, Search, Layers, CircleDot } from 'lucide-react';
 
 interface PerformanceStatsProps {
   stats: PerformanceStatsType;
@@ -10,6 +10,11 @@ function formatTime(ms: number | null): string {
   if (ms === null) return '-';
   if (ms < 1) return '<1ms';
   return `${ms.toFixed(1)}ms`;
+}
+
+function formatCount(count: number | null): string {
+  if (count === null) return '-';
+  return count.toLocaleString();
 }
 
 interface StatItemProps {
@@ -94,6 +99,75 @@ const StatItem: FC<StatItemProps> = ({ icon, label, lastValue, avgValue, color }
   </div>
 );
 
+interface CountStatItemProps {
+  icon: React.ReactNode;
+  label: string;
+  value: number | null;
+  color: string;
+}
+
+const CountStatItem: FC<CountStatItemProps> = ({ icon, label, value, color }) => (
+  <div style={{
+    display: 'flex',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: '12px',
+    padding: '12px 16px',
+    boxSizing: 'border-box',
+    background: 'rgba(22, 22, 42, 0.4)',
+    borderRadius: '8px',
+    border: '1px solid rgba(160, 160, 192, 0.15)',
+    margin: 0,
+  }}>
+    <div style={{
+      width: '18px',
+      height: '18px',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      color,
+      opacity: 0.8,
+      flexShrink: 0,
+      margin: 0,
+    }}>
+      {icon}
+    </div>
+    <div style={{
+      display: 'flex',
+      flexDirection: 'column',
+      justifyContent: 'center',
+      height: '100%',
+      margin: 0,
+    }}>
+      <span style={{
+        fontSize: '0.7rem',
+        color: '#808090',
+        textTransform: 'uppercase',
+        letterSpacing: '0.05em',
+        lineHeight: '1',
+        display: 'block',
+        margin: 0,
+      }}>
+        {label}
+      </span>
+      <span style={{
+        fontSize: '1.1rem',
+        fontWeight: 700,
+        fontFamily: 'monospace',
+        color,
+        lineHeight: '1',
+        marginTop: '4px',
+        marginBottom: 0,
+        marginLeft: 0,
+        marginRight: 0,
+        display: 'block',
+      }}>
+        {formatCount(value)}
+      </span>
+    </div>
+  </div>
+);
+
 export const PerformanceStats: FC<PerformanceStatsProps> = ({ stats }) => {
   return (
     <div style={{
@@ -142,6 +216,18 @@ export const PerformanceStats: FC<PerformanceStatsProps> = ({ stats }) => {
           lastValue={stats.lastQueryTimeMs}
           avgValue={stats.avgQueryTimeMs}
           color="#05d9e8"
+        />
+        <CountStatItem
+          icon={<Layers size={18} />}
+          label="Datoms"
+          value={stats.totalDatoms}
+          color="#d1d100"
+        />
+        <CountStatItem
+          icon={<CircleDot size={18} />}
+          label="Current Datoms"
+          value={stats.currentDatoms}
+          color="#00d15e"
         />
       </div>
     </div>

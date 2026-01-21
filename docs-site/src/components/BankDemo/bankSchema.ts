@@ -126,4 +126,10 @@ export const QUERIES = {
     txId
       ? `SELECT set_config('mnemonic.as_of_tx', '${txId}', false)`
       : `SELECT set_config('mnemonic.as_of_tx', '', false)`,
+
+  getDatomCounts: `
+    SELECT
+      (SELECT COUNT(*)::integer FROM datoms) as total_datoms,
+      (SELECT COUNT(*)::integer FROM datoms WHERE retracted_by IS NULL) as current_datoms
+  `,
 };

@@ -8,6 +8,7 @@ import {
   useBottomAccounts,
   useStepTransactions,
   useAggregates,
+  useDatomCounts,
   recordStepTx,
   getStepTxId,
 } from './useBankQueries';
@@ -44,6 +45,8 @@ export const BankDemoContent: FC = () => {
     lastQueryTimeMs: null,
     avgInsertTimeMs: null,
     avgQueryTimeMs: null,
+    totalDatoms: null,
+    currentDatoms: null,
   });
   const insertCountRef = useRef(0);
   const queryCountRef = useRef(0);
@@ -74,6 +77,7 @@ export const BankDemoContent: FC = () => {
     state.isLive ? null : viewingTxId,
     state.isInitialized
   );
+  const datomCountsQuery = useDatomCounts(state.isInitialized);
 
   // Extract data
   const topAccounts = topAccountsQuery.data?.data ?? [];
@@ -99,6 +103,17 @@ export const BankDemoContent: FC = () => {
       }));
     }
   }, [topAccountsQuery.data, bottomAccountsQuery.data, stepTransactionsQuery.data, aggregatesQuery.data]);
+
+  // Update datom counts when they change
+  useEffect(() => {
+    if (datomCountsQuery.data) {
+      setPerfStats(prev => ({
+        ...prev,
+        totalDatoms: datomCountsQuery.data.total_datoms,
+        currentDatoms: datomCountsQuery.data.current_datoms,
+      }));
+    }
+  }, [datomCountsQuery.data]);
 
   // Initialize schema
   useEffect(() => {
@@ -211,6 +226,7 @@ export const BankDemoContent: FC = () => {
       await queryClient.invalidateQueries({ queryKey: ['bottomAccounts'] });
       await queryClient.invalidateQueries({ queryKey: ['stepTransactions'] });
       await queryClient.invalidateQueries({ queryKey: ['aggregates'] });
+      await queryClient.invalidateQueries({ queryKey: ['datomCounts'] });
 
     } catch (err) {
       console.error('Step execution error:', err);
