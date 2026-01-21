@@ -146,6 +146,3 @@ npm test
 npm run dev
 ```
 
-## License
-
-MIT
