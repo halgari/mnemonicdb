@@ -255,6 +255,21 @@ pre {
   padding: 1rem 1.5rem;
 }
 
+/* Starlight CardGrid - ensure vertical alignment */
+.sl-link-card {
+  margin: 0 !important;
+}
+
+.card-grid {
+  margin-top: 1rem !important;
+  margin-bottom: 1rem !important;
+}
+
+.card-grid > * {
+  margin-top: 0 !important;
+  margin-bottom: 0 !important;
+}
+
 /* Starlight aside components */
 .starlight-aside {
   background: var(--bg-elevated) !important;
