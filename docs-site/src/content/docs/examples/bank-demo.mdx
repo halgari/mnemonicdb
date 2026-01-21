@@ -1,0 +1,97 @@
+---
+title: Bank Simulation Demo
+description: Interactive demo showcasing MnemonicDB's time-travel and temporal query features
+---
+
+import BankDemo from '../../../components/BankDemo/BankDemo';
+
+This interactive demo showcases the power of MnemonicDB's temporal features through a simulated bank account system. Watch accounts being created, money flowing in and out, and transfers between users - all while being able to **travel back in time** to see exactly what the database looked like at any point.
+
+<BankDemo client:load />
+
+## What's Happening
+
+The simulation runs automatically, executing one "step" per second. Each step can include:
+
+- **New Signups** - New users opening accounts with initial deposits
+- **Income** - Money entering the system (salaries, refunds, etc.)
+- **Expenses** - Money leaving the system (bills, purchases, etc.)
+- **Transfers** - Money moving between accounts
+
+## Time Travel in Action
+
+The slider at the top lets you **scrub through history**. When you move the slider back:
+
+1. MnemonicDB sets the `as_of_tx` configuration to the transaction ID from that step
+2. All queries automatically return data as it existed at that point in time
+3. The simulation continues running in the background
+4. Click "LIVE" to jump back to the current state
+
+This demonstrates a key MnemonicDB feature: **every change is preserved with full history**. Unlike traditional databases where UPDATE overwrites data, MnemonicDB records each change as a new fact, making time-travel queries trivial.
+
+## The Technology
+
+### Reactive Queries with TanStack Query
+
+This demo uses [TanStack Query](https://tanstack.com/query) for data fetching:
+
+```typescript
+function useAccounts(asOfTxId: string | null) {
+  return useQuery({
+    queryKey: ['accounts', asOfTxId],
+    queryFn: async () => {
+      await setAsOfTx(asOfTxId);  // Set temporal context
+      return executeQuery('SELECT * FROM accounts');
+    },
+  });
+}
+```
+
+The `queryKey` includes the transaction ID, so changing the temporal view automatically triggers a refetch with the new context.
+
+### Data Grids with TanStack Table
+
+The accounts and transactions tables use [TanStack Table](https://tanstack.com/table), a headless table library that provides sorting, filtering, and pagination logic while leaving the UI completely customizable.
+
+### Schema Definition
+
+The bank demo schema uses MnemonicDB's declarative attribute system:
+
+```sql
+-- Account attributes
+INSERT INTO mnemonic_defined_attributes (ident, value_type, cardinality)
+VALUES
+  ('account/name', 'db.type/text', 'db.cardinality/one'),
+  ('account/balance', 'db.type/int8', 'db.cardinality/one');
+
+-- Create the accounts view
+INSERT INTO mnemonic_defined_views (name, attributes, doc)
+VALUES ('accounts', ARRAY['account/name', 'account/balance'], 'Bank accounts');
+```
+
+### Time-Travel Query
+
+To query at a specific point in time:
+
+```sql
+-- Set the temporal context
+SELECT set_config('mnemonic.as_of_tx', '281474976710700', false);
+
+-- Now queries return historical data
+SELECT * FROM accounts;  -- Shows state at that transaction
+```
+
+## Key Observations
+
+As you watch the simulation, notice:
+
+1. **Total Money Conservation** - Transfers don't change the total system balance (money just moves between accounts)
+2. **Income Increases Total** - When income arrives, the total money in the system grows
+3. **Expenses Decrease Total** - When money is spent externally, the total shrinks
+4. **Full History** - Scrub back to any point and see exactly what the database looked like
+
+This pattern is powerful for:
+- **Audit trails** - See exactly what changed and when
+- **Debugging** - Reproduce issues by querying the database as it was when bugs occurred
+- **Analytics** - Compare current state to any historical point
+- **Compliance** - Maintain complete records without separate archival systems

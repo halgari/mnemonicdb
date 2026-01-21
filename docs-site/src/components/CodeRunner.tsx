@@ -1,6 +1,4 @@
-/** @jsxImportSource preact */
-import { useState, useEffect, useRef } from 'preact/hooks';
-import type { FunctionalComponent } from 'preact';
+import { useState, useEffect, useRef, type FC, type ChangeEvent } from 'react';
 import { executeQuery, resetDatabase, getDatabase } from '../lib/pglite-loader';
 import { ResultsTable } from './ResultsTable';
 
@@ -28,7 +26,8 @@ function highlightSQL(code: string): string {
     'PRIMARY', 'KEY', 'FOREIGN', 'REFERENCES', 'UNIQUE', 'CHECK', 'DEFAULT',
     'CONSTRAINT', 'IF', 'EXISTS', 'TRUE', 'FALSE', 'WITH', 'RETURNING',
     'SERIAL', 'INT', 'INTEGER', 'BIGINT', 'TEXT', 'VARCHAR', 'BOOLEAN',
-    'TIMESTAMP', 'TIMESTAMPTZ', 'DATE', 'TIME', 'JSONB', 'JSON', 'UUID'
+    'TIMESTAMP', 'TIMESTAMPTZ', 'DATE', 'TIME', 'JSONB', 'JSON', 'UUID',
+    'CALL', 'PROCEDURE', 'FUNCTION', 'ARRAY'
   ];
 
   let result = code;
@@ -52,7 +51,7 @@ function highlightSQL(code: string): string {
   return result;
 }
 
-export const CodeRunner: FunctionalComponent<CodeRunnerProps> = ({
+export const CodeRunner: FC<CodeRunnerProps> = ({
   initialCode,
   title = 'Live Example',
 }) => {
@@ -170,27 +169,31 @@ export const CodeRunner: FunctionalComponent<CodeRunnerProps> = ({
     }
   };
 
-  const buttonBaseStyle = {
+  const handleCodeChange = (e: ChangeEvent<HTMLTextAreaElement>) => {
+    setCode(e.target.value);
+  };
+
+  const buttonBaseStyle: React.CSSProperties = {
     padding: '6px 14px',
     borderRadius: '4px',
     fontWeight: '600',
     fontSize: '0.75rem',
     lineHeight: '1',
     cursor: 'pointer',
-    textTransform: 'uppercase' as const,
+    textTransform: 'uppercase',
     letterSpacing: '0.05em',
     verticalAlign: 'middle',
     margin: '0',
   };
 
-  const buttonStyle = {
+  const buttonStyle: React.CSSProperties = {
     ...buttonBaseStyle,
     background: 'linear-gradient(135deg, #ff2a6d, #d300c5)',
     color: 'white',
     border: 'none',
   };
 
-  const resetButtonStyle = {
+  const resetButtonStyle: React.CSSProperties = {
     ...buttonBaseStyle,
     background: 'transparent',
     border: '1px solid rgba(160, 160, 192, 0.4)',
@@ -198,36 +201,36 @@ export const CodeRunner: FunctionalComponent<CodeRunnerProps> = ({
   };
 
   return (
-    <div class="live-example">
-      <div class="live-example-header">
-        <span class="live-example-title">{title}</span>
+    <div className="live-example">
+      <div className="live-example-header">
+        <span className="live-example-title">{title}</span>
         {status === 'initializing' && (
-          <span class="header-status muted">Initializing PGLite...</span>
+          <span className="header-status muted">Initializing PGLite...</span>
         )}
         {status === 'success' && (
-          <span class="header-status success">Success</span>
+          <span className="header-status success">Success</span>
         )}
       </div>
 
-      <div class="live-example-editor">
-        <div class="code-editor-container">
+      <div className="live-example-editor">
+        <div className="code-editor-container">
           <div
             ref={highlightRef}
-            class="code-highlight"
+            className="code-highlight"
             dangerouslySetInnerHTML={{ __html: highlightSQL(code) + '\n' }}
           />
           <textarea
             ref={textareaRef}
             value={code}
-            onInput={(e) => setCode((e.target as HTMLTextAreaElement).value)}
+            onChange={handleCodeChange}
             onScroll={syncScroll}
-            spellcheck={false}
+            spellCheck={false}
             disabled={status === 'initializing' || status === 'running'}
           />
         </div>
       </div>
 
-      <div class="live-example-actions">
+      <div className="live-example-actions">
         <button
           onClick={handleRun}
           disabled={!dbReady || status === 'running'}
@@ -245,13 +248,13 @@ export const CodeRunner: FunctionalComponent<CodeRunnerProps> = ({
       </div>
 
       <div
-        class={`live-example-results ${status === 'error' ? 'error' : ''} ${
+        className={`live-example-results ${status === 'error' ? 'error' : ''} ${
           status === 'initializing' || status === 'running' ? 'loading' : ''
         }`}
       >
         {(status === 'initializing' || status === 'running') && (
-          <div class="loading-indicator">
-            <div class="spinner" />
+          <div className="loading-indicator">
+            <div className="spinner" />
             <span>
               {status === 'initializing' ? 'Loading PGLite...' : 'Executing...'}
             </span>
@@ -259,18 +262,18 @@ export const CodeRunner: FunctionalComponent<CodeRunnerProps> = ({
         )}
 
         {status === 'error' && (
-          <div class="error-content">
+          <div className="error-content">
             <strong>Error:</strong>
             <pre>{error}</pre>
           </div>
         )}
 
         {status === 'success' && results.length > 0 && (
-          <div class="results-list">
+          <div className="results-list">
             {results.map((result, idx) => (
-              <div key={idx} class="result-set">
+              <div key={idx} className="result-set">
                 {results.length > 1 && (
-                  <div class="result-set-header">Result Set {idx + 1}</div>
+                  <div className="result-set-header">Result Set {idx + 1}</div>
                 )}
                 <ResultsTable rows={result.rows} fields={result.fields} />
               </div>
@@ -279,13 +282,13 @@ export const CodeRunner: FunctionalComponent<CodeRunnerProps> = ({
         )}
 
         {status === 'success' && results.length === 0 && (
-          <div class="success-message fade-in">
+          <div className="success-message fade-in">
             Statements executed successfully
           </div>
         )}
 
         {status === 'idle' && (
-          <div class="idle-message">
+          <div className="idle-message">
             Click "Run" to execute the SQL
           </div>
         )}

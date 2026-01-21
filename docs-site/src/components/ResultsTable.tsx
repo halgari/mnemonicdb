@@ -1,5 +1,4 @@
-/** @jsxImportSource preact */
-import type { FunctionalComponent } from 'preact';
+import type { FC } from 'react';
 
 interface ResultsTableProps {
   rows: Record<string, unknown>[];
@@ -14,13 +13,13 @@ function formatValue(value: unknown): string {
   return String(value);
 }
 
-export const ResultsTable: FunctionalComponent<ResultsTableProps> = ({
+export const ResultsTable: FC<ResultsTableProps> = ({
   rows,
   fields,
 }) => {
   if (fields.length === 0) {
     return (
-      <div class="results-message">
+      <div className="results-message">
         Query executed successfully (no results to display)
       </div>
     );
@@ -28,15 +27,15 @@ export const ResultsTable: FunctionalComponent<ResultsTableProps> = ({
 
   if (rows.length === 0) {
     return (
-      <div class="results-message">
+      <div className="results-message">
         No rows returned
       </div>
     );
   }
 
   return (
-    <div class="results-container fade-in">
-      <table class="results-table">
+    <div className="results-container fade-in">
+      <table className="results-table">
         <thead>
           <tr>
             {fields.map((field) => (
@@ -49,14 +48,14 @@ export const ResultsTable: FunctionalComponent<ResultsTableProps> = ({
             <tr key={rowIndex}>
               {fields.map((field) => (
                 <td key={field.name}>
-                  <code class="result-value">{formatValue(row[field.name])}</code>
+                  <code className="result-value">{formatValue(row[field.name])}</code>
                 </td>
               ))}
             </tr>
           ))}
         </tbody>
       </table>
-      <div class="results-count">
+      <div className="results-count">
         {rows.length} row{rows.length !== 1 ? 's' : ''} returned
       </div>
     </div>
