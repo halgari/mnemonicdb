@@ -43,7 +43,8 @@ struct AttributeDef {
 	string index_name;
 
 	bool many;
-	//! The type of one stored value: the list element type when `many`, else `type`
+	//! The type of one stored value: the list element type when `many`, else
+	//! `type`
 	LogicalType value_type;
 	bool is_ref;
 	ValueCodec codec;
@@ -74,7 +75,8 @@ public:
 	static shared_ptr<Schema> Builtin();
 	//! Read all definitions visible in `view`
 	static shared_ptr<Schema> Load(ReadView &view, duckdb::ClientContext &context);
-	//! Write the datoms describing the built-in `sys` tables (the bootstrap transaction)
+	//! Write the datoms describing the built-in `sys` tables (the bootstrap
+	//! transaction)
 	static void WriteBootstrap(TxWriter &writer);
 	//! Write the datoms defining a table or an attribute
 	static void WriteTable(TxWriter &writer, const Schema &schema, const TableDef &table);
@@ -85,12 +87,14 @@ public:
 	const TableDef *FindTable(const string &schema, const string &name) const;
 	const TableDef *FindTable(EntityId id) const;
 	const AttributeDef &GetAttribute(AttrId local) const;
-	//! The attribute with this local number, if it is part of the schema (dropped columns are not)
+	//! The attribute with this local number, if it is part of the schema (dropped
+	//! columns are not)
 	const AttributeDef *FindAttributeById(AttrId local) const;
 	const AttributeDef *FindAttribute(const TableDef &table, const string &name) const;
 	vector<const TableDef *> TablesInSchema(const string &schema) const;
 
-	//! A copy of this schema with one more table; used for DDL inside a transaction
+	//! A copy of this schema with one more table; used for DDL inside a
+	//! transaction
 	shared_ptr<Schema> WithTable(TableDef table, vector<AttributeDef> attributes) const;
 	//! A copy of this schema with one attribute definition replaced
 	shared_ptr<Schema> WithAttribute(AttributeDef attribute) const;

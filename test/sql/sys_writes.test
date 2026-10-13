@@ -1,6 +1,6 @@
 # name: test/sql/sys_writes.test
 # description: Schema can be defined by writing to sys.tables / sys.attributes; transactions can carry metadata
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

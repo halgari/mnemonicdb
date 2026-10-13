@@ -29,7 +29,8 @@ public:
 		return "MNEMONICDB_INSERT";
 	}
 
-	// Sink interface: rows are buffered and written in Finalize, so the statement never reads its own writes
+	// Sink interface: rows are buffered and written in Finalize, so the statement
+	// never reads its own writes
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
@@ -86,10 +87,12 @@ public:
 		return id;
 	}
 
-	//! A row's `id`: NULL allocates, a tempid may resolve to an existing entity through a unique-identity value
+	//! A row's `id`: NULL allocates, a tempid may resolve to an existing entity
+	//! through a unique-identity value
 	EntityId ResolveRow(optional_ptr<const EntityId> value, optional_ptr<const EntityId> identity_match) {
 		if (!value) {
-			// A NULL id is a new entity; an identity match then fails the uniqueness check
+			// A NULL id is a new entity; an identity match then fails the uniqueness
+			// check
 			return Allocate(default_partition);
 		}
 		auto id = *value;
@@ -100,7 +103,8 @@ public:
 		}
 		auto bound = transaction.FindTempid(id);
 		if (bound && identity_match && *bound != *identity_match) {
-			throw ConstraintException("MnemonicDB: tempid resolved to entity %d earlier in this transaction, but "
+			throw ConstraintException("MnemonicDB: tempid resolved to entity %d earlier in this "
+			                          "transaction, but "
 			                          "its unique identity value belongs to entity %d",
 			                          *bound, *identity_match);
 		}
@@ -162,7 +166,8 @@ static uint8_t DefaultPartition(const MnemonicTableEntry &table) {
 	return mnemonicdb::partition::DB;
 }
 
-//! Rows of sys tables may only describe user entities (and, for sys.tx, the current transaction)
+//! Rows of sys tables may only describe user entities (and, for sys.tx, the
+//! current transaction)
 static void CheckSysEntity(MnemonicTransaction &transaction, const MnemonicTableEntry &table, EntityId entity) {
 	auto id = table.GetTableDef().id;
 	if (table.GetTableDef().schema != "sys") {
@@ -173,7 +178,8 @@ static void CheckSysEntity(MnemonicTransaction &transaction, const MnemonicTable
 	}
 	if (id == mnemonicdb::sys::TX) {
 		if (entity != transaction.CurrentTxEntity()) {
-			throw InvalidInputException("MnemonicDB: rows of sys.tx can only describe the current transaction; use "
+			throw InvalidInputException("MnemonicDB: rows of sys.tx can only "
+			                            "describe the current transaction; use "
 			                            "current_tx() as the id");
 		}
 		return;
@@ -215,7 +221,8 @@ idx_t MnemonicInsert::WriteChunk(ClientContext &context, DataChunk &chunk) const
 	auto count = chunk.size();
 	chunk.Flatten();
 
-	// Encode every non-REF attribute column once per chunk; cardinality-many columns encode their list children
+	// Encode every non-REF attribute column once per chunk; cardinality-many
+	// columns encode their list children
 	idx_t attr_count = def.attributes.size();
 	vector<vector<string>> encoded(attr_count);
 	for (idx_t a = 0; a < attr_count; a++) {
@@ -236,7 +243,8 @@ idx_t MnemonicInsert::WriteChunk(ClientContext &context, DataChunk &chunk) const
 	auto ids = chunk.data[MNEMONIC_ID_COLUMN_INDEX].Values<uint64_t>();
 	idx_t written = 0;
 	for (idx_t row = 0; row < count; row++) {
-		// A row without any value asserts nothing: it neither creates an entity nor counts as inserted
+		// A row without any value asserts nothing: it neither creates an entity nor
+		// counts as inserted
 		bool has_value = false;
 		for (idx_t a = 0; a < attr_count && !has_value; a++) {
 			has_value = !FlatVector::IsNull(chunk.data[a + 1], row);
@@ -245,7 +253,8 @@ idx_t MnemonicInsert::WriteChunk(ClientContext &context, DataChunk &chunk) const
 			continue;
 		}
 		written++;
-		// A unique-identity value already present on an entity identifies the row's entity
+		// A unique-identity value already present on an entity identifies the row's
+		// entity
 		optional_ptr<const EntityId> identity_match;
 		EntityId match = 0;
 		for (idx_t a = 0; a < attr_count && !identity_match; a++) {
@@ -292,7 +301,8 @@ idx_t MnemonicInsert::WriteChunk(ClientContext &context, DataChunk &chunk) const
 			auto &child = ListVector::GetChild(column);
 			for (idx_t i = list.offset; i < list.offset + list.length; i++) {
 				if (FlatVector::IsNull(child, i)) {
-					throw InvalidInputException("MnemonicDB: cardinality-many column \"%s\" cannot hold NULL elements",
+					throw InvalidInputException("MnemonicDB: cardinality-many column "
+					                            "\"%s\" cannot hold NULL elements",
 					                            attr.name);
 				}
 				if (attr.is_ref) {

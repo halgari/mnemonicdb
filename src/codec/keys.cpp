@@ -168,7 +168,7 @@ TxId DecodeHistoryValue(std::string_view value) {
 	if (value.size() != PACKED_TX_SIZE) {
 		throw std::invalid_argument("malformed history value");
 	}
-	return GetTxId(value.data());
+	return GetTxId(value.data()); // NOLINT: size checked above
 }
 
 std::string EncodeTxOp(TxOp op) {

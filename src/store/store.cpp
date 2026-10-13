@@ -22,7 +22,8 @@ static constexpr const char *META_LAST_TX = "last_tx";
 static constexpr const char *META_LAST_INSTANT = "last_instant";
 //! Followed by one partition byte
 static constexpr const char *META_NEXT_LOCAL = "next_local/";
-//! Followed by a 2-byte attribute id: the number of current datoms of the attribute
+//! Followed by a 2-byte attribute id: the number of current datoms of the
+//! attribute
 static constexpr const char *META_COUNT = "count/";
 static constexpr const char *META_COUNTS_READY = "counts_ready";
 
@@ -32,7 +33,8 @@ static string CountKey(AttrId attr) {
 	return key;
 }
 
-//! First local number handed out per partition; lower numbers are reserved for built-in entities
+//! First local number handed out per partition; lower numbers are reserved for
+//! built-in entities
 static uint64_t FirstLocal(uint8_t part) {
 	switch (part) {
 	case partition::ATTR:
@@ -77,11 +79,13 @@ const char *ColumnFamilyName(ColumnFamily cf) {
 	}
 }
 
-//! Indexes whose keys start with two fixed-width components (E6 A2, A2 E6, V6 A2) get an 8-byte prefix extractor
-//! with prefix Bloom filters in SST files and memtables. A seek within one (e, a) / (a, e) / (v, a) prefix, which
-//! is what every per-datom lookup is, then skips files that cannot contain the prefix. Iterators opt in through
-//! iterate_upper_bound + auto_prefix_mode (see ReadView::NewIterator), so seeks spanning several prefixes still
-//! use total order. Every key is at least 13 bytes, so no key is shorter than the prefix.
+//! Indexes whose keys start with two fixed-width components (E6 A2, A2 E6, V6
+//! A2) get an 8-byte prefix extractor with prefix Bloom filters in SST files
+//! and memtables. A seek within one (e, a) / (a, e) / (v, a) prefix, which is
+//! what every per-datom lookup is, then skips files that cannot contain the
+//! prefix. Iterators opt in through iterate_upper_bound + auto_prefix_mode (see
+//! ReadView::NewIterator), so seeks spanning several prefixes still use total
+//! order. Every key is at least 13 bytes, so no key is shorter than the prefix.
 bool HasPrefixBloom(ColumnFamily cf) {
 	switch (cf) {
 	case ColumnFamily::EAVT:
@@ -98,8 +102,9 @@ bool HasPrefixBloom(ColumnFamily cf) {
 
 static rocksdb::ColumnFamilyOptions ColumnFamilyOptionsFor(ColumnFamily cf) {
 	rocksdb::ColumnFamilyOptions options;
-	// Datoms repeat a lot (shared key prefixes, values stored in several indexes): LZ4 for the levels that churn,
-	// ZSTD for the bottommost level that holds most of the data
+	// Datoms repeat a lot (shared key prefixes, values stored in several
+	// indexes): LZ4 for the levels that churn, ZSTD for the bottommost level that
+	// holds most of the data
 	options.compression = rocksdb::kLZ4Compression;
 	options.bottommost_compression = rocksdb::kZSTD;
 	if (!HasPrefixBloom(cf)) {
@@ -150,7 +155,9 @@ unique_ptr<Store> Store::Open(const string &path, bool read_only) {
 			throw IOException("MnemonicDB: database \"%s\" does not exist", path);
 		}
 	} else if (std::find(existing.begin(), existing.end(), "meta") == existing.end()) {
-		throw IOException("MnemonicDB: \"%s\" is a RocksDB database but not a MnemonicDB database", path);
+		throw IOException("MnemonicDB: \"%s\" is a RocksDB database but not a "
+		                  "MnemonicDB database",
+		                  path);
 	}
 	db_options.create_missing_column_families = created;
 
@@ -172,7 +179,8 @@ unique_ptr<Store> Store::Open(const string &path, bool read_only) {
 	CheckStatus(status, path);
 	store->db = unique_ptr<rocksdb::DB>(db.release());
 
-	// The default column family is unused; keep only ours, indexed by ColumnFamily
+	// The default column family is unused; keep only ours, indexed by
+	// ColumnFamily
 	store->db->DestroyColumnFamilyHandle(all_handles[0]);
 	store->handles.assign(all_handles.begin() + 1, all_handles.end());
 
@@ -206,8 +214,9 @@ void Store::LoadMeta(bool created) {
 	CheckStatus(status, path);
 	format_version = static_cast<uint32_t>(GetBigEndian(value.data(), 4));
 	if (format_version != FORMAT_VERSION) {
-		throw IOException("MnemonicDB: \"%s\" has format version %d, this build supports version %d", path,
-		                  format_version, FORMAT_VERSION);
+		throw IOException("MnemonicDB: \"%s\" has format version %d, this build "
+		                  "supports version %d",
+		                  path, format_version, FORMAT_VERSION);
 	}
 
 	status = db->Get(rocksdb::ReadOptions(), &meta, META_LAST_TX, &value);
@@ -345,8 +354,9 @@ void Store::CheckAllocated(EntityId id) const {
 		allocated = local < next_local[part];
 	}
 	if (!allocated) {
-		throw duckdb::InvalidInputException(
-		    "MnemonicDB: entity %d does not exist; new entities get their ids from tempid() or by omitting id", id);
+		throw duckdb::InvalidInputException("MnemonicDB: entity %d does not exist; new entities get their ids from "
+		                                    "tempid() or by omitting id",
+		                                    id);
 	}
 }
 

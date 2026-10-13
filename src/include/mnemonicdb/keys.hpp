@@ -8,8 +8,9 @@
 
 namespace mnemonicdb {
 
-//! A datom as stored in an index key. `v` is the encoded value (see ValueCodec), or for a REF attribute the
-//! 6-byte packed entity ID. `t` is the asserting transaction.
+//! A datom as stored in an index key. `v` is the encoded value (see
+//! ValueCodec), or for a REF attribute the 6-byte packed entity ID. `t` is the
+//! asserting transaction.
 struct Datom {
 	EntityId e = 0;
 	AttrId a = 0;
@@ -22,8 +23,10 @@ struct Datom {
 //! Operation stored as the value of a txlog entry
 enum class TxOp : uint8_t { RETRACT = 0, ASSERT = 1 };
 
-//! Every index key has at most one variable-length segment (V), so keys can be split without decoding V:
-//!   eavt: E6 A2 V T5    aevt: A2 E6 V T5    avet: A2 V E6 T5    vaet: V6 A2 E6 T5    txlog: T5 E6 A2 V
+//! Every index key has at most one variable-length segment (V), so keys can be
+//! split without decoding V:
+//!   eavt: E6 A2 V T5    aevt: A2 E6 V T5    avet: A2 V E6 T5    vaet: V6 A2 E6
+//!   T5    txlog: T5 E6 A2 V
 //! The `_hist` variants share the key layout of their current index.
 enum class IndexKind : uint8_t { EAVT, AEVT, AVET, VAET, TXLOG };
 

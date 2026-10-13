@@ -1,6 +1,6 @@
 # name: test/sql/statistics.test
 # description: Scans report row estimates from exact per-attribute datom counts, kept through writes and rollbacks
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

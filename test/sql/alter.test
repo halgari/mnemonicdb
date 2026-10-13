@@ -1,6 +1,6 @@
 # name: test/sql/alter.test
 # description: ALTER TABLE: add, rename and drop columns, rename tables, change column types (rewriting history)
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

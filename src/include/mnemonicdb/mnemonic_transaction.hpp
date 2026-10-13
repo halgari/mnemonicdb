@@ -22,8 +22,9 @@ class ColumnDefinition;
 
 class MnemonicTransaction;
 
-//! Makes one statement's writes atomic within the transaction: on failure (an exception before Commit), the write
-//! batch, tempid bindings, ID counters and schema are restored to their state at the start of the statement
+//! Makes one statement's writes atomic within the transaction: on failure (an
+//! exception before Commit), the write batch, tempid bindings, ID counters and
+//! schema are restored to their state at the start of the statement
 class MnemonicStatement {
 public:
 	explicit MnemonicStatement(MnemonicTransaction &transaction);
@@ -50,7 +51,8 @@ public:
 public:
 	static MnemonicTransaction &Get(ClientContext &context, Catalog &catalog);
 
-	//! Called by DuckDB before the first modifying statement: take the writer lock and check for conflicts
+	//! Called by DuckDB before the first modifying statement: take the writer
+	//! lock and check for conflicts
 	void SetReadWrite() override;
 
 	//! The last transaction committed when this transaction began
@@ -63,7 +65,8 @@ public:
 	mnemonicdb::ReadView &GetCommittedView() {
 		return view;
 	}
-	//! Record that the transaction read data, so it can no longer move its snapshot forward on its first write
+	//! Record that the transaction read data, so it can no longer move its
+	//! snapshot forward on its first write
 	void MarkDataRead() {
 		read_data = true;
 	}
@@ -86,19 +89,22 @@ public:
 	void DropIndex(const string &index_name, bool if_exists);
 	//! ALTER TABLE inside this transaction
 	void AlterTable(const string &schema_name, AlterTableInfo &info);
-	//! Re-read the schema after a statement wrote to sys tables, and bring the indexes in line with it
+	//! Re-read the schema after a statement wrote to sys tables, and bring the
+	//! indexes in line with it
 	void ReloadSchema(ClientContext &context);
 	//! The entity of this (writing) transaction
 	mnemonicdb::EntityId CurrentTxEntity();
 
-	//! The real entity ID a tempid placeholder resolved to in this transaction, if any
+	//! The real entity ID a tempid placeholder resolved to in this transaction,
+	//! if any
 	optional_ptr<const mnemonicdb::EntityId> FindTempid(mnemonicdb::EntityId placeholder) const;
 	void BindTempid(mnemonicdb::EntityId placeholder, mnemonicdb::EntityId id);
 
 	//! Write this transaction's changes; called by the transaction manager
 	void Commit();
 
-	//! Serializes writers within this transaction: e.g. the actions of a MERGE run as separate pipelines
+	//! Serializes writers within this transaction: e.g. the actions of a MERGE
+	//! run as separate pipelines
 	mutex &GetWriteLock() {
 		return write_lock;
 	}
@@ -114,13 +120,15 @@ private:
 private:
 	MnemonicCatalog &catalog;
 	mnemonicdb::Store &store;
-	//! Declared before the snapshot: read before taking it, so the snapshot covers at least this tx
+	//! Declared before the snapshot: read before taking it, so the snapshot
+	//! covers at least this tx
 	mnemonicdb::TxId basis_tx;
 	const rocksdb::Snapshot *snapshot;
 	mnemonicdb::ReadView view;
 	unique_ptr<mnemonicdb::TxWriter> writer;
 	bool holds_writer = false;
-	//! The ID counters when this transaction took the writer, restored if it does not commit
+	//! The ID counters when this transaction took the writer, restored if it does
+	//! not commit
 	mnemonicdb::Store::CounterState counters_at_start;
 	bool read_data = false;
 	shared_ptr<MnemonicCatalogGeneration> generation;

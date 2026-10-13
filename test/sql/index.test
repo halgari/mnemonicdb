@@ -1,6 +1,6 @@
 # name: test/sql/index.test
 # description: CREATE INDEX builds AVET entries; filters on indexed columns and id narrow the scan but stay exact
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

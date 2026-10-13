@@ -6,9 +6,11 @@
 
 namespace mnemonicdb {
 
-//! Tempid placeholders live in partition 255. The 16 middle bits, unused by real IDs, hold the partition the real
-//! ID should be allocated in (0 = default), and the low 40 bits a hash of the label. Placeholders are therefore
-//! deterministic: the same label gives the same placeholder anywhere in a transaction.
+//! Tempid placeholders live in partition 255. The 16 middle bits, unused by
+//! real IDs, hold the partition the real ID should be allocated in (0 =
+//! default), and the low 40 bits a hash of the label. Placeholders are
+//! therefore deterministic: the same label gives the same placeholder anywhere
+//! in a transaction.
 EntityId MakeTempid(const std::string &label, uint8_t target_partition);
 
 inline bool IsTempid(EntityId id) {

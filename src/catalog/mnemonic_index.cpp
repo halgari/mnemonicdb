@@ -93,7 +93,8 @@ protected:
 
 unique_ptr<LogicalOperator> BindMnemonicCreateIndex(MnemonicTableEntry &table, unique_ptr<CreateIndexInfo> info) {
 	if (info->constraint_type != IndexConstraintType::NONE) {
-		throw BinderException("MnemonicDB: use a UNIQUE or PRIMARY KEY column constraint instead of a unique index");
+		throw BinderException("MnemonicDB: use a UNIQUE or PRIMARY KEY column "
+		                      "constraint instead of a unique index");
 	}
 	if (!info->options.empty()) {
 		throw BinderException("MnemonicDB: CREATE INDEX does not take options");

@@ -69,8 +69,7 @@ static optional_idx IdColumnTable(LogicalGet &get, const MnemonicScanBindData &b
 }
 
 //! Maps the column ids of one side's scan into the fused scan's column space
-static column_t MapColumn(const MnemonicScanBindData &old_data, idx_t table_base, idx_t column_base,
-                          column_t column) {
+static column_t MapColumn(const MnemonicScanBindData &old_data, idx_t table_base, idx_t column_base, column_t column) {
 	if (column == COLUMN_IDENTIFIER_EMPTY) {
 		return column;
 	}
@@ -86,7 +85,8 @@ static column_t MapColumn(const MnemonicScanBindData &old_data, idx_t table_base
 	return column_base + column;
 }
 
-//! Try to replace `op`, a join of two MnemonicDB scans on their entity ids, with a single fused scan
+//! Try to replace `op`, a join of two MnemonicDB scans on their entity ids,
+//! with a single fused scan
 static bool TryFuse(Binder &binder, unique_ptr<LogicalOperator> &op, vector<ReplacementBinding> &replacements) {
 	if (op->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		return false;
@@ -94,8 +94,7 @@ static bool TryFuse(Binder &binder, unique_ptr<LogicalOperator> &op, vector<Repl
 	auto &join = op->Cast<LogicalComparisonJoin>();
 	auto join_type = join.join_type;
 	if ((join_type != JoinType::INNER && join_type != JoinType::LEFT && join_type != JoinType::RIGHT) ||
-	    join.conditions.size() != 1 ||
-	    !join.duplicate_eliminated_columns.empty()) {
+	    join.conditions.size() != 1 || !join.duplicate_eliminated_columns.empty()) {
 		return false;
 	}
 	auto left_data = ScanBindData(*join.children[0]);
@@ -109,9 +108,10 @@ static bool TryFuse(Binder &binder, unique_ptr<LogicalOperator> &op, vector<Repl
 	    left_data->as_of != right_data->as_of) {
 		return false;
 	}
-	// An outer join keeps rows whose other side is missing: only a single table can then be optional, and filters
-	// pushed into the optional side restrict which of its rows match, not which output rows exist, so they cannot
-	// become filters of the fused scan
+	// An outer join keeps rows whose other side is missing: only a single table
+	// can then be optional, and filters pushed into the optional side restrict
+	// which of its rows match, not which output rows exist, so they cannot become
+	// filters of the fused scan
 	if ((join_type == JoinType::LEFT && (right_data->tables.size() != 1 || right.table_filters.HasFilters())) ||
 	    (join_type == JoinType::RIGHT && (left_data->tables.size() != 1 || left.table_filters.HasFilters()))) {
 		return false;
@@ -125,8 +125,7 @@ static bool TryFuse(Binder &binder, unique_ptr<LogicalOperator> &op, vector<Repl
 		return false;
 	}
 	auto left_table = IdColumnTable(left, *left_data, condition.GetLHS().Cast<BoundColumnRefExpression>().Binding());
-	auto right_table =
-	    IdColumnTable(right, *right_data, condition.GetRHS().Cast<BoundColumnRefExpression>().Binding());
+	auto right_table = IdColumnTable(right, *right_data, condition.GetRHS().Cast<BoundColumnRefExpression>().Binding());
 	if (!left_table.IsValid() || !right_table.IsValid()) {
 		return false;
 	}
@@ -146,7 +145,8 @@ static bool TryFuse(Binder &binder, unique_ptr<LogicalOperator> &op, vector<Repl
 	auto right_table_base = fused->tables.size();
 	auto right_column_base = column_offset;
 	add_tables(*right_data, join_type != JoinType::LEFT);
-	// The joined id must exist on each side whose rows are not preserved (a NULL id never matches)
+	// The joined id must exist on each side whose rows are not preserved (a NULL
+	// id never matches)
 	if (join_type != JoinType::RIGHT) {
 		fused->tables[left_table.GetIndex()].required = true;
 	}
@@ -181,14 +181,14 @@ static bool TryFuse(Binder &binder, unique_ptr<LogicalOperator> &op, vector<Repl
 	}
 	auto left_count = left.GetColumnIds().size();
 	for (auto &column : right.GetColumnIds()) {
-		column_ids.emplace_back(
-		    MapColumn(*right_data, right_table_base, right_column_base, column.GetPrimaryIndex()));
+		column_ids.emplace_back(MapColumn(*right_data, right_table_base, right_column_base, column.GetPrimaryIndex()));
 	}
 	get->SetColumnIds(std::move(column_ids));
 	(void)fused_data;
 
-	// The fused scan must output exactly what the join did, in the same positions: parents (e.g. a join's
-	// projection map) may refer to the join's output by position
+	// The fused scan must output exactly what the join did, in the same
+	// positions: parents (e.g. a join's projection map) may refer to the join's
+	// output by position
 	column_binding_map_t<idx_t> new_position;
 	for (idx_t i = 0; i < left.GetColumnIds().size(); i++) {
 		new_position[ColumnBinding(left.table_index, ProjectionIndex(i))] = i;
@@ -212,7 +212,8 @@ static bool TryFuse(Binder &binder, unique_ptr<LogicalOperator> &op, vector<Repl
 	move_filters(left, 0);
 	move_filters(right, left_count);
 
-	// Every column of either side keeps its position, now under the fused scan's table index
+	// Every column of either side keeps its position, now under the fused scan's
+	// table index
 	for (idx_t i = 0; i < left.GetColumnIds().size(); i++) {
 		replacements.emplace_back(ColumnBinding(left.table_index, ProjectionIndex(i)),
 		                          ColumnBinding(table_index, ProjectionIndex(i)));
@@ -246,7 +247,8 @@ static void FuseScans(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 	if (ContainsDML(*plan)) {
 		return;
 	}
-	// One join at a time: the parent of a fused join must see the fused scan's bindings before it can be fused
+	// One join at a time: the parent of a fused join must see the fused scan's
+	// bindings before it can be fused
 	while (true) {
 		vector<ReplacementBinding> replacements;
 		if (!FuseOne(input.optimizer.binder, plan, replacements)) {

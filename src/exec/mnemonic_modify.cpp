@@ -17,7 +17,8 @@ namespace duckdb {
 using mnemonicdb::AttributeDef;
 using mnemonicdb::EntityId;
 
-//! A sink that changes rows identified by their row id and reports how many it changed
+//! A sink that changes rows identified by their row id and reports how many it
+//! changed
 class MnemonicModify : public PhysicalOperator {
 public:
 	MnemonicModify(PhysicalPlan &physical_plan, vector<LogicalType> types, MnemonicTableEntry &table,
@@ -38,7 +39,8 @@ public:
 		idx_t count = 0;
 		unordered_set<EntityId> seen;
 	};
-	//! Each thread buffers its rows; row order does not matter for UPDATE and DELETE
+	//! Each thread buffers its rows; row order does not matter for UPDATE and
+	//! DELETE
 	struct LocalState : public LocalSinkState {
 		LocalState(ClientContext &context, const vector<LogicalType> &types) : rows(context, types) {
 		}
@@ -52,7 +54,8 @@ public:
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override {
 		return make_uniq<LocalState>(context.client, children[0].get().GetTypes());
 	}
-	//! Rows are buffered and changed in Finalize, so the statement never reads its own writes
+	//! Rows are buffered and changed in Finalize, so the statement never reads
+	//! its own writes
 	SinkResultType Sink(ExecutionContext &, DataChunk &chunk, OperatorSinkInput &input) const override {
 		input.local_state.Cast<LocalState>().rows.Append(chunk);
 		return SinkResultType::NEED_MORE_INPUT;
@@ -93,7 +96,8 @@ public:
 				if (row_id_handling == RowIdHandling::ERROR) {
 					throw InvalidInputException("MnemonicDB: the same row is modified more than once");
 				}
-				// The first match wins for UPDATE ... FROM; a repeated DELETE of the same row is a no-op
+				// The first match wins for UPDATE ... FROM; a repeated DELETE of the
+				// same row is a no-op
 				continue;
 			}
 			CheckEntity(transaction, entity);
@@ -119,7 +123,8 @@ protected:
 		}
 		if (def.id == mnemonicdb::sys::TX) {
 			if (entity != transaction.CurrentTxEntity()) {
-				throw InvalidInputException("MnemonicDB: only the current transaction's sys.tx row can be changed");
+				throw InvalidInputException("MnemonicDB: only the current "
+				                            "transaction's sys.tx row can be changed");
 			}
 			return;
 		}
@@ -165,7 +170,8 @@ PhysicalOperator &PlanMnemonicDelete(ClientContext &, PhysicalPlanGenerator &pla
 	}
 	auto &table = op.table.Cast<MnemonicTableEntry>();
 	if (table.GetTableDef().schema != "main") {
-		throw NotImplementedException("MnemonicDB: rows cannot be deleted from sys tables; use DROP / ALTER TABLE");
+		throw NotImplementedException("MnemonicDB: rows cannot be deleted from sys "
+		                              "tables; use DROP / ALTER TABLE");
 	}
 	auto row_id_index = op.expressions.back()->Cast<BoundReferenceExpression>().Index();
 	auto &result = planner.Make<MnemonicDelete>(op.types, table, row_id_index, RowIdHandling::KEEP_FIRST,
@@ -182,12 +188,12 @@ public:
 	MnemonicUpdate(PhysicalPlan &physical_plan, vector<LogicalType> types, MnemonicTableEntry &table,
 	               idx_t row_id_index, RowIdHandling row_id_handling, idx_t estimated_cardinality,
 	               vector<PhysicalIndex> columns_p, vector<idx_t> value_indexes_p)
-	    : MnemonicModify(physical_plan, std::move(types), table, row_id_index, row_id_handling,
-	                     estimated_cardinality),
+	    : MnemonicModify(physical_plan, std::move(types), table, row_id_index, row_id_handling, estimated_cardinality),
 	      columns(std::move(columns_p)), value_indexes(std::move(value_indexes_p)) {
 	}
 
-	//! Updated physical columns, and where each one's new value is in the input chunk
+	//! Updated physical columns, and where each one's new value is in the input
+	//! chunk
 	vector<PhysicalIndex> columns;
 	vector<idx_t> value_indexes;
 
@@ -219,7 +225,8 @@ protected:
 			unordered_set<string> wanted;
 			for (idx_t c = list.offset; c < list.offset + list.length; c++) {
 				if (FlatVector::IsNull(child, c)) {
-					throw InvalidInputException("MnemonicDB: cardinality-many column \"%s\" cannot hold NULL elements",
+					throw InvalidInputException("MnemonicDB: cardinality-many column "
+					                            "\"%s\" cannot hold NULL elements",
 					                            attr.name);
 				}
 				wanted.insert(Encode(writer, attr, child, c));
@@ -236,8 +243,9 @@ protected:
 	}
 
 private:
-	//! The `id` column of an update leaves the row's entity unchanged. Its value may be the row's own id, NULL, or
-	//! a tempid, which is then bound to the row (so ON CONFLICT DO UPDATE resolves tempids like INSERT does).
+	//! The `id` column of an update leaves the row's entity unchanged. Its value
+	//! may be the row's own id, NULL, or a tempid, which is then bound to the row
+	//! (so ON CONFLICT DO UPDATE resolves tempids like INSERT does).
 	static void BindId(MnemonicTransaction &transaction, const Vector &vector, idx_t row, EntityId entity) {
 		if (FlatVector::IsNull(vector, row)) {
 			return;
@@ -249,7 +257,8 @@ private:
 		if (mnemonicdb::IsTempid(id)) {
 			auto bound = transaction.FindTempid(id);
 			if (bound && *bound != entity) {
-				throw ConstraintException("MnemonicDB: tempid resolved to entity %d earlier in this transaction, but "
+				throw ConstraintException("MnemonicDB: tempid resolved to entity %d "
+				                          "earlier in this transaction, but "
 				                          "this row is entity %d",
 				                          *bound, entity);
 			}
@@ -263,8 +272,7 @@ private:
 		if (attr.is_ref) {
 			auto id = FlatVector::GetData<uint64_t>(vector)[row];
 			if (mnemonicdb::IsTempid(id) || !mnemonicdb::IsWellFormed(id)) {
-				throw InvalidInputException("MnemonicDB: %d is not a valid entity ID for column \"%s\"", id,
-				                            attr.name);
+				throw InvalidInputException("MnemonicDB: %d is not a valid entity ID for column \"%s\"", id, attr.name);
 			}
 			writer.GetView().GetStore().CheckAllocated(id);
 			string v;
@@ -284,13 +292,13 @@ PhysicalOperator &PlanMnemonicUpdate(ClientContext &, PhysicalPlanGenerator &pla
 	vector<PhysicalIndex> columns;
 	vector<idx_t> value_indexes;
 	for (idx_t i = 0; i < op.columns.size(); i++) {
-		// `id` may appear: delete-and-insert updates (e.g. of LIST columns) carry every column, and ON CONFLICT DO
-		// UPDATE carries the inserted row's id so its tempid can be bound; BindId checks the value
+		// `id` may appear: delete-and-insert updates (e.g. of LIST columns) carry
+		// every column, and ON CONFLICT DO UPDATE carries the inserted row's id so
+		// its tempid can be bound; BindId checks the value
 		columns.push_back(op.columns[i]);
 		auto &expr = *op.expressions[i];
-		value_indexes.push_back(expr.GetExpressionType() == ExpressionType::BOUND_REF
-		                            ? expr.Cast<BoundReferenceExpression>().Index()
-		                            : i);
+		value_indexes.push_back(
+		    expr.GetExpressionType() == ExpressionType::BOUND_REF ? expr.Cast<BoundReferenceExpression>().Index() : i);
 	}
 	// Row ids are the last column of the input chunk
 	auto row_id_index = plan.types.size() - 1;

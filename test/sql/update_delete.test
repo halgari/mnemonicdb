@@ -1,6 +1,6 @@
 # name: test/sql/update_delete.test
 # description: UPDATE and DELETE retract and assert datoms; redundant writes are skipped; cardinality-many is a set; write conflicts
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

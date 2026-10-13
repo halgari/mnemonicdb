@@ -1,6 +1,6 @@
 # name: test/sql/history.test
 # description: mnemonicdb_history returns every assertion and retraction, with values as VARIANT
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

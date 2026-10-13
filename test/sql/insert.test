@@ -1,6 +1,6 @@
 # name: test/sql/insert.test
 # description: INSERT asserts datoms; tables share one entity space; tempids link rows across tables
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

@@ -1,6 +1,6 @@
 # name: test/sql/prefix_bloom.test
 # description: Lookups through prefix Bloom filters stay correct when data is spread over many SST files
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

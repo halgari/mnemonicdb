@@ -127,7 +127,8 @@ static void CurrentTxFunction(DataChunk &args, ExpressionState &state, Vector &r
 		}
 		auto &transaction = MnemonicTransaction::Get(context, catalog);
 		if (transaction.IsReadOnly()) {
-			throw InvalidInputException("current_tx: the transaction has not written to \"%s\"; use current_tx() "
+			throw InvalidInputException("current_tx: the transaction has not written to \"%s\"; use "
+			                            "current_tx() "
 			                            "in a statement that writes, or after one in the same transaction",
 			                            name.GetString());
 		}

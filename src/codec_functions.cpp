@@ -98,14 +98,13 @@ static void DecodeFunction(DataChunk &args, ExpressionState &state, Vector &resu
 // Entity IDs
 //===--------------------------------------------------------------------===//
 static void MakeIdFunction(DataChunk &args, ExpressionState &, Vector &result) {
-	BinaryExecutor::Execute<uint8_t, uint64_t, uint64_t>(args.data[0], args.data[1], result, args.size(),
-	                                                     [](uint8_t part, uint64_t local) {
-		                                                     if (local > mnemonicdb::LOCAL_MASK) {
-			                                                     throw InvalidInputException(
-			                                                         "entity local number %d exceeds 40 bits", local);
-		                                                     }
-		                                                     return mnemonicdb::MakeEntityId(part, local);
-	                                                     });
+	BinaryExecutor::Execute<uint8_t, uint64_t, uint64_t>(
+	    args.data[0], args.data[1], result, args.size(), [](uint8_t part, uint64_t local) {
+		    if (local > mnemonicdb::LOCAL_MASK) {
+			    throw InvalidInputException("entity local number %d exceeds 40 bits", local);
+		    }
+		    return mnemonicdb::MakeEntityId(part, local);
+	    });
 }
 
 static void CheckWellFormed(uint64_t id) {
@@ -220,9 +219,8 @@ static void DecodeKeyFunction(DataChunk &args, ExpressionState &, Vector &result
 // tempid(label [, partition]) -> REF
 //===--------------------------------------------------------------------===//
 static void TempidFunction(DataChunk &args, ExpressionState &, Vector &result) {
-	UnaryExecutor::Execute<string_t, uint64_t>(args.data[0], result, args.size(), [](string_t label) {
-		return mnemonicdb::MakeTempid(label.GetString(), 0);
-	});
+	UnaryExecutor::Execute<string_t, uint64_t>(
+	    args.data[0], result, args.size(), [](string_t label) { return mnemonicdb::MakeTempid(label.GetString(), 0); });
 }
 
 static void TempidPartitionFunction(DataChunk &args, ExpressionState &, Vector &result) {
@@ -238,11 +236,12 @@ static void TempidPartitionFunction(DataChunk &args, ExpressionState &, Vector &
 
 void RegisterCodecFunctions(ExtensionLoader &loader) {
 	loader.RegisterType("REF", mnemonicdb::RefType());
-	// REF and UBIGINT share a representation; both directions are cheap implicit casts
-	loader.RegisterCastFunction(mnemonicdb::RefType(), LogicalType::UBIGINT, BoundCastInfo(DefaultCasts::ReinterpretCast),
-	                            1);
-	loader.RegisterCastFunction(LogicalType::UBIGINT, mnemonicdb::RefType(), BoundCastInfo(DefaultCasts::ReinterpretCast),
-	                            1);
+	// REF and UBIGINT share a representation; both directions are cheap implicit
+	// casts
+	loader.RegisterCastFunction(mnemonicdb::RefType(), LogicalType::UBIGINT,
+	                            BoundCastInfo(DefaultCasts::ReinterpretCast), 1);
+	loader.RegisterCastFunction(LogicalType::UBIGINT, mnemonicdb::RefType(),
+	                            BoundCastInfo(DefaultCasts::ReinterpretCast), 1);
 	ScalarFunctionSet tempid("tempid");
 	ScalarFunction tempid_label({LogicalType::VARCHAR}, mnemonicdb::RefType(), TempidFunction);
 	ScalarFunction tempid_partition({LogicalType::VARCHAR, LogicalType::UTINYINT}, mnemonicdb::RefType(),
@@ -259,8 +258,8 @@ void RegisterCodecFunctions(ExtensionLoader &loader) {
 	                       LogicalType::ANY, DecodeFunction, DecodeBind);
 	functions.emplace_back("mnemonicdb_make_id", vector<LogicalType> {LogicalType::UTINYINT, LogicalType::UBIGINT},
 	                       LogicalType::UBIGINT, MakeIdFunction);
-	functions.emplace_back("mnemonicdb_id_partition", vector<LogicalType> {LogicalType::UBIGINT},
-	                       LogicalType::UTINYINT, IdPartitionFunction);
+	functions.emplace_back("mnemonicdb_id_partition", vector<LogicalType> {LogicalType::UBIGINT}, LogicalType::UTINYINT,
+	                       IdPartitionFunction);
 	functions.emplace_back("mnemonicdb_id_local", vector<LogicalType> {LogicalType::UBIGINT}, LogicalType::UBIGINT,
 	                       IdLocalFunction);
 	functions.emplace_back("mnemonicdb_encode_key",

@@ -64,7 +64,8 @@ rocksdb::Iterator &PrefixReader::GetIterator(ColumnFamily cf, bool prefix_mode) 
 	if (!slot) {
 		rocksdb::ReadOptions options;
 		options.snapshot = view.snapshot;
-		// Prefix mode: iteration stays within the seek key's 8-byte prefix, and Bloom filters apply
+		// Prefix mode: iteration stays within the seek key's 8-byte prefix, and
+		// Bloom filters apply
 		options.prefix_same_as_start = prefix_mode;
 		options.total_order_seek = !prefix_mode;
 		slot.reset(view.store->GetDB().NewIterator(options, &view.store->GetHandle(cf)));
@@ -91,7 +92,8 @@ void PrefixReader::Scan(ColumnFamily cf, const string &prefix,
 	auto view_of = [](const rocksdb::Slice &slice) {
 		return std::string_view(slice.data(), slice.size());
 	};
-	// Merge the snapshot with the pending writes; with overwrite_key each key appears once in the batch
+	// Merge the snapshot with the pending writes; with overwrite_key each key
+	// appears once in the batch
 	while (true) {
 		bool has_base = base_valid();
 		bool has_delta = delta_valid();
@@ -119,7 +121,8 @@ void PrefixReader::Scan(ColumnFamily cf, const string &prefix,
 	}
 }
 
-//! The smallest key greater than every key starting with `prefix`, or empty if there is none (all 0xFF)
+//! The smallest key greater than every key starting with `prefix`, or empty if
+//! there is none (all 0xFF)
 static string PrefixSuccessor(const string &prefix) {
 	string result = prefix;
 	while (!result.empty()) {
@@ -136,7 +139,7 @@ static string PrefixSuccessor(const string &prefix) {
 //! A RocksDB iterator that owns the upper bound its read options point to
 class BoundedIterator : public rocksdb::Iterator {
 public:
-	BoundedIterator(string upper_bound_p) : upper_bound(std::move(upper_bound_p)), upper_slice(upper_bound) {
+	explicit BoundedIterator(string upper_bound_p) : upper_bound(std::move(upper_bound_p)), upper_slice(upper_bound) {
 	}
 	const rocksdb::Slice *Bound() const {
 		return &upper_slice;
@@ -226,7 +229,8 @@ TxWriter::TxWriter(Store &store_p, const rocksdb::Snapshot *snapshot, TxId tx_p)
 TxWriter::~TxWriter() = default;
 
 bool TxWriter::HasChanges() {
-	// Writes that cancel out leave deletes in the batch but no txlog entry for this transaction
+	// Writes that cancel out leave deletes in the batch but no txlog entry for
+	// this transaction
 	auto prefix = TxlogPrefix(tx);
 	auto it = view.NewIterator(ColumnFamily::TXLOG, prefix);
 	it->Seek(prefix);
@@ -249,7 +253,8 @@ vector<Datom> TxWriter::CurrentDatoms(EntityId e, AttrId a) {
 	return view.ScanPrefix(ColumnFamily::EAVT, EavtPrefix(e, a));
 }
 
-//! The column families holding an attribute's current datoms, paired with their history column families
+//! The column families holding an attribute's current datoms, paired with their
+//! history column families
 static vector<std::pair<ColumnFamily, ColumnFamily>> IndexesOf(const AttributeDef &attr) {
 	vector<std::pair<ColumnFamily, ColumnFamily>> result {{ColumnFamily::EAVT, ColumnFamily::EAVT_HIST},
 	                                                      {ColumnFamily::AEVT, ColumnFamily::AEVT_HIST}};
@@ -306,9 +311,9 @@ void TxWriter::FinishStatement() {
 			if (!first.IsValid()) {
 				first = existing.e;
 			} else if (first.GetIndex() != existing.e) {
-				throw duckdb::ConstraintException(
-				    "Duplicate key: attribute \"%s\" has the same value on entities %d and %d", name,
-				    first.GetIndex(), existing.e);
+				throw duckdb::ConstraintException("Duplicate key: attribute \"%s\" has the same value on entities %d "
+				                                  "and %d",
+				                                  name, first.GetIndex(), existing.e);
 			}
 		}
 	}
@@ -365,7 +370,8 @@ void TxWriter::RetractDatom(const AttributeDef &attr, const Datom &datom) {
 	auto log_key = EncodeKey(IndexKind::TXLOG, log_entry);
 	count_deltas[datom.a]--;
 	if (datom.t == tx) {
-		// Asserted earlier in this transaction: it never becomes visible, so it leaves no history
+		// Asserted earlier in this transaction: it never becomes visible, so it
+		// leaves no history
 		for (auto &index : IndexesOf(attr)) {
 			Delete(index.first, EncodeKey(IndexKindOf(index.first), datom));
 		}
@@ -384,7 +390,8 @@ void TxWriter::RetractDatom(const AttributeDef &attr, const Datom &datom) {
 }
 
 bool TxWriter::UndoRetraction(const AttributeDef &attr, EntityId e, const string &v) {
-	// A value retracted earlier in this transaction and asserted again is simply restored
+	// A value retracted earlier in this transaction and asserted again is simply
+	// restored
 	if (!retracted.count({e, attr.Local()})) {
 		return false;
 	}
@@ -433,7 +440,8 @@ void TxWriter::RewriteAttribute(const AttributeDef &old_attr, const AttributeDef
 		CheckStatus(it->status());
 	}
 
-	// The conversion must keep distinct current values distinct, per entity and, for unique attributes, overall
+	// The conversion must keep distinct current values distinct, per entity and,
+	// for unique attributes, overall
 	std::set<std::pair<EntityId, string>> per_entity;
 	std::set<string> overall;
 	for (auto &entry : entries) {
@@ -441,25 +449,28 @@ void TxWriter::RewriteAttribute(const AttributeDef &old_attr, const AttributeDef
 			continue;
 		}
 		if (!per_entity.insert({entry.datom.e, entry.new_v}).second) {
-			throw duckdb::InvalidInputException(
-			    "MnemonicDB: changing the type of \"%s\" would merge two values of entity %d", old_attr.name,
-			    entry.datom.e);
+			throw duckdb::InvalidInputException("MnemonicDB: changing the type of \"%s\" would merge two values of "
+			                                    "entity %d",
+			                                    old_attr.name, entry.datom.e);
 		}
 		if (new_attr.unique != Uniqueness::NONE && !overall.insert(entry.new_v).second) {
-			throw duckdb::ConstraintException(
-			    "MnemonicDB: changing the type of \"%s\" would make two entities share a unique value",
-			    old_attr.name);
+			throw duckdb::ConstraintException("MnemonicDB: changing the type of \"%s\" would make two entities "
+			                                  "share a unique value",
+			                                  old_attr.name);
 		}
 	}
 
-	auto history_cfs = [](bool history, ColumnFamily current, ColumnFamily hist) { return history ? hist : current; };
+	auto history_cfs = [](bool history, ColumnFamily current, ColumnFamily hist) {
+		return history ? hist : current;
+	};
 	for (auto &entry : entries) {
 		auto old_datom = entry.datom;
 		auto new_datom = entry.datom;
 		new_datom.v = entry.new_v;
 		auto value = entry.history ? EncodeHistoryValue(entry.retracted_by) : string();
 		for (auto &index : IndexesOf(old_attr)) {
-			Delete(history_cfs(entry.history, index.first, index.second), EncodeKey(IndexKindOf(index.first), old_datom));
+			Delete(history_cfs(entry.history, index.first, index.second),
+			       EncodeKey(IndexKindOf(index.first), old_datom));
 		}
 		for (auto &index : IndexesOf(new_attr)) {
 			Put(history_cfs(entry.history, index.first, index.second), EncodeKey(IndexKindOf(index.first), new_datom),

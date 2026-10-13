@@ -1,6 +1,6 @@
 # name: test/sql/statement_atomicity.test
 # description: Failed statements and rolled-back transactions leave no writes behind and give their IDs back
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

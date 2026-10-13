@@ -43,7 +43,7 @@ MnemonicCatalogGeneration::MnemonicCatalogGeneration(MnemonicCatalog &catalog,
 }
 
 optional_ptr<CatalogEntry> MnemonicCatalogGeneration::GetIndex(const string &schema_name,
-                                                                const string &index_name) const {
+                                                               const string &index_name) const {
 	auto schema_indexes = indexes.find(schema_name);
 	if (schema_indexes == indexes.end()) {
 		return nullptr;
@@ -66,7 +66,7 @@ void MnemonicCatalogGeneration::ScanIndexes(const string &schema_name,
 MnemonicCatalogGeneration::~MnemonicCatalogGeneration() = default;
 
 optional_ptr<MnemonicTableEntry> MnemonicCatalogGeneration::GetTable(const string &schema_name,
-                                                                      const string &table_name) const {
+                                                                     const string &table_name) const {
 	auto schema_tables = tables.find(schema_name);
 	if (schema_tables == tables.end()) {
 		return nullptr;
@@ -166,25 +166,26 @@ PhysicalOperator &MnemonicCatalog::PlanCreateTableAs(ClientContext &, PhysicalPl
 	throw NotImplementedException("MnemonicDB does not support CREATE TABLE AS yet");
 }
 
-PhysicalOperator &MnemonicCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
-                                              LogicalInsert &op, optional_ptr<PhysicalOperator> plan) {
+PhysicalOperator &MnemonicCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
+                                              optional_ptr<PhysicalOperator> plan) {
 	return PlanMnemonicInsert(context, planner, op, plan);
 }
 
-PhysicalOperator &MnemonicCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
-                                              LogicalDelete &op, PhysicalOperator &plan) {
+PhysicalOperator &MnemonicCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
+                                              PhysicalOperator &plan) {
 	return PlanMnemonicDelete(context, planner, op, plan);
 }
 
-PhysicalOperator &MnemonicCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
-                                              LogicalUpdate &op, PhysicalOperator &plan) {
+PhysicalOperator &MnemonicCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
+                                              PhysicalOperator &plan) {
 	return PlanMnemonicUpdate(context, planner, op, plan);
 }
 
 PhysicalOperator &MnemonicCatalog::PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner,
                                                  LogicalMergeInto &op, PhysicalOperator &plan) {
-	// Give each UPDATE action the `id` its INSERT action would have written, so a tempid in an upserted row is
-	// bound to the existing entity the row merged into
+	// Give each UPDATE action the `id` its INSERT action would have written, so a
+	// tempid in an upserted row is bound to the existing entity the row merged
+	// into
 	optional_ptr<BoundMergeIntoAction> insert_action;
 	for (auto &entry : op.actions) {
 		for (auto &action : entry.second) {
@@ -195,7 +196,8 @@ PhysicalOperator &MnemonicCatalog::PlanMergeInto(ClientContext &context, Physica
 		}
 	}
 	if (insert_action && op.actions.find(MergeActionCondition::WHEN_MATCHED) == op.actions.end()) {
-		// ON CONFLICT DO NOTHING: matched rows have no action, but their tempids must still be bound
+		// ON CONFLICT DO NOTHING: matched rows have no action, but their tempids
+		// must still be bound
 		auto bind_action = make_uniq<BoundMergeIntoAction>();
 		bind_action->action_type = MergeActionType::MERGE_UPDATE;
 		op.actions[MergeActionCondition::WHEN_MATCHED].push_back(std::move(bind_action));
@@ -203,8 +205,8 @@ PhysicalOperator &MnemonicCatalog::PlanMergeInto(ClientContext &context, Physica
 	if (insert_action) {
 		for (auto &entry : op.actions) {
 			for (auto &action : entry.second) {
-				// A matched DO NOTHING still has to bind the row's tempid: make it an UPDATE of `id` alone, which
-				// changes no datom
+				// A matched DO NOTHING still has to bind the row's tempid: make it an
+				// UPDATE of `id` alone, which changes no datom
 				if (action->action_type == MergeActionType::MERGE_DO_NOTHING &&
 				    entry.first == MergeActionCondition::WHEN_MATCHED) {
 					action->action_type = MergeActionType::MERGE_UPDATE;

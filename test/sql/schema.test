@@ -1,6 +1,6 @@
 # name: test/sql/schema.test
 # description: Schema is data: sys tables describe themselves, and CREATE TABLE writes sys datoms
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

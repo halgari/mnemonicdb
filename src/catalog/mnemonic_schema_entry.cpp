@@ -13,8 +13,7 @@
 
 namespace duckdb {
 
-MnemonicSchemaEntry::MnemonicSchemaEntry(Catalog &catalog, CreateSchemaInfo &info)
-    : SchemaCatalogEntry(catalog, info) {
+MnemonicSchemaEntry::MnemonicSchemaEntry(Catalog &catalog, CreateSchemaInfo &info) : SchemaCatalogEntry(catalog, info) {
 }
 
 static void ScanGeneration(const MnemonicCatalogGeneration &generation, const string &schema, CatalogType type,
@@ -50,7 +49,8 @@ optional_ptr<CatalogEntry> MnemonicSchemaEntry::CreateFunction(CatalogTransactio
 	throw Unsupported("creating functions");
 }
 
-optional_ptr<CatalogEntry> MnemonicSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
+optional_ptr<CatalogEntry> MnemonicSchemaEntry::CreateTable(CatalogTransaction transaction,
+                                                            BoundCreateTableInfo &info) {
 	auto &transaction_entry = MnemonicTransaction::Get(transaction.GetContext(), catalog);
 	return transaction_entry.CreateTable(*this, info);
 }
@@ -71,8 +71,7 @@ optional_ptr<CatalogEntry> MnemonicSchemaEntry::CreateCopyFunction(CatalogTransa
 	throw Unsupported("creating copy functions");
 }
 
-optional_ptr<CatalogEntry> MnemonicSchemaEntry::CreatePragmaFunction(CatalogTransaction,
-                                                                     CreatePragmaFunctionInfo &) {
+optional_ptr<CatalogEntry> MnemonicSchemaEntry::CreatePragmaFunction(CatalogTransaction, CreatePragmaFunctionInfo &) {
 	throw Unsupported("creating pragma functions");
 }
 

@@ -1,6 +1,6 @@
 # name: test/sql/scan_fusion.test
 # description: Joins of tables on their entity id are fused into one scan; results match the unfused plan exactly
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

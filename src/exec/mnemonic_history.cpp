@@ -40,7 +40,8 @@ struct HistoryEvent {
 	}
 };
 
-//! How to describe and decode one attribute, including attributes whose column was dropped
+//! How to describe and decode one attribute, including attributes whose column
+//! was dropped
 struct AttributeInfo {
 	string schema;
 	string table;
@@ -113,12 +114,13 @@ static unique_ptr<FunctionData> HistoryBind(ClientContext &context, TableFunctio
 		}
 		if (column_name.empty()) {
 			result->attributes = table->attributes;
-			// Columns dropped from the table keep their history: their table link is in the history index
+			// Columns dropped from the table keep their history: their table link is
+			// in the history index
 			auto &view = MnemonicTransaction::Get(context, mnemonic_catalog).GetReadView();
 			string table_ref;
 			mnemonicdb::PutEntityId(table_ref, table->id);
-			for (auto &datom : view.ScanPrefix(ColumnFamily::AEVT_HIST,
-			                                   mnemonicdb::AevtPrefix(mnemonicdb::sys::ATTRIBUTES_TABLE))) {
+			for (auto &datom :
+			     view.ScanPrefix(ColumnFamily::AEVT_HIST, mnemonicdb::AevtPrefix(mnemonicdb::sys::ATTRIBUTES_TABLE))) {
 				auto local = static_cast<AttrId>(mnemonicdb::LocalOf(datom.e));
 				if (datom.v == table_ref && !schema.FindAttributeById(local)) {
 					result->attributes.push_back(local);
@@ -127,8 +129,7 @@ static unique_ptr<FunctionData> HistoryBind(ClientContext &context, TableFunctio
 		} else {
 			auto attr = schema.FindAttribute(*table, column_name);
 			if (!attr) {
-				throw BinderException("mnemonicdb_history: table \"%s\" has no column \"%s\"", table_name,
-				                      column_name);
+				throw BinderException("mnemonicdb_history: table \"%s\" has no column \"%s\"", table_name, column_name);
 			}
 			result->attributes.push_back(attr->Local());
 		}
@@ -136,12 +137,13 @@ static unique_ptr<FunctionData> HistoryBind(ClientContext &context, TableFunctio
 
 	names = {Identifier("tx"),          Identifier("entity"),    Identifier("schema_name"), Identifier("table_name"),
 	         Identifier("column_name"), Identifier("attribute"), Identifier("value"),       Identifier("added")};
-	return_types = {LogicalType::UBIGINT, mnemonicdb::RefType(), LogicalType::VARCHAR,     LogicalType::VARCHAR,
+	return_types = {LogicalType::UBIGINT, mnemonicdb::RefType(), LogicalType::VARCHAR,   LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, mnemonicdb::RefType(), LogicalType::VARIANT(), LogicalType::BOOLEAN};
 	return std::move(result);
 }
 
-//! Collect the events of the datoms under `prefix` in a current index and its history index
+//! Collect the events of the datoms under `prefix` in a current index and its
+//! history index
 static void CollectEvents(mnemonicdb::ReadView &view, ColumnFamily cf, ColumnFamily history_cf, const string &prefix,
                           vector<HistoryEvent> &events) {
 	auto kind = mnemonicdb::IndexKindOf(cf);
@@ -193,7 +195,8 @@ static unique_ptr<GlobalTableFunctionState> HistoryInit(ClientContext &context, 
 	return std::move(state);
 }
 
-//! Name, table and decoder of an attribute; dropped columns are described from their own definition datoms
+//! Name, table and decoder of an attribute; dropped columns are described from
+//! their own definition datoms
 static AttributeInfo &GetAttributeInfo(ClientContext &context, HistoryState &state, MnemonicTransaction &transaction,
                                        AttrId local) {
 	auto entry = state.attributes.find(local);
@@ -210,15 +213,18 @@ static AttributeInfo &GetAttributeInfo(ClientContext &context, HistoryState &sta
 		info->column = attr->name;
 		info->codec = make_uniq<mnemonicdb::ValueCodec>(attr->codec);
 	} else {
-		// A dropped column: its definition datoms are still there, only its table link was retracted
+		// A dropped column: its definition datoms are still there, only its table
+		// link was retracted
 		auto &view = transaction.GetReadView();
 		auto read = [&](AttrId sys_attr) -> string {
-			auto datoms = view.ScanPrefix(ColumnFamily::EAVT, mnemonicdb::EavtPrefix(mnemonicdb::AttrEntity(local), sys_attr));
+			auto datoms =
+			    view.ScanPrefix(ColumnFamily::EAVT, mnemonicdb::EavtPrefix(mnemonicdb::AttrEntity(local), sys_attr));
 			return datoms.empty() ? string() : schema.GetAttribute(sys_attr).codec.DecodeValue(datoms[0].v).ToString();
 		};
 		info->column = read(mnemonicdb::sys::ATTRIBUTES_NAME);
-		auto table_links = view.ScanPrefix(ColumnFamily::EAVT_HIST,
-		                                   mnemonicdb::EavtPrefix(mnemonicdb::AttrEntity(local), mnemonicdb::sys::ATTRIBUTES_TABLE));
+		auto table_links =
+		    view.ScanPrefix(ColumnFamily::EAVT_HIST,
+		                    mnemonicdb::EavtPrefix(mnemonicdb::AttrEntity(local), mnemonicdb::sys::ATTRIBUTES_TABLE));
 		if (!table_links.empty()) {
 			auto table = schema.FindTable(mnemonicdb::GetEntityId(table_links.back().v.data()));
 			if (table) {
@@ -262,8 +268,8 @@ static void HistoryFunction(ClientContext &context, TableFunctionInput &input, D
 	if (state.log) {
 		auto &it = *state.log;
 		for (; count < STANDARD_VECTOR_SIZE && it.Valid(); it.Next()) {
-			auto datom = mnemonicdb::DecodeKey(mnemonicdb::IndexKind::TXLOG,
-			                                   std::string_view(it.key().data(), it.key().size()));
+			auto datom =
+			    mnemonicdb::DecodeKey(mnemonicdb::IndexKind::TXLOG, std::string_view(it.key().data(), it.key().size()));
 			if (datom.t > data.until) {
 				break;
 			}
@@ -285,7 +291,7 @@ static void HistoryFunction(ClientContext &context, TableFunctionInput &input, D
 			emit(event.tx, event.datom, event.added);
 		}
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 void RegisterHistoryFunction(ExtensionLoader &loader) {

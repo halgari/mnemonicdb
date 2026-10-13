@@ -4,9 +4,11 @@
 
 namespace duckdb {
 
-//! mnemonicdb_info(catalog): format version, last tx and column families of an attached database
+//! mnemonicdb_info(catalog): format version, last tx and column families of an
+//! attached database
 TableFunction MnemonicInfoTableFunction();
-//! mnemonicdb_compact(catalog): full compaction of every column family; returns the size before and after
+//! mnemonicdb_compact(catalog): full compaction of every column family; returns
+//! the size before and after
 TableFunction MnemonicCompactTableFunction();
 
 } // namespace duckdb

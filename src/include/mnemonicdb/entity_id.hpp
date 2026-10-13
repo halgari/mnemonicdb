@@ -8,11 +8,14 @@
 
 namespace mnemonicdb {
 
-//! An entity ID: partition in the top byte, a 40-bit local number in the low bits, the 16 bits between always zero
+//! An entity ID: partition in the top byte, a 40-bit local number in the low
+//! bits, the 16 bits between always zero
 using EntityId = uint64_t;
-//! The local number of an attribute entity (partition 0), as stored in the A position of keys
+//! The local number of an attribute entity (partition 0), as stored in the A
+//! position of keys
 using AttrId = uint16_t;
-//! The local number of a transaction entity (partition 2), as stored in the T position of keys
+//! The local number of a transaction entity (partition 2), as stored in the T
+//! position of keys
 using TxId = uint64_t;
 
 namespace partition {

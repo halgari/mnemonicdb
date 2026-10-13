@@ -20,7 +20,8 @@
 
 namespace duckdb {
 
-//! Write the first transaction of a new database: the datoms describing the sys tables
+//! Write the first transaction of a new database: the datoms describing the sys
+//! tables
 static void Bootstrap(mnemonicdb::Store &store) {
 	store.AcquireWriter();
 	try {

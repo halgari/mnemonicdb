@@ -18,8 +18,11 @@ using duckdb::PhysicalType;
 using duckdb::string_t;
 using duckdb::UnifiedVectorFormat;
 
-static const OrderModifiers MODIFIERS(OrderType::ASCENDING, OrderByNullType::NULLS_LAST);
-//! With NULLS LAST at the top level, a non-NULL value's sort key starts with this byte
+static OrderModifiers Modifiers() {
+	return OrderModifiers(OrderType::ASCENDING, OrderByNullType::NULLS_LAST);
+}
+//! With NULLS LAST at the top level, a non-NULL value's sort key starts with
+//! this byte
 static constexpr char VALID_BYTE = 1;
 
 ValueCodec::ValueCodec(LogicalType type_p, bool is_ref_p) : type(std::move(type_p)), is_ref(is_ref_p) {
@@ -87,8 +90,9 @@ void ValueCodec::CheckSupported(const LogicalType &type) {
 //===--------------------------------------------------------------------===//
 // Validation
 //===--------------------------------------------------------------------===//
-//! Bounds-checked walk over one encoded value, mirroring DuckDB's sort-key layout (ascending; NULLS LAST inside
-//! nested values). Returns the offset just past the value. `data` is the full key including the validity byte.
+//! Bounds-checked walk over one encoded value, mirroring DuckDB's sort-key
+//! layout (ascending; NULLS LAST inside nested values). Returns the offset just
+//! past the value. `data` is the full key including the validity byte.
 static idx_t ValidateValue(const uint8_t *data, idx_t size, idx_t pos, const LogicalType &type);
 
 static void Require(bool condition, const char *what) {
@@ -101,7 +105,8 @@ static constexpr uint8_t SORT_VALID = 1;
 static constexpr uint8_t SORT_NULL = 2;
 static constexpr uint8_t SORT_DELIMITER = 0;
 
-//! A validity byte followed, unless NULL, by the payload. Struct children and array elements always follow.
+//! A validity byte followed, unless NULL, by the payload. Struct children and
+//! array elements always follow.
 static idx_t ValidateNested(const uint8_t *data, idx_t size, idx_t pos, const LogicalType &type) {
 	Require(pos < size, "truncated validity byte");
 	auto validity = data[pos++];
@@ -191,7 +196,8 @@ static idx_t ValidateValue(const uint8_t *data, idx_t size, idx_t pos, const Log
 
 bool ValueCodec::Validate(std::string_view encoded) const {
 	if (is_ref) {
-		return encoded.size() == PACKED_ID_SIZE && IsWellFormed(GetEntityId(encoded.data()));
+		return encoded.size() == PACKED_ID_SIZE &&
+		       IsWellFormed(GetEntityId(encoded.data())); // NOLINT: size checked above
 	}
 	auto data = reinterpret_cast<const uint8_t *>(encoded.data());
 	return ValidateValue(data, encoded.size(), 0, type) == encoded.size();
@@ -215,7 +221,7 @@ void ValueCodec::EncodeVector(const Vector &input, idx_t count, duckdb::vector<s
 	}
 
 	Vector keys(LogicalType::BLOB, count);
-	duckdb::CreateSortKeyHelpers::CreateSortKey(input, count, MODIFIERS, keys);
+	duckdb::CreateSortKeyHelpers::CreateSortKey(input, count, Modifiers(), keys);
 	auto key_data = duckdb::FlatVector::GetData<string_t>(keys);
 	for (idx_t i = 0; i < count; i++) {
 		if (!format.validity.RowIsValid(format.sel->get_index(i))) {
@@ -242,7 +248,8 @@ idx_t ValueCodec::DecodeInternal(std::string_view encoded, Vector &result, idx_t
 		if (encoded.size() < PACKED_ID_SIZE) {
 			throw InvalidInputException("MnemonicDB: truncated REF value");
 		}
-		duckdb::FlatVector::GetDataMutable<uint64_t>(result)[row] = GetEntityId(encoded.data());
+		duckdb::FlatVector::GetDataMutable<uint64_t>(result)[row] =
+		    GetEntityId(encoded.data()); // NOLINT: size checked above
 		return PACKED_ID_SIZE;
 	}
 	// Restore the validity byte stripped on encode, reusing a per-thread buffer
@@ -251,7 +258,7 @@ idx_t ValueCodec::DecodeInternal(std::string_view encoded, Vector &result, idx_t
 	key.push_back(VALID_BYTE);
 	key.append(encoded);
 	auto consumed =
-	    duckdb::CreateSortKeyHelpers::DecodeSortKey(string_t(key.data(), key.size()), result, row, MODIFIERS);
+	    duckdb::CreateSortKeyHelpers::DecodeSortKey(string_t(key.data(), key.size()), result, row, Modifiers());
 	if (consumed < 1 || consumed > key.size()) {
 		throw InvalidInputException("MnemonicDB: malformed encoded value");
 	}

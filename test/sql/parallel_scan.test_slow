@@ -1,6 +1,6 @@
 # name: test/sql/parallel_scan.test_slow
 # description: Parallel scans (entity ranges and candidate slices) return exactly what a single-threaded scan does
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

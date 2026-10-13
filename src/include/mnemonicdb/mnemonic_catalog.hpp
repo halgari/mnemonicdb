@@ -12,8 +12,9 @@ class MnemonicSchemaEntry;
 class MnemonicTableEntry;
 class MnemonicCatalog;
 
-//! The catalog entries for one immutable Schema. Transactions hold on to the generation they read, so entries stay
-//! alive for as long as any transaction can see them.
+//! The catalog entries for one immutable Schema. Transactions hold on to the
+//! generation they read, so entries stay alive for as long as any transaction
+//! can see them.
 class MnemonicCatalogGeneration {
 public:
 	MnemonicCatalogGeneration(MnemonicCatalog &catalog, shared_ptr<const mnemonicdb::Schema> schema);
@@ -81,8 +82,9 @@ public:
 	}
 	MnemonicSchemaEntry &GetSchemaEntry(const string &name);
 
-	//! Held while a transaction takes its basis, snapshot and generation, and while a commit publishes them, so a
-	//! transaction never sees a basis and a catalog generation from different commits
+	//! Held while a transaction takes its basis, snapshot and generation, and
+	//! while a commit publishes them, so a transaction never sees a basis and a
+	//! catalog generation from different commits
 	mutex &GetSnapshotLock() {
 		return snapshot_lock;
 	}
@@ -98,7 +100,8 @@ private:
 private:
 	unique_ptr<mnemonicdb::Store> store;
 	shared_ptr<const mnemonicdb::Schema> initial_schema;
-	//! The fixed schemas: `main` for user tables and `sys` for the schema-as-data tables
+	//! The fixed schemas: `main` for user tables and `sys` for the schema-as-data
+	//! tables
 	vector<unique_ptr<MnemonicSchemaEntry>> schemas;
 	mutex snapshot_lock;
 	mutex generation_lock;

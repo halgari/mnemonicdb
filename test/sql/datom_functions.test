@@ -1,6 +1,6 @@
 # name: test/sql/datom_functions.test
 # description: mnemonicdb_add / mnemonicdb_retract assert or retract a single datom
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

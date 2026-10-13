@@ -1,6 +1,6 @@
 # name: test/sql/time_travel.test
 # description: AT (VERSION => n) and AT (TIMESTAMP => ts) read the database as of an earlier transaction
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

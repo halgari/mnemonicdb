@@ -5,7 +5,8 @@
 
 namespace duckdb {
 
-//! The hidden row-id column used by UPDATE and DELETE; carries the same value as `id`
+//! The hidden row-id column used by UPDATE and DELETE; carries the same value
+//! as `id`
 #define MNEMONIC_ROWID_COLUMN COLUMN_IDENTIFIER_ROW_ID
 //! Physical index of the `id` column, present in every table
 static constexpr idx_t MNEMONIC_ID_COLUMN_INDEX = 0;
@@ -37,7 +38,8 @@ public:
 	const mnemonicdb::TableDef &GetTableDef() const {
 		return table;
 	}
-	//! The attribute behind physical column `index` (index 0 is `id`, which has none)
+	//! The attribute behind physical column `index` (index 0 is `id`, which has
+	//! none)
 	const mnemonicdb::AttributeDef &GetAttribute(idx_t index) const;
 
 private:

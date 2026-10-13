@@ -21,8 +21,8 @@ enum class ColumnFamily : uint8_t {
 
 const char *ColumnFamilyName(ColumnFamily cf);
 
-//! Indexes whose keys start with two fixed-width components (E6 A2, A2 E6, V6 A2) have an 8-byte prefix extractor
-//! with prefix Bloom filters
+//! Indexes whose keys start with two fixed-width components (E6 A2, A2 E6, V6
+//! A2) have an 8-byte prefix extractor with prefix Bloom filters
 static constexpr unsigned BLOOM_PREFIX_LENGTH = 8;
 bool HasPrefixBloom(ColumnFamily cf);
 

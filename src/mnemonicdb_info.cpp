@@ -50,7 +50,7 @@ static void MnemonicInfoFunction(ClientContext &, TableFunctionInput &input, Dat
 	output.SetValue(2, 0, Value::UBIGINT(store.GetLastTx()));
 	output.SetValue(3, 0, Value::BOOLEAN(store.IsReadOnly()));
 	output.SetValue(4, 0, Value::LIST(LogicalType::VARCHAR, std::move(column_families)));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 struct MnemonicCompactState : public GlobalTableFunctionState {

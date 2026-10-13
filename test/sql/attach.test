@@ -1,6 +1,6 @@
 # name: test/sql/attach.test
 # description: ATTACH opens or creates a MnemonicDB database backed by RocksDB
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

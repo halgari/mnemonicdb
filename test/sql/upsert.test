@@ -1,6 +1,6 @@
 # name: test/sql/upsert.test
 # description: ON CONFLICT and INSERT OR REPLACE resolve against UNIQUE / PRIMARY KEY attributes
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

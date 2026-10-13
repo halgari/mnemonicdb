@@ -1,6 +1,6 @@
 # name: test/sql/projection_pushdown.test
 # description: A NULL-rejecting filter lets a scan read only the filtered and projected columns; results match a full scan
-# group: [mnemonicdb]
+# group: [sql]
 
 require mnemonicdb
 

@@ -47,8 +47,8 @@ static LogicalType ValueTypeOf(const LogicalType &type) {
 
 AttributeDef::AttributeDef(EntityId id_p, EntityId table_p, string name_p, LogicalType type_p, Uniqueness unique_p,
                            bool indexed_p, string index_name_p)
-    : id(id_p), table(table_p), name(std::move(name_p)), type(std::move(type_p)), unique(unique_p),
-      indexed(indexed_p), index_name(std::move(index_name_p)), many(type.id() == LogicalTypeId::LIST), value_type(ValueTypeOf(type)),
+    : id(id_p), table(table_p), name(std::move(name_p)), type(std::move(type_p)), unique(unique_p), indexed(indexed_p),
+      index_name(std::move(index_name_p)), many(type.id() == LogicalTypeId::LIST), value_type(ValueTypeOf(type)),
       is_ref(IsRefType(value_type)), codec(is_ref ? LogicalType(LogicalTypeId::UBIGINT) : value_type, is_ref) {
 	if (PartitionOf(id) != partition::ATTR || LocalOf(id) > MAX_ATTR_LOCAL) {
 		throw duckdb::InternalException("attribute ID %d is not in the attribute partition", id);
@@ -100,8 +100,8 @@ shared_ptr<Schema> Schema::Builtin() {
 		schema->AddTable(table);
 	}
 	for (auto &attr : BuiltinAttributes()) {
-		schema->AddAttribute(AttributeDef(AttrEntity(attr.local), attr.table, attr.name, attr.type, attr.unique,
-		                                  attr.indexed));
+		schema->AddAttribute(
+		    AttributeDef(AttrEntity(attr.local), attr.table, attr.name, attr.type, attr.unique, attr.indexed));
 	}
 	return schema;
 }
@@ -217,7 +217,8 @@ shared_ptr<Schema> Schema::WithoutAttribute(AttrId local) const {
 		throw duckdb::InternalException("MnemonicDB: removing unknown attribute %d", local);
 	}
 	auto &table = result->tables.at(entry->second.table);
-	table.attributes.erase(std::remove(table.attributes.begin(), table.attributes.end(), local), table.attributes.end());
+	table.attributes.erase(std::remove(table.attributes.begin(), table.attributes.end(), local),
+	                       table.attributes.end());
 	result->attributes.erase(entry);
 	return result;
 }
@@ -316,7 +317,8 @@ shared_ptr<Schema> Schema::Load(ReadView &view, duckdb::ClientContext &context) 
 		auto index_name = CurrentValue(view, *schema, datom.e, sys::ATTRIBUTES_INDEX);
 		user_attributes.emplace_back(datom.e, table, name, duckdb::TransformStringToLogicalType(type_name, context),
 		                             unique ? ParseUniqueness(unique->ToString()) : Uniqueness::NONE,
-		                             indexed && indexed->GetValue<bool>(), index_name ? index_name->ToString() : string());
+		                             indexed && indexed->GetValue<bool>(),
+		                             index_name ? index_name->ToString() : string());
 	}
 	std::sort(user_attributes.begin(), user_attributes.end(),
 	          [](const AttributeDef &a, const AttributeDef &b) { return a.id < b.id; });
@@ -339,8 +341,9 @@ void Schema::WriteBootstrap(TxWriter &writer) {
 		AssertValue(writer, *schema, table.id, sys::TABLES_DOC, Value(table.doc));
 	}
 	for (auto &attr : BuiltinAttributes()) {
-		WriteAttribute(writer, *schema,
-		               AttributeDef(AttrEntity(attr.local), attr.table, attr.name, attr.type, attr.unique, attr.indexed));
+		WriteAttribute(
+		    writer, *schema,
+		    AttributeDef(AttrEntity(attr.local), attr.table, attr.name, attr.type, attr.unique, attr.indexed));
 	}
 }
 
