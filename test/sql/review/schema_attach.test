@@ -1,0 +1,81 @@
+# name: test/sql/review/schema_attach.test
+# description: Review: schema persistence across reattach, names, DETACH with open transactions (all pass; coverage)
+# group: [review]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/review_schema.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.t ("My Col" INTEGER, s STRUCT("x""y" INTEGER, "it's" VARCHAR, "order" INTEGER), e ENUM('it''s', 'a"b'), refs REF[], m MAP(VARCHAR, INTEGER[]), u UNION("a b" INTEGER, "C" VARCHAR), arr INTEGER[3], dec DECIMAL(20,4), "select" INTEGER)
+
+statement ok
+INSERT INTO d.t ("My Col", s, e, refs, m, u, arr, dec, "select") VALUES (1, {'x"y': 2, 'it''s': 'c', 'order': 3}, 'it''s', [tempid('r')], MAP {'k': [1]}, 'str'::UNION("a b" INTEGER, "C" VARCHAR), [1,2,3], 1.5, 7)
+
+# Table and column names are case-insensitive; id/rowid are reserved in any case
+statement error
+CREATE TABLE d.T (x INTEGER)
+----
+already exists
+
+statement error
+CREATE TABLE d.r (ID INTEGER)
+----
+reserved
+
+statement error
+CREATE TABLE d.r (RowId INTEGER)
+----
+reserved
+
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/review_schema.mnemonic' AS d (TYPE mnemonicdb)
+
+query IT
+SELECT "my col", s::VARCHAR FROM d.T
+----
+1	{'x"y': 2, 'it\'s': c, 'order': 3}
+
+query TTTTTR
+SELECT e, refs, m, u, arr, dec FROM d.t
+----
+it's	[216172782113783810]	{k=[1]}	str	[1, 2, 3]	1.5000
+
+query T
+SELECT column_name FROM duckdb_columns() WHERE database_name = 'd' AND table_name = 't' ORDER BY column_index
+----
+id
+My Col
+s
+e
+refs
+m
+u
+arr
+dec
+select
+
+# DETACH by another connection while a write transaction is open: the open transaction can still commit
+statement ok con1
+BEGIN
+
+statement ok con1
+INSERT INTO d.t ("My Col") VALUES (2)
+
+statement ok con2
+DETACH d
+
+statement ok con1
+COMMIT
+
+statement ok con2
+ATTACH '{TEST_DIR}/review_schema.mnemonic' AS d (TYPE mnemonicdb)
+
+query I con2
+SELECT sum("My Col") FROM d.t
+----
+3

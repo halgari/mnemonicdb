@@ -184,12 +184,19 @@ void Store::LoadMeta(bool created) {
 	CheckStatus(it->status(), path);
 }
 
-void Store::AcquireWriter() {
+void Store::AcquireWriter(const std::function<void()> &check_interrupt) {
 	if (read_only) {
 		throw duckdb::InvalidInputException("MnemonicDB: database \"%s\" is attached read-only", path);
 	}
 	std::unique_lock<std::mutex> guard(writer_lock);
-	writer_released.wait(guard, [&] { return !writer_active; });
+	while (writer_active) {
+		writer_released.wait_for(guard, std::chrono::milliseconds(50));
+		if (writer_active && check_interrupt) {
+			guard.unlock();
+			check_interrupt();
+			guard.lock();
+		}
+	}
 	writer_active = true;
 }
 
@@ -215,6 +222,24 @@ EntityId Store::AllocateId(uint8_t part) {
 	next_local[part] = local + 1;
 	next_local_dirty[part] = true;
 	return MakeEntityId(part, local);
+}
+
+void Store::CheckAllocated(EntityId id) const {
+	auto part = PartitionOf(id);
+	auto local = LocalOf(id);
+	bool allocated;
+	if (!IsWellFormed(id) || part == partition::TEMP) {
+		allocated = false;
+	} else if (part == partition::TX) {
+		// The writing transaction's own entity counts
+		allocated = local >= 1 && local <= last_tx.load() + (writer_active ? 1 : 0);
+	} else {
+		allocated = local < next_local[part];
+	}
+	if (!allocated) {
+		throw duckdb::InvalidInputException(
+		    "MnemonicDB: entity %d does not exist; new entities get their ids from tempid() or by omitting id", id);
+	}
 }
 
 void Store::Commit(rocksdb::WriteBatch &batch, TxId tx, int64_t instant) {

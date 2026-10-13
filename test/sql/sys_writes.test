@@ -128,6 +128,16 @@ INSERT INTO d.sys.attributes (table_id, name, type, uniqueness) SELECT id, 'x', 
 ----
 unknown uniqueness
 
+statement error
+INSERT INTO d.sys.tables (schema, name) VALUES ('nope', 'x')
+----
+unknown schema
+
+statement error
+INSERT INTO d.sys.tables (schema, name) VALUES ('sys', 'mine')
+----
+must be in schema "main"
+
 # Failed schema writes leave the schema unchanged
 query I
 SELECT count(*) FROM duckdb_columns() WHERE database_name = 'd' AND table_name = 'stuff'

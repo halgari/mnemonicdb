@@ -4,6 +4,8 @@
 
 #include <set>
 
+using duckdb::optional_idx;
+
 #include "rocksdb/db.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
 
@@ -19,14 +21,14 @@ static void CheckStatus(const rocksdb::Status &status) {
 // ReadView
 //===--------------------------------------------------------------------===//
 ReadView::ReadView(Store &store_p, const rocksdb::Snapshot *snapshot_p, rocksdb::WriteBatchWithIndex *batch_p)
-    : store(store_p), snapshot(snapshot_p), batch(batch_p) {
+    : store(&store_p), snapshot(snapshot_p), batch(batch_p) {
 }
 
 std::unique_ptr<rocksdb::Iterator> ReadView::NewIterator(ColumnFamily cf) {
 	rocksdb::ReadOptions options;
 	options.snapshot = snapshot;
-	auto &handle = store.GetHandle(cf);
-	auto base = store.GetDB().NewIterator(options, &handle);
+	auto &handle = store->GetHandle(cf);
+	auto base = store->GetDB().NewIterator(options, &handle);
 	if (!batch) {
 		return std::unique_ptr<rocksdb::Iterator>(base);
 	}
@@ -101,14 +103,29 @@ void TxWriter::PutIndexes(const AttributeDef &attr, const Datom &datom) {
 	}
 }
 
-void TxWriter::CheckUnique(const AttributeDef &attr, EntityId e, const string &v) {
-	if (attr.unique == Uniqueness::NONE) {
-		return;
+void TxWriter::CheckUnique(const AttributeDef &attr, EntityId, const string &v) {
+	if (attr.unique != Uniqueness::NONE) {
+		pending_unique.emplace_back(attr.Local(), v, attr.name);
 	}
-	for (auto &existing : view.ScanPrefix(ColumnFamily::AVET, AvetPrefix(attr.Local(), v))) {
-		if (existing.v == v && existing.e != e) {
-			throw duckdb::ConstraintException("Duplicate key: attribute \"%s\" already has this value on entity %d",
-			                                  attr.name, existing.e);
+}
+
+void TxWriter::FinishStatement() {
+	auto pending = std::move(pending_unique);
+	pending_unique.clear();
+	for (auto &entry : pending) {
+		auto &[local, v, name] = entry;
+		optional_idx first;
+		for (auto &existing : view.ScanPrefix(ColumnFamily::AVET, AvetPrefix(local, v))) {
+			if (existing.v != v) {
+				continue;
+			}
+			if (!first.IsValid()) {
+				first = existing.e;
+			} else if (first.GetIndex() != existing.e) {
+				throw duckdb::ConstraintException(
+				    "Duplicate key: attribute \"%s\" has the same value on entities %d and %d", name,
+				    first.GetIndex(), existing.e);
+			}
 		}
 	}
 }

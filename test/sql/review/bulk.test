@@ -1,0 +1,101 @@
+# name: test/sql/review/bulk.test
+# description: Review: statements over several 2048-row chunks, large values (all pass; coverage)
+# group: [review]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/review_bulk.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.t (x INTEGER, y VARCHAR, tags VARCHAR[])
+
+statement ok
+INSERT INTO d.t (x, y, tags) SELECT range, 'v' || range, ['a' || (range % 7), 'b'] FROM range(5000)
+
+query IIII
+SELECT count(*), sum(x), count(y), sum(len(tags)) FROM d.t
+----
+5000	12497500	5000	10000
+
+statement ok
+UPDATE d.t SET x = x + 1
+
+query III
+SELECT count(*), sum(x), min(x) FROM d.t
+----
+5000	12502500	1
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE d.t SET x = x + 1
+
+statement ok
+UPDATE d.t SET tags = list_append(tags, 'z')
+
+query III
+SELECT count(*), sum(x), sum(len(tags)) FROM d.t
+----
+5000	12507500	15000
+
+statement ok
+DELETE FROM d.t WHERE x % 2 = 0
+
+query II
+SELECT count(*), sum(x) FROM d.t
+----
+2500	6255000
+
+statement ok
+COMMIT
+
+query II
+SELECT count(*), sum(x) FROM d.t
+----
+2500	6255000
+
+query II
+SELECT count(*), sum(x) FROM d.t AT (VERSION => 4)
+----
+5000	12502500
+
+statement ok
+UPDATE d.t SET y = NULL WHERE x < 2000
+
+query I
+SELECT count(y) FROM d.t
+----
+1501
+
+query II
+SELECT count(*), sum(len(tags)) FROM d.t AT (VERSION => 3)
+----
+5000	10000
+
+# Multi-megabyte values in every index position, cardinality-one and -many
+statement ok
+CREATE TABLE d.big (s VARCHAR, b BLOB, tags VARCHAR[])
+
+statement ok
+INSERT INTO d.big (s, b, tags) SELECT repeat('x', 5000000) || range, repeat('\x00\x01'::BLOB, 100000), [repeat('y', 1000000), repeat('z', 10)] FROM range(3)
+
+statement ok
+UPDATE d.big SET s = s || 'q'
+
+query IIII
+SELECT length(s), octet_length(b), len(tags), length(tags[1]) FROM d.big ORDER BY s
+----
+5000002	200000	2	1000000
+5000002	200000	2	1000000
+5000002	200000	2	1000000
+
+# An entity with many values of a cardinality-many column
+statement ok
+INSERT INTO d.big (tags) SELECT list(range::VARCHAR) FROM range(20000)
+
+query I
+SELECT max(len(tags)) FROM d.big
+----
+20000

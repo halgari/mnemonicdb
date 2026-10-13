@@ -1,0 +1,114 @@
+# name: test/sql/review/tempids.test
+# description: Review: tempid resolution, identity matching and upserts
+# group: [review]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/review_tempids.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.p (email VARCHAR PRIMARY KEY, name VARCHAR)
+
+statement ok
+CREATE TABLE d.acct (owner REF, bal INTEGER)
+
+statement ok
+INSERT INTO d.p (email, name) VALUES ('a', 'A')
+
+# A label first used as a REF, then as the id of a row with a new identity value: one entity (passes)
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.acct (owner, bal) VALUES (tempid('n'), 1)
+
+statement ok
+INSERT INTO d.p (id, email, name) VALUES (tempid('n'), 'new', 'N')
+
+statement ok
+COMMIT
+
+query TI
+SELECT p.name, a.bal FROM d.p p JOIN d.acct a ON a.owner = p.id
+----
+N	1
+
+# A label first used as a REF, then matched to an existing entity by identity: error (passes; DESIGN.md)
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.acct (owner, bal) VALUES (tempid('a'), 2)
+
+statement error
+INSERT INTO d.p (id, email, name) VALUES (tempid('a'), 'a', 'A2')
+----
+unique identity value belongs to entity
+
+statement ok
+ROLLBACK
+
+# Plain INSERT with a tempid upserts into the entity owning the identity value, and the label
+# follows it into later statements (passes)
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.p (id, email, name) VALUES (tempid('x'), 'a', 'A2')
+
+statement ok
+INSERT INTO d.acct (owner, bal) VALUES (tempid('x'), 3)
+
+statement ok
+COMMIT
+
+query TI
+SELECT p.name, a.bal FROM d.p p JOIN d.acct a ON a.owner = p.id WHERE p.email = 'a'
+----
+A2	3
+
+#
+# Regression (fixed): with ON CONFLICT DO UPDATE the matched row goes through MERGE's UPDATE path
+# (src/exec/mnemonic_modify.cpp), which never binds the row's tempid. A later statement in the same
+# transaction using the label allocates a fresh, empty entity instead of the upserted one.
+# Actual: the account's owner is a dangling new entity, so the join is empty.
+# Expected: tempid('y') resolves to the entity owning 'a', exactly as for the plain INSERT above.
+# Fix: in the MERGE update path, bind a tempid id value to the matched row id (or resolve tempids for
+# the source rows before the merge join).
+#
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.p (id, email, name) VALUES (tempid('y'), 'a', 'A3') ON CONFLICT (email) DO UPDATE SET name = excluded.name
+
+statement ok
+INSERT INTO d.acct (owner, bal) VALUES (tempid('y'), 4)
+
+statement ok
+COMMIT
+
+query TI
+SELECT p.name, a.bal FROM d.p p JOIN d.acct a ON a.owner = p.id WHERE a.bal = 4
+----
+A3	4
+
+# Same for DO NOTHING (FAILS, also with the uncommitted fix: DO NOTHING has no UPDATE action to carry the id,
+# so the label stays unbound and later statements allocate a fresh entity)
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.p (id, email, name) VALUES (tempid('z'), 'a', 'ignored') ON CONFLICT DO NOTHING
+
+statement ok
+INSERT INTO d.acct (owner, bal) VALUES (tempid('z'), 5)
+
+statement ok
+COMMIT
+
+query TI
+SELECT p.name, a.bal FROM d.p p JOIN d.acct a ON a.owner = p.id WHERE a.bal = 5
+----
+A3	5

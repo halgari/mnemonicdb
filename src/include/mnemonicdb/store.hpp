@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 
 namespace rocksdb {
@@ -62,13 +63,17 @@ public:
 		return last_instant.load();
 	}
 
-	//! Block until this caller is the only writer; paired with ReleaseWriter, possibly from another thread
-	void AcquireWriter();
+	//! Block until this caller is the only writer; paired with ReleaseWriter, possibly from another thread.
+	//! `check_interrupt` is called periodically while waiting and may throw to give up.
+	void AcquireWriter(const std::function<void()> &check_interrupt = nullptr);
 	void ReleaseWriter();
 
 	//! Allocate a new entity ID in `part`. Only the current writer may allocate. IDs allocated by a transaction
 	//! that rolls back are simply never used.
 	EntityId AllocateId(uint8_t part);
+	//! Throw unless `id` names an entity that was allocated (explicit ids and REF targets must exist; they never
+	//! move the counters, so one bad value cannot exhaust a partition)
+	void CheckAllocated(EntityId id) const;
 
 	//! Atomically write `batch` as transaction `tx`, together with the updated metadata. Only the current writer
 	//! may commit, and `tx` must be GetLastTx() + 1.

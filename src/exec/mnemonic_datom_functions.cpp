@@ -94,9 +94,13 @@ static void DatomFunction(ClientContext &context, TableFunctionInput &input, Dat
 	}
 	state.done = true;
 	auto &data = input.bind_data->Cast<DatomFunctionData>();
-	auto &writer = MnemonicTransaction::Get(context, data.table.catalog).GetWriter();
+	auto &transaction = MnemonicTransaction::Get(context, data.table.catalog);
+	lock_guard<mutex> guard(transaction.GetWriteLock());
+	auto &writer = transaction.GetWriter();
 	string v;
+	writer.GetView().GetStore().CheckAllocated(data.entity);
 	if (data.attr.is_ref) {
+		writer.GetView().GetStore().CheckAllocated(data.value.GetValue<uint64_t>());
 		mnemonicdb::PutEntityId(v, data.value.GetValue<uint64_t>());
 	} else {
 		v = data.attr.codec.EncodeValue(data.value);
@@ -107,6 +111,7 @@ static void DatomFunction(ClientContext &context, TableFunctionInput &input, Dat
 	} else {
 		writer.Retract(data.attr, data.entity, v);
 	}
+	writer.FinishStatement();
 	auto after = writer.CurrentDatoms(data.entity, data.attr.Local());
 	output.data[0].Append(Value::BOOLEAN(before != after));
 }

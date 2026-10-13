@@ -11,6 +11,7 @@
 #include "duckdb/parser/parsed_data/create_index_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/storage/database_size.hpp"
 
@@ -178,6 +179,51 @@ PhysicalOperator &MnemonicCatalog::PlanDelete(ClientContext &context, PhysicalPl
 PhysicalOperator &MnemonicCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalUpdate &op, PhysicalOperator &plan) {
 	return PlanMnemonicUpdate(context, planner, op, plan);
+}
+
+PhysicalOperator &MnemonicCatalog::PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                 LogicalMergeInto &op, PhysicalOperator &plan) {
+	// Give each UPDATE action the `id` its INSERT action would have written, so a tempid in an upserted row is
+	// bound to the existing entity the row merged into
+	optional_ptr<BoundMergeIntoAction> insert_action;
+	for (auto &entry : op.actions) {
+		for (auto &action : entry.second) {
+			if (action->action_type == MergeActionType::MERGE_INSERT && action->column_index_map.empty() &&
+			    !action->expressions.empty()) {
+				insert_action = action.get();
+			}
+		}
+	}
+	if (insert_action && op.actions.find(MergeActionCondition::WHEN_MATCHED) == op.actions.end()) {
+		// ON CONFLICT DO NOTHING: matched rows have no action, but their tempids must still be bound
+		auto bind_action = make_uniq<BoundMergeIntoAction>();
+		bind_action->action_type = MergeActionType::MERGE_UPDATE;
+		op.actions[MergeActionCondition::WHEN_MATCHED].push_back(std::move(bind_action));
+	}
+	if (insert_action) {
+		for (auto &entry : op.actions) {
+			for (auto &action : entry.second) {
+				// A matched DO NOTHING still has to bind the row's tempid: make it an UPDATE of `id` alone, which
+				// changes no datom
+				if (action->action_type == MergeActionType::MERGE_DO_NOTHING &&
+				    entry.first == MergeActionCondition::WHEN_MATCHED) {
+					action->action_type = MergeActionType::MERGE_UPDATE;
+				}
+				if (action->action_type != MergeActionType::MERGE_UPDATE) {
+					continue;
+				}
+				bool has_id = false;
+				for (auto &column : action->columns) {
+					has_id = has_id || column.index == MNEMONIC_ID_COLUMN_INDEX;
+				}
+				if (!has_id) {
+					action->columns.emplace_back(MNEMONIC_ID_COLUMN_INDEX);
+					action->expressions.push_back(insert_action->expressions[MNEMONIC_ID_COLUMN_INDEX]->Copy());
+				}
+			}
+		}
+	}
+	return Catalog::PlanMergeInto(context, planner, op, plan);
 }
 
 unique_ptr<LogicalOperator> MnemonicCatalog::BindCreateIndex(Binder &, CreateStatement &stmt, TableCatalogEntry &table,

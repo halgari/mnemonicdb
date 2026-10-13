@@ -246,10 +246,18 @@ database into a single merge join.
 ### Lifecycle
 
 1. **Begin.** Take a RocksDB snapshot, record basis `t0` = last committed T.
-2. **First write.** Acquire the process-wide writer mutex (a second writer
-   blocks). If a transaction committed after `t0`, fail with a conflict
-   error. The caller must retry; the system never re-runs a transaction
-   on its own. Allocate this transaction's ID in the `tx`
+2. **First write.** Acquire the process-wide writer mutex. A second writer
+   waits, and the wait can be interrupted. Then:
+   - If the transaction hasn't read any data yet (an autocommit
+     `INSERT ... VALUES`, or a statement whose scans all start after this
+     point) and the schema is unchanged, it moves its snapshot to the latest
+     commit.
+   - Otherwise, if a transaction committed after `t0`, it fails with a
+     conflict error. The caller must retry; the system never re-runs a
+     transaction on its own.
+
+   Basis, snapshot and catalog generation are taken under the same lock that
+   commit holds while publishing, so they always belong together. Allocate this transaction's ID in the `tx`
    partition; `current_tx()` returns it from here on.
 3. **Statements.** Writes go into a `WriteBatchWithIndex`. Reads in the same
    transaction iterate the batch over the snapshot (read-your-writes).
@@ -288,6 +296,20 @@ commits nothing and gets no `sys.tx` row. "Changed" means at least one
 - Omitting `id` on INSERT allocates a fresh ID.
 
 ### Statement semantics
+
+- **Statements don't see their own writes.** INSERT/UPDATE/DELETE sinks
+  buffer their input and apply it in Finalize, after the statement's scans
+  are done (this is the Halloween problem). Writers within one transaction
+  are serialized by a per-transaction mutex, because the actions of a MERGE
+  run as separate pipelines.
+- **Uniqueness is checked per statement.** Unique values asserted by a
+  statement are verified when it finishes, so a statement may move or swap
+  unique values between entities.
+- **Explicit ids must exist.** An explicit `id`, a REF value, or the entity
+  given to `mnemonicdb_add` must name an allocated entity. New entities come
+  from `tempid()` or an omitted `id`. Explicit ids therefore never collide
+  with later allocations and never move the counters. Partitions 4–15 and
+  255 are rejected.
 
 - **ON CONFLICT** is rewritten by DuckDB into MERGE INTO, which plans
   through our INSERT/UPDATE/DELETE operators. It finds conflict targets

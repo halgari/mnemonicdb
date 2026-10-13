@@ -1,0 +1,54 @@
+# name: test/sql/review/unique_swap.test
+# description: Review: uniqueness is checked per datom, not per statement
+# group: [review]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/review_unique_swap.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.p (email VARCHAR UNIQUE, name VARCHAR)
+
+statement ok
+INSERT INTO d.p (email, name) VALUES ('a', 'A'), ('b', 'B')
+
+# Swapping in three statements works (passes)
+statement ok
+BEGIN
+
+statement ok
+UPDATE d.p SET email = 'tmp' WHERE name = 'A'
+
+statement ok
+UPDATE d.p SET email = 'a' WHERE name = 'B'
+
+statement ok
+UPDATE d.p SET email = 'b' WHERE name = 'A'
+
+statement ok
+COMMIT
+
+query TT
+SELECT name, email FROM d.p ORDER BY name
+----
+A	b
+B	a
+
+#
+# Regression (fixed): swapping two unique values in ONE statement fails, because TxWriter::CheckUnique
+# (src/write/tx_writer.cpp:102) runs per row, before the other row's value is retracted. Native DuckDB
+# tables accept this statement (constraints hold at the end of the statement).
+# Actual: Constraint Error: Duplicate key: attribute "email" already has this value on entity ...
+# Expected: success, values swapped.
+# Fix: defer the uniqueness check for values asserted in a statement to the end of the statement
+# (e.g. collect (attr, v) pairs in the sink and verify AVET in Finalize).
+#
+statement ok
+UPDATE d.p SET email = CASE WHEN email = 'a' THEN 'b' ELSE 'a' END
+
+query TT
+SELECT name, email FROM d.p ORDER BY name
+----
+A	a
+B	b

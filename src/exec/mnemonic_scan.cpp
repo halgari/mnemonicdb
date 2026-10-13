@@ -438,6 +438,7 @@ static unique_ptr<GlobalTableFunctionState> MnemonicScanInit(ClientContext &cont
 	auto &bind_data = input.bind_data->Cast<MnemonicScanBindData>();
 	auto &table = bind_data.table;
 	auto &transaction = MnemonicTransaction::Get(context, table.catalog);
+	transaction.MarkDataRead();
 	auto &view = transaction.GetReadView();
 	auto &def = table.GetTableDef();
 

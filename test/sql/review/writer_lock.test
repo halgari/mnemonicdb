@@ -1,0 +1,202 @@
+# name: test/sql/review/writer_lock.test
+# description: Review: every path that takes the writer lock releases it (all pass; coverage).
+# A leaked lock makes the next con2 write block forever (single-threaded runner), so a hang here is a failure.
+# group: [review]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/review_writer_lock.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.t (x INTEGER, u VARCHAR UNIQUE)
+
+statement ok
+CREATE TABLE mem (x INTEGER)
+
+statement ok
+INSERT INTO d.t (x, u) VALUES (0, 'taken')
+
+# failed statement inside explicit transaction, then rollback
+statement ok con1
+BEGIN
+
+statement ok con1
+INSERT INTO d.t (x) VALUES (1)
+
+statement error con1
+INSERT INTO d.t (x, u) VALUES (2, 'taken')
+----
+Duplicate
+
+statement ok con1
+ROLLBACK
+
+statement ok con2
+INSERT INTO d.t (x) VALUES (10)
+
+# failed first write in autocommit
+statement error con1
+INSERT INTO d.t (x, u) VALUES (2, 'taken')
+----
+Duplicate
+
+statement ok con2
+INSERT INTO d.t (x) VALUES (20)
+
+# writing two databases in one transaction
+statement ok con1
+BEGIN
+
+statement ok con1
+INSERT INTO mem VALUES (1)
+
+statement error con1
+INSERT INTO d.t (x) VALUES (3)
+----
+single attached database
+
+statement ok con1
+ROLLBACK
+
+statement ok con2
+INSERT INTO d.t (x) VALUES (30)
+
+statement ok con1
+BEGIN
+
+statement ok con1
+INSERT INTO d.t (x) VALUES (4)
+
+statement error con1
+INSERT INTO mem VALUES (1)
+----
+single attached database
+
+statement ok con1
+ROLLBACK
+
+statement ok con2
+INSERT INTO d.t (x) VALUES (40)
+
+# failed CREATE TABLE
+statement error con1
+CREATE TABLE d.bad (id INTEGER)
+----
+reserved
+
+statement error con1
+CREATE TABLE d.bad (x INTEGER NOT NULL)
+----
+NOT NULL
+
+statement ok con2
+INSERT INTO d.t (x) VALUES (50)
+
+# CREATE TABLE inside explicit transaction, failed statement, rollback
+statement ok con1
+BEGIN
+
+statement ok con1
+CREATE TABLE d.t2 (y INTEGER)
+
+statement ok con1
+INSERT INTO d.t2 (y) VALUES (1)
+
+query I con1
+SELECT y FROM d.t2
+----
+1
+
+statement ok con1
+ROLLBACK
+
+statement error con2
+SELECT * FROM d.t2
+----
+does not exist
+
+statement ok con2
+CREATE TABLE d.t2 (z VARCHAR)
+
+statement ok con2
+INSERT INTO d.t2 (z) VALUES ('ok')
+
+query T
+SELECT z FROM d.t2
+----
+ok
+
+query I
+SELECT sum(x) FROM d.t
+----
+150
+
+# Conflict at the first write releases the lock, and the aborted transaction stays aborted
+statement ok con1
+BEGIN
+
+query I con1
+SELECT count(*) > 0 FROM d.t
+----
+true
+
+statement ok con2
+INSERT INTO d.t (x) VALUES (0)
+
+statement error con1
+INSERT INTO d.t (x) VALUES (1000)
+----
+transaction conflict
+
+statement error con1
+INSERT INTO d.t (x) VALUES (1000)
+----
+Current transaction is aborted
+
+statement ok con2
+INSERT INTO d.t (x) VALUES (0)
+
+statement ok con1
+ROLLBACK
+
+# A read-only transaction holds no lock and never conflicts
+statement ok con1
+BEGIN
+
+query I con1
+SELECT sum(x) FROM d.t
+----
+150
+
+statement ok con2
+INSERT INTO d.t (x) VALUES (0)
+
+query I con1
+SELECT sum(x) FROM d.t
+----
+150
+
+statement ok con1
+COMMIT
+
+# A net-empty transaction releases the lock without committing
+statement ok con1
+BEGIN
+
+statement ok con1
+INSERT INTO d.t (x) VALUES (999)
+
+statement ok con1
+DELETE FROM d.t WHERE x = 999
+
+statement ok con1
+COMMIT
+
+statement ok con2
+INSERT INTO d.t (x) VALUES (0)
+
+query I
+SELECT sum(x) FROM d.t
+----
+150

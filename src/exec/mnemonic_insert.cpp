@@ -4,6 +4,7 @@
 #include "mnemonicdb/tempid.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
@@ -28,9 +29,12 @@ public:
 		return "MNEMONICDB_INSERT";
 	}
 
-	// Sink interface
+	// Sink interface: rows are buffered and written in Finalize, so the statement never reads its own writes
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
+	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+	                          OperatorSinkFinalizeInput &input) const override;
+	void WriteChunk(ClientContext &context, DataChunk &chunk) const;
 	bool IsSink() const override {
 		return true;
 	}
@@ -49,11 +53,14 @@ protected:
 };
 
 struct MnemonicInsertState : public GlobalSinkState {
+	MnemonicInsertState(ClientContext &context, const vector<LogicalType> &types) : rows(context, types) {
+	}
+	ColumnDataCollection rows;
 	idx_t count = 0;
 };
 
-unique_ptr<GlobalSinkState> MnemonicInsert::GetGlobalSinkState(ClientContext &) const {
-	return make_uniq<MnemonicInsertState>();
+unique_ptr<GlobalSinkState> MnemonicInsert::GetGlobalSinkState(ClientContext &context) const {
+	return make_uniq<MnemonicInsertState>(context, children[0].get().GetTypes());
 }
 
 //! Resolves entity IDs for inserted rows and REF values
@@ -67,6 +74,7 @@ public:
 	EntityId ResolveRef(EntityId value) {
 		if (!mnemonicdb::IsTempid(value)) {
 			Validate(value);
+			Reserve(value);
 			return value;
 		}
 		if (auto bound = transaction.FindTempid(value)) {
@@ -86,6 +94,7 @@ public:
 		auto id = *value;
 		if (!mnemonicdb::IsTempid(id)) {
 			Validate(id);
+			Reserve(id);
 			return id;
 		}
 		auto bound = transaction.FindTempid(id);
@@ -117,9 +126,18 @@ private:
 		return transaction.GetWriter().GetView().GetStore().AllocateId(partition);
 	}
 
+	void Reserve(EntityId id) {
+		transaction.GetWriter().GetView().GetStore().CheckAllocated(id);
+	}
+
 	static void Validate(EntityId id) {
 		if (!mnemonicdb::IsWellFormed(id)) {
 			throw InvalidInputException("MnemonicDB: %d is not a valid entity ID", id);
+		}
+		auto part = mnemonicdb::PartitionOf(id);
+		if ((part >= mnemonicdb::partition::FIRST_RESERVED && part < mnemonicdb::partition::FIRST_USER) ||
+		    part == mnemonicdb::partition::TEMP) {
+			throw InvalidInputException("MnemonicDB: entity %d is in reserved partition %d", id, part);
 		}
 	}
 
@@ -162,9 +180,27 @@ static void CheckSysEntity(MnemonicTransaction &transaction, const MnemonicTable
 	}
 }
 
-SinkResultType MnemonicInsert::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
+SinkResultType MnemonicInsert::Sink(ExecutionContext &, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &state = input.global_state.Cast<MnemonicInsertState>();
-	auto &transaction = MnemonicTransaction::Get(context.client, table.catalog);
+	state.rows.Append(chunk);
+	state.count += chunk.size();
+	return SinkResultType::NEED_MORE_INPUT;
+}
+
+SinkFinalizeType MnemonicInsert::Finalize(Pipeline &, Event &, ClientContext &context,
+                                          OperatorSinkFinalizeInput &input) const {
+	auto &state = input.global_state.Cast<MnemonicInsertState>();
+	auto &transaction = MnemonicTransaction::Get(context, table.catalog);
+	lock_guard<mutex> guard(transaction.GetWriteLock());
+	for (auto &chunk : state.rows.Chunks()) {
+		WriteChunk(context, chunk);
+	}
+	transaction.GetWriter().FinishStatement();
+	return SinkFinalizeType::READY;
+}
+
+void MnemonicInsert::WriteChunk(ClientContext &context, DataChunk &chunk) const {
+	auto &transaction = MnemonicTransaction::Get(context, table.catalog);
 	auto &writer = transaction.GetWriter();
 	auto &def = table.GetTableDef();
 	auto count = chunk.size();
@@ -250,15 +286,15 @@ SinkResultType MnemonicInsert::Sink(ExecutionContext &context, DataChunk &chunk,
 			}
 		}
 	}
-	state.count += count;
-	return SinkResultType::NEED_MORE_INPUT;
 }
 
 SourceResultType MnemonicInsert::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                  OperatorSourceInput &) const {
 	auto &state = sink_state->Cast<MnemonicInsertState>();
 	if (table.GetTableDef().schema == "sys" && table.GetTableDef().id != mnemonicdb::sys::TX) {
-		MnemonicTransaction::Get(context.client, table.catalog).ReloadSchema(context.client);
+		auto &transaction = MnemonicTransaction::Get(context.client, table.catalog);
+		lock_guard<mutex> guard(transaction.GetWriteLock());
+		transaction.ReloadSchema(context.client);
 	}
 	chunk.data[0].Append(Value::BIGINT(NumericCast<int64_t>(state.count)));
 	return SourceResultType::FINISHED;

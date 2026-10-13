@@ -60,6 +60,8 @@ public:
 	                             PhysicalOperator &plan) override;
 	PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
 	                             PhysicalOperator &plan) override;
+	PhysicalOperator &PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner, LogicalMergeInto &op,
+	                                PhysicalOperator &plan) override;
 	unique_ptr<LogicalOperator> BindCreateIndex(Binder &binder, CreateStatement &stmt, TableCatalogEntry &table,
 	                                            unique_ptr<LogicalOperator> plan) override;
 
@@ -79,6 +81,11 @@ public:
 	}
 	MnemonicSchemaEntry &GetSchemaEntry(const string &name);
 
+	//! Held while a transaction takes its basis, snapshot and generation, and while a commit publishes them, so a
+	//! transaction never sees a basis and a catalog generation from different commits
+	mutex &GetSnapshotLock() {
+		return snapshot_lock;
+	}
 	//! The generation of the latest committed schema
 	shared_ptr<MnemonicCatalogGeneration> GetGeneration();
 	void SetGeneration(shared_ptr<MnemonicCatalogGeneration> generation);
@@ -93,6 +100,7 @@ private:
 	shared_ptr<const mnemonicdb::Schema> initial_schema;
 	//! The fixed schemas: `main` for user tables and `sys` for the schema-as-data tables
 	vector<unique_ptr<MnemonicSchemaEntry>> schemas;
+	mutex snapshot_lock;
 	mutex generation_lock;
 	shared_ptr<MnemonicCatalogGeneration> generation;
 };

@@ -6,6 +6,7 @@
 
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
@@ -26,9 +27,20 @@ using mnemonicdb::EntityId;
 
 MnemonicTransaction::MnemonicTransaction(MnemonicTransactionManager &manager, ClientContext &context,
                                          MnemonicCatalog &catalog_p)
-    : Transaction(manager, context), catalog(catalog_p), store(catalog_p.GetStore()),
-      basis_tx(store.GetLastTx()), snapshot(store.GetDB().GetSnapshot()), view(store, snapshot),
-      generation(catalog_p.GetGeneration()) {
+    : Transaction(manager, context), catalog(catalog_p), store(catalog_p.GetStore()), basis_tx(0), snapshot(nullptr),
+      view(store, nullptr) {
+	TakeSnapshot();
+}
+
+void MnemonicTransaction::TakeSnapshot() {
+	lock_guard<mutex> guard(catalog.GetSnapshotLock());
+	if (snapshot) {
+		store.GetDB().ReleaseSnapshot(snapshot);
+	}
+	basis_tx = store.GetLastTx();
+	snapshot = store.GetDB().GetSnapshot();
+	view = mnemonicdb::ReadView(store, snapshot);
+	generation = catalog.GetGeneration();
 }
 
 MnemonicTransaction::~MnemonicTransaction() {
@@ -50,8 +62,21 @@ void MnemonicTransaction::ReleaseWriter() {
 
 void MnemonicTransaction::SetReadWrite() {
 	Transaction::SetReadWrite();
-	store.AcquireWriter();
+	auto weak_context = context;
+	store.AcquireWriter([weak_context]() {
+		auto client = weak_context.lock();
+		if (client) {
+			client->InterruptCheck();
+		}
+	});
 	holds_writer = true;
+	// A transaction that has not read any data (e.g. an autocommit INSERT ... VALUES, or a statement whose scans
+	// all run after this point) can simply move to the latest state, provided the schema it was bound against is
+	// unchanged
+	if (store.GetLastTx() != basis_tx && !read_data && !schema_changed &&
+	    catalog.GetGeneration().get() == generation.get()) {
+		TakeSnapshot();
+	}
 	if (store.GetLastTx() != basis_tx) {
 		auto last = store.GetLastTx();
 		ReleaseWriter();
@@ -336,7 +361,19 @@ mnemonicdb::EntityId MnemonicTransaction::CurrentTxEntity() {
 void MnemonicTransaction::ReloadSchema(ClientContext &context) {
 	auto &writer = GetWriter();
 	auto &old_schema = GetSchema();
+	for (auto &datom : writer.GetView().ScanPrefix(mnemonicdb::ColumnFamily::AEVT,
+	                                               mnemonicdb::AevtPrefix(mnemonicdb::sys::TABLES_SCHEMA))) {
+		auto schema_name = old_schema.GetAttribute(mnemonicdb::sys::TABLES_SCHEMA).codec.DecodeValue(datom.v).ToString();
+		if (schema_name != "main" && schema_name != "sys") {
+			throw InvalidInputException("MnemonicDB: unknown schema \"%s\": user tables live in \"main\"", schema_name);
+		}
+	}
 	auto new_schema = mnemonicdb::Schema::Load(writer.GetView(), context);
+	for (auto table : new_schema->TablesInSchema("sys")) {
+		if (!old_schema.FindTable(table->id)) {
+			throw InvalidInputException("MnemonicDB: user tables must be in schema \"main\"");
+		}
+	}
 	for (auto old_attr : old_schema.AllAttributes()) {
 		auto new_table = new_schema->FindTable(old_attr->table);
 		bool still_there = false;
@@ -440,10 +477,14 @@ void MnemonicTransaction::DropIndex(const string &index_name, bool if_exists) {
 // Commit
 //===--------------------------------------------------------------------===//
 void MnemonicTransaction::Commit() {
+	if (writer) {
+		writer->FinishStatement();
+	}
 	if (writer && writer->HasChanges()) {
 		auto tx = writer->GetTx();
 		auto instant = MaxValue<int64_t>(Timestamp::GetCurrentTimestamp().value, store.GetLastInstant() + 1);
 		mnemonicdb::Schema::WriteTxEntity(*writer, GetSchema(), tx, instant);
+		lock_guard<mutex> guard(catalog.GetSnapshotLock());
 		store.Commit(writer->GetWriteBatch(), tx, instant);
 		if (schema_changed) {
 			catalog.SetGeneration(generation);

@@ -1,0 +1,38 @@
+# name: test/sql/review/entity_id_exhaustion.test
+# description: Review: explicit ids / REF targets must not be able to exhaust a partition's ID counter
+# group: [review]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/review_id_exhaustion.mnemonic' AS d (TYPE mnemonicdb)
+
+#
+# Regression (fixed): a single explicit id or REF value with a huge
+# local number bumps the partition counter to its limit, permanently (the counter is persisted at commit).
+# Actual: "partition 3 has no IDs left" for every later fresh entity; a REF to attr/65535 makes every later
+# CREATE TABLE / ADD COLUMN fail with "partition 0 has no IDs left".
+# Expected: allocation keeps working. Fix: never reserve in system partitions (attr/table/tx), and reject
+# explicit ids / REF targets ahead of the counter that do not name an existing entity (Datomic semantics),
+# instead of reserving them.
+#
+statement ok
+CREATE TABLE d.refs (r REF, n INTEGER)
+
+statement maybe
+INSERT INTO d.refs (r, n) VALUES (mnemonicdb_make_id(0, 65535), 1)
+----
+
+statement maybe
+INSERT INTO d.refs (id, n) VALUES (mnemonicdb_make_id(3, 1099511627775), 2)
+----
+
+statement maybe
+INSERT INTO d.refs (r, n) VALUES (mnemonicdb_make_id(3, 1099511627774), 3)
+----
+
+statement ok
+INSERT INTO d.refs (n) VALUES (4)
+
+statement ok
+CREATE TABLE d.after_refs (x INTEGER)

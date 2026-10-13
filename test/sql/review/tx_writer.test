@@ -1,0 +1,235 @@
+# name: test/sql/review/tx_writer.test
+# description: Review: TxWriter edge cases (all pass; coverage)
+# group: [review]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/review_tx_writer.mnemonic' AS d (TYPE mnemonicdb)
+
+# tx 2
+statement ok
+CREATE TABLE d.p (email VARCHAR UNIQUE, name VARCHAR, tags VARCHAR[], friend REF)
+
+# tx 3
+statement ok
+INSERT INTO d.p (id, email, name, tags) VALUES (tempid('a'), 'a', 'A', ['x', 'y']), (tempid('b'), 'b', 'B', NULL)
+
+statement ok
+SET VARIABLE a = (SELECT id FROM d.p WHERE email = 'a')
+
+query I
+SELECT count(*) FROM d.sys.tx
+----
+3
+
+# Retract and re-assert across statements, for cardinality-many and cardinality-one: commits nothing
+statement ok
+BEGIN
+
+statement ok
+UPDATE d.p SET tags = ['x'] WHERE name = 'A'
+
+statement ok
+UPDATE d.p SET tags = ['x', 'y'] WHERE name = 'A'
+
+statement ok
+UPDATE d.p SET name = 'Z' WHERE name = 'A'
+
+statement ok
+UPDATE d.p SET name = 'A' WHERE name = 'Z'
+
+statement ok
+UPDATE d.p SET name = 'Q' WHERE name = 'A'
+
+statement ok
+UPDATE d.p SET name = 'A' WHERE name = 'Q'
+
+statement ok
+COMMIT
+
+query I
+SELECT count(*) FROM d.sys.tx
+----
+3
+
+# tx 4: a unique value freed earlier in the transaction is taken by another entity
+statement ok
+BEGIN
+
+statement ok
+UPDATE d.p SET email = 'a2' WHERE name = 'A'
+
+statement ok
+UPDATE d.p SET email = 'a' WHERE name = 'B'
+
+statement ok
+COMMIT
+
+query TT
+SELECT name, email FROM d.p ORDER BY name
+----
+A	a2
+B	a
+
+# History of the unique attribute, through the scan and through AVET lookups
+query TT
+SELECT name, email FROM d.p AT (VERSION => 3) ORDER BY name
+----
+A	a
+B	b
+
+query T
+SELECT name FROM d.p AT (VERSION => 3) WHERE email = 'a'
+----
+A
+
+query T
+SELECT name FROM d.p AT (VERSION => 4) WHERE email = 'a'
+----
+B
+
+query I
+SELECT count(*) FROM d.p AT (VERSION => 4) WHERE email = 'b'
+----
+0
+
+# tx 5: undo a retraction that was itself undone and redone in the same transaction
+statement ok
+BEGIN
+
+statement ok
+UPDATE d.p SET email = 'tmp' WHERE name = 'A'
+
+statement ok
+UPDATE d.p SET email = 'a2' WHERE name = 'A'
+
+statement ok
+UPDATE d.p SET email = 'tmp2' WHERE name = 'A'
+
+statement ok
+UPDATE d.p SET email = 'b' WHERE name = 'B'
+
+statement ok
+UPDATE d.p SET email = 'a' WHERE name = 'A'
+
+statement ok
+COMMIT
+
+query TT
+SELECT name, email FROM d.p ORDER BY name
+----
+A	a
+B	b
+
+query TT
+SELECT name, email FROM d.p AT (VERSION => 4) ORDER BY name
+----
+A	a2
+B	a
+
+query TT
+SELECT name, email FROM d.p AT (VERSION => 3) WHERE email IN ('a', 'b') ORDER BY name
+----
+A	a
+B	b
+
+# DELETE then re-INSERT of the same entity and values in one transaction commits nothing
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM d.p WHERE name = 'A'
+
+statement ok
+INSERT INTO d.p (id, email, name, tags) VALUES (getvariable('a'), 'a', 'A', ['y', 'x'])
+
+statement ok
+COMMIT
+
+query I
+SELECT count(*) FROM d.sys.tx
+----
+5
+
+# A new entity inserted and deleted in one transaction commits nothing
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.p (email, name, friend) VALUES ('c', 'C', getvariable('a'))
+
+statement ok
+DELETE FROM d.p WHERE name = 'C'
+
+statement ok
+COMMIT
+
+query I
+SELECT count(*) FROM d.sys.tx
+----
+5
+
+# AT inside a transaction with pending writes reads the committed state; without AT it reads the writes
+statement ok
+BEGIN
+
+statement ok
+UPDATE d.p SET email = 'c', tags = ['z'] WHERE name = 'A'
+
+query TTT
+SELECT name, email, tags FROM d.p ORDER BY name
+----
+A	c	[z]
+B	b	NULL
+
+query TTT
+SELECT name, email, tags FROM d.p AT (VERSION => 5) ORDER BY name
+----
+A	a	[x, y]
+B	b	NULL
+
+query T
+SELECT name FROM d.p AT (VERSION => 5) WHERE email = 'a'
+----
+A
+
+query T
+SELECT name FROM d.p WHERE email = 'c'
+----
+A
+
+statement error
+SELECT * FROM d.p AT (VERSION => 6)
+----
+later than the last committed transaction
+
+statement ok
+ROLLBACK
+
+# Projection of the same column twice, and two points in time in one query
+query TTTT
+SELECT email, email, tags, tags FROM d.p WHERE name = 'A'
+----
+a	a	[x, y]	[x, y]
+
+query III
+SELECT (SELECT count(*) FROM d.p AT (VERSION => 2)), (SELECT count(*) FROM d.p AT (VERSION => 3)), (SELECT count(*) FROM d.p)
+----
+0	2	2
+
+query I
+SELECT count(*) FROM d.p AT (VERSION => 0)
+----
+0
+
+query I
+SELECT count(*) FROM d.p AT (TIMESTAMP => TIMESTAMPTZ '1970-01-01 00:00:00+00')
+----
+0
+
+query T
+SELECT a.email || '/' || b.email FROM d.p AS a AT (VERSION => 4) JOIN d.p b USING (id) ORDER BY 1
+----
+a/b
+a2/a

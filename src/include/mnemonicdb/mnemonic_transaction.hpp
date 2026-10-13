@@ -1,5 +1,6 @@
 #pragma once
 
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/transaction/transaction.hpp"
 #include "mnemonicdb/tx_writer.hpp"
@@ -40,6 +41,10 @@ public:
 	mnemonicdb::ReadView &GetCommittedView() {
 		return view;
 	}
+	//! Record that the transaction read data, so it can no longer move its snapshot forward on its first write
+	void MarkDataRead() {
+		read_data = true;
+	}
 	//! The writer of a read-write transaction
 	mnemonicdb::TxWriter &GetWriter();
 	MnemonicCatalog &GetCatalog() {
@@ -71,8 +76,14 @@ public:
 	//! Write this transaction's changes; called by the transaction manager
 	void Commit();
 
+	//! Serializes writers within this transaction: e.g. the actions of a MERGE run as separate pipelines
+	mutex &GetWriteLock() {
+		return write_lock;
+	}
+
 private:
 	void ReleaseWriter();
+	void TakeSnapshot();
 	void SetSchema(shared_ptr<const mnemonicdb::Schema> schema);
 	//! A new attribute definition for a column of a new or altered table
 	mnemonicdb::AttributeDef NewAttribute(mnemonicdb::EntityId table, const ColumnDefinition &column,
@@ -87,9 +98,11 @@ private:
 	mnemonicdb::ReadView view;
 	unique_ptr<mnemonicdb::TxWriter> writer;
 	bool holds_writer = false;
+	bool read_data = false;
 	shared_ptr<MnemonicCatalogGeneration> generation;
 	bool schema_changed = false;
 	unordered_map<mnemonicdb::EntityId, mnemonicdb::EntityId> tempids;
+	mutex write_lock;
 };
 
 } // namespace duckdb

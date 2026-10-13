@@ -1,0 +1,110 @@
+# name: test/sql/review/entity_ids.test
+# description: Review: explicit entity ids, partitions and ID counters
+# group: [review]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/review_ids.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.p (name VARCHAR)
+
+#
+# Regression (fixed): an explicit id ahead of the partition's counter is later handed out again by fresh
+# allocation. Store::AllocateId (src/store/store.cpp:205) only consults next_local, and
+# EntityResolver::ResolveRow (src/exec/mnemonic_insert.cpp:86) accepts any well-formed explicit id.
+# Actual: the second INSERT allocates db/1, the same entity, and its cardinality-one `name`
+# silently retracts 'explicit' -> only one row ('fresh') remains.
+# Expected: two distinct entities (fix: reject explicit ids >= next_local, or bump next_local past them).
+#
+# Resolved: explicit ids must name allocated entities (Datomic semantics), so they can neither collide with
+# later allocations nor push the counters (see entity_id_exhaustion.test)
+statement error
+INSERT INTO d.p (id, name) VALUES (mnemonicdb_make_id(3, 1), 'explicit')
+----
+does not exist
+
+statement ok
+INSERT INTO d.p (name) VALUES ('fresh')
+
+statement ok
+INSERT INTO d.p (id, name) VALUES (mnemonicdb_make_id(3, 1), 'explicit')
+
+query T
+SELECT name FROM d.p ORDER BY name
+----
+explicit
+
+query I
+SELECT count(DISTINCT id) FROM d.p
+----
+1
+
+#
+# Regression (fixed): explicit ids in the reserved partitions 4-15 are accepted. Only partitions < db are
+# rejected (src/exec/mnemonic_insert.cpp:175), although Allocate refuses 4-15 and DESIGN.md reserves them.
+#
+statement error
+INSERT INTO d.p (id, name) VALUES (mnemonicdb_make_id(5, 1), 'reserved')
+----
+reserved partition
+
+statement error
+INSERT INTO d.p (id, name) VALUES (mnemonicdb_make_id(15, 7), 'reserved')
+----
+reserved partition
+
+# System partitions are rejected (passes)
+statement error
+INSERT INTO d.p (id, name) VALUES (mnemonicdb_make_id(2, 1), 'tx')
+----
+system partition
+
+#
+# Counters survive rollback and reattach without reusing committed ids (passes)
+#
+statement ok
+CREATE TABLE d.q (n INTEGER)
+
+statement ok
+INSERT INTO d.q (id, n) VALUES (tempid('a', 16), 1), (tempid('b', 16), 2)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.q (id, n) VALUES (tempid('c', 16), 3)
+
+statement ok
+ROLLBACK
+
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/review_ids.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+INSERT INTO d.q (id, n) VALUES (tempid('d', 16), 4)
+
+query I
+SELECT count(DISTINCT id) FROM d.q
+----
+3
+
+query II
+SELECT n, mnemonicdb_id_partition(id) FROM d.q ORDER BY n
+----
+1	16
+2	16
+4	16
+
+# The same label with and without a partition names two different placeholders (passes; by design)
+statement ok
+INSERT INTO d.q (id, n) VALUES (tempid('same'), 5), (tempid('same', 16), 6)
+
+query I
+SELECT count(DISTINCT id) FROM d.q WHERE n IN (5, 6)
+----
+2

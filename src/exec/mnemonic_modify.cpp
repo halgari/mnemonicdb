@@ -5,6 +5,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -30,18 +31,36 @@ public:
 	RowIdHandling row_id_handling;
 
 	struct State : public GlobalSinkState {
+		State(ClientContext &context, const vector<LogicalType> &types) : rows(context, types) {
+		}
+		ColumnDataCollection rows;
 		idx_t count = 0;
 		unordered_set<EntityId> seen;
 	};
 
 public:
-	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &) const override {
-		return make_uniq<State>();
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
+		return make_uniq<State>(context, children[0].get().GetTypes());
 	}
-	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
+	//! Rows are buffered and changed in Finalize, so the statement never reads its own writes
+	SinkResultType Sink(ExecutionContext &, DataChunk &chunk, OperatorSinkInput &input) const override {
+		input.global_state.Cast<State>().rows.Append(chunk);
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+	SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &context,
+	                          OperatorSinkFinalizeInput &input) const override {
 		auto &state = input.global_state.Cast<State>();
-		auto &transaction = MnemonicTransaction::Get(context.client, table.catalog);
+		auto &transaction = MnemonicTransaction::Get(context, table.catalog);
+		lock_guard<mutex> guard(transaction.GetWriteLock());
 		auto &writer = transaction.GetWriter();
+		for (auto &chunk : state.rows.Chunks()) {
+			ModifyChunk(state, transaction, writer, chunk);
+		}
+		writer.FinishStatement();
+		return SinkFinalizeType::READY;
+	}
+	void ModifyChunk(State &state, MnemonicTransaction &transaction, mnemonicdb::TxWriter &writer,
+	                 DataChunk &chunk) const {
 		chunk.Flatten();
 		auto &row_ids = chunk.data[row_id_index];
 		for (idx_t row = 0; row < chunk.size(); row++) {
@@ -57,10 +76,9 @@ public:
 				continue;
 			}
 			CheckEntity(transaction, entity);
-			ModifyRow(writer, chunk, row, entity);
+			ModifyRow(transaction, writer, chunk, row, entity);
 			state.count++;
 		}
-		return SinkResultType::NEED_MORE_INPUT;
 	}
 	bool IsSink() const override {
 		return true;
@@ -90,12 +108,15 @@ protected:
 		}
 	}
 
-	virtual void ModifyRow(mnemonicdb::TxWriter &writer, DataChunk &chunk, idx_t row, EntityId entity) const = 0;
+	virtual void ModifyRow(MnemonicTransaction &transaction, mnemonicdb::TxWriter &writer, DataChunk &chunk, idx_t row,
+	                       EntityId entity) const = 0;
 
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &) const override {
 		auto &def = table.GetTableDef();
 		if (def.schema == "sys" && def.id != mnemonicdb::sys::TX) {
-			MnemonicTransaction::Get(context.client, table.catalog).ReloadSchema(context.client);
+			auto &transaction = MnemonicTransaction::Get(context.client, table.catalog);
+			lock_guard<mutex> guard(transaction.GetWriteLock());
+			transaction.ReloadSchema(context.client);
 		}
 		chunk.data[0].Append(Value::BIGINT(NumericCast<int64_t>(sink_state->Cast<State>().count)));
 		return SourceResultType::FINISHED;
@@ -114,7 +135,8 @@ public:
 	}
 
 protected:
-	void ModifyRow(mnemonicdb::TxWriter &writer, DataChunk &, idx_t, EntityId entity) const override {
+	void ModifyRow(MnemonicTransaction &, mnemonicdb::TxWriter &writer, DataChunk &, idx_t,
+	               EntityId entity) const override {
 		for (idx_t a = 1; a <= table.GetTableDef().attributes.size(); a++) {
 			writer.RetractAll(table.GetAttribute(a), entity);
 		}
@@ -159,16 +181,21 @@ public:
 	}
 
 protected:
-	void ModifyRow(mnemonicdb::TxWriter &writer, DataChunk &chunk, idx_t row, EntityId entity) const override {
+	void ModifyRow(MnemonicTransaction &transaction, mnemonicdb::TxWriter &writer, DataChunk &chunk, idx_t row,
+	               EntityId entity) const override {
 		for (idx_t i = 0; i < columns.size(); i++) {
-			auto &attr = table.GetAttribute(columns[i].index);
 			auto &vector = chunk.data[value_indexes[i]];
+			if (columns[i].index == MNEMONIC_ID_COLUMN_INDEX) {
+				BindId(transaction, vector, row, entity);
+				continue;
+			}
+			auto &attr = table.GetAttribute(columns[i].index);
 			if (FlatVector::IsNull(vector, row)) {
 				writer.RetractAll(attr, entity);
 				continue;
 			}
 			if (!attr.many) {
-				writer.Assert(attr, entity, Encode(attr, vector, row));
+				writer.Assert(attr, entity, Encode(writer, attr, vector, row));
 				continue;
 			}
 			// The new list replaces the set: retract what is gone, assert what is new
@@ -180,7 +207,7 @@ protected:
 					throw InvalidInputException("MnemonicDB: cardinality-many column \"%s\" cannot hold NULL elements",
 					                            attr.name);
 				}
-				wanted.insert(Encode(attr, child, c));
+				wanted.insert(Encode(writer, attr, child, c));
 			}
 			for (auto &datom : writer.CurrentDatoms(entity, attr.Local())) {
 				if (wanted.erase(datom.v) == 0) {
@@ -194,13 +221,37 @@ protected:
 	}
 
 private:
-	static string Encode(const AttributeDef &attr, const Vector &vector, idx_t row) {
+	//! The `id` column of an update leaves the row's entity unchanged. Its value may be the row's own id, NULL, or
+	//! a tempid, which is then bound to the row (so ON CONFLICT DO UPDATE resolves tempids like INSERT does).
+	static void BindId(MnemonicTransaction &transaction, const Vector &vector, idx_t row, EntityId entity) {
+		if (FlatVector::IsNull(vector, row)) {
+			return;
+		}
+		auto id = FlatVector::GetData<uint64_t>(vector)[row];
+		if (id == entity) {
+			return;
+		}
+		if (mnemonicdb::IsTempid(id)) {
+			auto bound = transaction.FindTempid(id);
+			if (bound && *bound != entity) {
+				throw ConstraintException("MnemonicDB: tempid resolved to entity %d earlier in this transaction, but "
+				                          "this row is entity %d",
+				                          *bound, entity);
+			}
+			transaction.BindTempid(id, entity);
+			return;
+		}
+		throw BinderException("MnemonicDB: the id column cannot be updated");
+	}
+
+	static string Encode(mnemonicdb::TxWriter &writer, const AttributeDef &attr, const Vector &vector, idx_t row) {
 		if (attr.is_ref) {
 			auto id = FlatVector::GetData<uint64_t>(vector)[row];
 			if (mnemonicdb::IsTempid(id) || !mnemonicdb::IsWellFormed(id)) {
 				throw InvalidInputException("MnemonicDB: %d is not a valid entity ID for column \"%s\"", id,
 				                            attr.name);
 			}
+			writer.GetView().GetStore().CheckAllocated(id);
 			string v;
 			mnemonicdb::PutEntityId(v, id);
 			return v;
@@ -218,13 +269,8 @@ PhysicalOperator &PlanMnemonicUpdate(ClientContext &, PhysicalPlanGenerator &pla
 	vector<PhysicalIndex> columns;
 	vector<idx_t> value_indexes;
 	for (idx_t i = 0; i < op.columns.size(); i++) {
-		if (op.columns[i].index == MNEMONIC_ID_COLUMN_INDEX) {
-			// A delete-and-insert update (e.g. of a LIST column) carries every column, `id` unchanged
-			if (op.update_is_del_and_insert) {
-				continue;
-			}
-			throw BinderException("MnemonicDB: the id column cannot be updated");
-		}
+		// `id` may appear: delete-and-insert updates (e.g. of LIST columns) carry every column, and ON CONFLICT DO
+		// UPDATE carries the inserted row's id so its tempid can be bound; BindId checks the value
 		columns.push_back(op.columns[i]);
 		auto &expr = *op.expressions[i];
 		value_indexes.push_back(expr.GetExpressionType() == ExpressionType::BOUND_REF

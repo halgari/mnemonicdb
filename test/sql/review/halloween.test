@@ -1,0 +1,50 @@
+# name: test/sql/review/halloween.test
+# description: Review: a statement must not see its own writes (scans read the live write batch)
+# group: [review]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/review_halloween.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.t (x BIGINT, u VARCHAR UNIQUE, tags BIGINT[])
+
+# Entities db/1 .. db/5000 with x = local id
+statement ok
+INSERT INTO d.t (x, u, tags) SELECT range, 'u' || range, [range] FROM range(1, 5001)
+
+query II
+SELECT count(*), bool_and(mnemonicdb_id_local(id) = x) FROM d.t
+----
+5000	true
+
+#
+# Regression (fixed): INSERT ... SELECT from the same table, writing to other entities, with a pushed-down
+# filter on a UNIQUE column. The scan runs in lookup mode (NextCandidate, src/exec/mnemonic_scan.cpp:538)
+# and opens fresh iterators on the transaction's live WriteBatchWithIndex for every entity, so rows read
+# after the first 2048-row chunk was sunk see that chunk's writes.
+# Actual: entities 2050 and 4098 (first row of each later chunk + 1) get x = 2048 / 4096 and three tags.
+# Expected: every entity j > 1 gets x = j - 1 and tags {j - 1, j}, entity 1 is unchanged.
+# Fix: give each statement a stable read view of the transaction's writes, e.g. buffer DML input and
+# apply it in Finalize, or snapshot the batch at statement start.
+#
+statement ok
+INSERT INTO d.t (id, x, tags) SELECT id + 1, x, tags FROM d.t WHERE u >= 'u' AND x < 5000
+
+# Entity 1 keeps x = 1, tags [1]; entity j > 1 gets x = j - 1 and tags {j - 1, j}
+query III
+SELECT count(*), sum(x), sum(len(tags)) FROM d.t
+----
+5000	12497501	9999
+
+# Explicit ids must name existing entities: id + 1 of the last entity does not exist
+statement error
+INSERT INTO d.t (id, x) SELECT id + 1, x FROM d.t WHERE x = 4999
+----
+does not exist
+
+query I
+SELECT count(*) FROM d.t WHERE mnemonicdb_id_local(id) != x + 1 AND mnemonicdb_id_local(id) != 1
+----
+0

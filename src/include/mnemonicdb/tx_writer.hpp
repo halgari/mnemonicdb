@@ -5,6 +5,7 @@
 #include "mnemonicdb/store.hpp"
 
 #include <functional>
+#include <tuple>
 #include <memory>
 
 namespace rocksdb {
@@ -22,14 +23,14 @@ public:
 	ReadView(Store &store, const rocksdb::Snapshot *snapshot, rocksdb::WriteBatchWithIndex *batch = nullptr);
 
 	Store &GetStore() {
-		return store;
+		return *store;
 	}
 	std::unique_ptr<rocksdb::Iterator> NewIterator(ColumnFamily cf);
 	//! All entries of `cf` whose key starts with `prefix`, decoded; history values are returned in `retracted_by`
 	vector<Datom> ScanPrefix(ColumnFamily cf, const string &prefix, vector<TxId> *retracted_by = nullptr);
 
 private:
-	Store &store;
+	Store *store;
 	const rocksdb::Snapshot *snapshot;
 	rocksdb::WriteBatchWithIndex *batch;
 };
@@ -56,6 +57,10 @@ public:
 	//! Assert a value. Cardinality-one attributes retract any other current value; asserting a value that is
 	//! already current does nothing. Throws on a uniqueness violation.
 	void Assert(const AttributeDef &attr, EntityId e, const string &v);
+	//! Check the uniqueness of every unique value asserted since the last call. Uniqueness is checked per
+	//! statement, so a statement may move unique values between entities (e.g. swap them).
+	void FinishStatement();
+
 	//! Retract one value if it is current
 	void Retract(const AttributeDef &attr, EntityId e, const string &v);
 	//! Retract every current value of (e, attr)
@@ -82,6 +87,8 @@ private:
 private:
 	Store &store;
 	TxId tx;
+	//! Unique values asserted in the current statement: (attribute, encoded value, attribute name)
+	vector<std::tuple<AttrId, string, string>> pending_unique;
 	std::unique_ptr<rocksdb::WriteBatchWithIndex> batch;
 	ReadView view;
 };
