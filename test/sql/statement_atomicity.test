@@ -1,0 +1,122 @@
+# name: test/sql/statement_atomicity.test
+# description: Failed statements and rolled-back transactions leave no writes behind and give their IDs back
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/atomicity.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.person (name VARCHAR, email VARCHAR UNIQUE)
+
+# A statement that fails part-way (the second row violates uniqueness) writes nothing
+statement error
+INSERT INTO d.person (name, email) VALUES ('a', 'x'), ('b', 'y'), ('c', 'x')
+----
+Duplicate key
+
+query I
+SELECT count(*) FROM d.person
+----
+0
+
+# ... and gives back the entity IDs it allocated: the next insert gets db/1
+statement ok
+INSERT INTO d.person (name, email) VALUES ('a', 'x')
+
+query I
+SELECT mnemonicdb_id_local(id) FROM d.person
+----
+1
+
+# A failed CREATE TABLE keeps no table or attribute IDs
+statement error
+CREATE TABLE d.bad (a INTEGER, b INTEGER, c INTEGER NOT NULL)
+----
+NOT NULL
+
+statement ok
+CREATE TABLE d.good (a INTEGER)
+
+query II
+SELECT mnemonicdb_id_local(t.id), mnemonicdb_id_local(a.id) FROM d.sys.tables t JOIN d.sys.attributes a ON a.table_id = t.id WHERE t.name = 'good'
+----
+17	66
+
+# A rolled-back transaction gives back every ID it allocated
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE d.temp (a INTEGER, b INTEGER)
+
+statement ok
+INSERT INTO d.person (name) SELECT 'p' || range FROM range(100)
+
+statement ok
+ROLLBACK
+
+statement ok
+CREATE TABLE d.after (a INTEGER)
+
+query II
+SELECT mnemonicdb_id_local(t.id), mnemonicdb_id_local(a.id) FROM d.sys.tables t JOIN d.sys.attributes a ON a.table_id = t.id WHERE t.name = 'after'
+----
+18	67
+
+statement ok
+INSERT INTO d.person (name) VALUES ('next')
+
+query I
+SELECT mnemonicdb_id_local(id) FROM d.person WHERE name = 'next'
+----
+2
+
+# Rows without any value assert nothing, create no entity and are not counted
+query I
+INSERT INTO d.person (name, email) VALUES (NULL, NULL), ('z', NULL), (NULL, NULL)
+----
+1
+
+query I
+SELECT count(*) FROM d.person
+----
+3
+
+query I
+SELECT mnemonicdb_id_local(id) FROM d.person WHERE name = 'z'
+----
+3
+
+# A failed ALTER TABLE ... TYPE leaves the column and its data untouched
+statement ok
+CREATE TABLE d.nums (v DOUBLE[])
+
+statement ok
+INSERT INTO d.nums (v) VALUES ([1.5, 2.5])
+
+statement error
+ALTER TABLE d.nums ALTER COLUMN v TYPE INTEGER[]
+----
+only conversions
+
+query T
+SELECT v FROM d.nums
+----
+[1.5, 2.5]
+
+# The counters survive reattach (db/4 is the nums row: all tables share one entity space)
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/atomicity.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+INSERT INTO d.person (name) VALUES ('after reattach')
+
+query I
+SELECT mnemonicdb_id_local(id) FROM d.person WHERE name = 'after reattach'
+----
+5

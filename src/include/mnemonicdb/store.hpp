@@ -71,6 +71,14 @@ public:
 	//! Allocate a new entity ID in `part`. Only the current writer may allocate. IDs allocated by a transaction
 	//! that rolls back are simply never used.
 	EntityId AllocateId(uint8_t part);
+	//! The ID counters, saved so a failed statement or a rolled-back transaction can give its IDs back
+	struct CounterState {
+		std::array<uint64_t, 256> next_local;
+		std::array<bool, 256> next_local_dirty;
+	};
+	CounterState SaveCounters() const;
+	void RestoreCounters(const CounterState &state);
+
 	//! Throw unless `id` names an entity that was allocated (explicit ids and REF targets must exist; they never
 	//! move the counters, so one bad value cannot exhaust a partition)
 	void CheckAllocated(EntityId id) const;

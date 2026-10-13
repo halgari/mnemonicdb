@@ -57,6 +57,11 @@ public:
 	//! Assert a value. Cardinality-one attributes retract any other current value; asserting a value that is
 	//! already current does nothing. Throws on a uniqueness violation.
 	void Assert(const AttributeDef &attr, EntityId e, const string &v);
+	//! Statement savepoints: everything written after BeginStatement is undone by RollbackStatement
+	void BeginStatement();
+	void PopStatement();
+	void RollbackStatement();
+
 	//! Check the uniqueness of every unique value asserted since the last call. Uniqueness is checked per
 	//! statement, so a statement may move unique values between entities (e.g. swap them).
 	void FinishStatement();

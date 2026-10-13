@@ -109,6 +109,20 @@ void TxWriter::CheckUnique(const AttributeDef &attr, EntityId, const string &v) 
 	}
 }
 
+void TxWriter::BeginStatement() {
+	batch->SetSavePoint();
+	pending_unique.clear();
+}
+
+void TxWriter::PopStatement() {
+	CheckStatus(batch->PopSavePoint());
+}
+
+void TxWriter::RollbackStatement() {
+	CheckStatus(batch->RollbackToSavePoint());
+	pending_unique.clear();
+}
+
 void TxWriter::FinishStatement() {
 	auto pending = std::move(pending_unique);
 	pending_unique.clear();

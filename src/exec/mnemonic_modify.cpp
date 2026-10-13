@@ -52,11 +52,16 @@ public:
 		auto &state = input.global_state.Cast<State>();
 		auto &transaction = MnemonicTransaction::Get(context, table.catalog);
 		lock_guard<mutex> guard(transaction.GetWriteLock());
+		MnemonicStatement statement(transaction);
 		auto &writer = transaction.GetWriter();
 		for (auto &chunk : state.rows.Chunks()) {
 			ModifyChunk(state, transaction, writer, chunk);
 		}
-		writer.FinishStatement();
+		auto &def = table.GetTableDef();
+		if (def.schema == "sys" && def.id != mnemonicdb::sys::TX) {
+			transaction.ReloadSchema(context);
+		}
+		statement.Commit();
 		return SinkFinalizeType::READY;
 	}
 	void ModifyChunk(State &state, MnemonicTransaction &transaction, mnemonicdb::TxWriter &writer,
@@ -111,13 +116,7 @@ protected:
 	virtual void ModifyRow(MnemonicTransaction &transaction, mnemonicdb::TxWriter &writer, DataChunk &chunk, idx_t row,
 	                       EntityId entity) const = 0;
 
-	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &) const override {
-		auto &def = table.GetTableDef();
-		if (def.schema == "sys" && def.id != mnemonicdb::sys::TX) {
-			auto &transaction = MnemonicTransaction::Get(context.client, table.catalog);
-			lock_guard<mutex> guard(transaction.GetWriteLock());
-			transaction.ReloadSchema(context.client);
-		}
+	SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk, OperatorSourceInput &) const override {
 		chunk.data[0].Append(Value::BIGINT(NumericCast<int64_t>(sink_state->Cast<State>().count)));
 		return SourceResultType::FINISHED;
 	}

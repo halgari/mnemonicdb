@@ -43,7 +43,41 @@ void MnemonicTransaction::TakeSnapshot() {
 	generation = catalog.GetGeneration();
 }
 
+MnemonicStatement::MnemonicStatement(MnemonicTransaction &transaction_p) : transaction(transaction_p) {
+	auto &writer = transaction.GetWriter();
+	counters = transaction.store.SaveCounters();
+	tempids = transaction.tempids;
+	generation = transaction.generation;
+	schema_changed = transaction.schema_changed;
+	writer.BeginStatement();
+}
+
+MnemonicStatement::~MnemonicStatement() {
+	if (done) {
+		return;
+	}
+	try {
+		transaction.GetWriter().RollbackStatement();
+		transaction.store.RestoreCounters(counters);
+		transaction.tempids = std::move(tempids);
+		transaction.generation = std::move(generation);
+		transaction.schema_changed = schema_changed;
+	} catch (...) { // NOLINT: a destructor must not throw; the transaction is aborted anyway
+	}
+}
+
+void MnemonicStatement::Commit() {
+	auto &writer = transaction.GetWriter();
+	writer.FinishStatement();
+	writer.PopStatement();
+	done = true;
+}
+
 MnemonicTransaction::~MnemonicTransaction() {
+	if (writer) {
+		// Not committed: give back the IDs this transaction allocated
+		store.RestoreCounters(counters_at_start);
+	}
 	writer.reset();
 	ReleaseWriter();
 	store.GetDB().ReleaseSnapshot(snapshot);
@@ -84,6 +118,7 @@ void MnemonicTransaction::SetReadWrite() {
 		                           "but tx %d has committed since. Retry the transaction.",
 		                           basis_tx, last);
 	}
+	counters_at_start = store.SaveCounters();
 	writer = make_uniq<mnemonicdb::TxWriter>(store, snapshot, basis_tx + 1);
 }
 
@@ -169,6 +204,7 @@ optional_ptr<CatalogEntry> MnemonicTransaction::CreateTable(MnemonicSchemaEntry 
 	}
 
 	auto &writer = GetWriter();
+	MnemonicStatement statement(*this);
 	mnemonicdb::TableDef table;
 	table.id = store.AllocateId(mnemonicdb::partition::TABLE);
 	table.schema = schema_name;
@@ -185,6 +221,7 @@ optional_ptr<CatalogEntry> MnemonicTransaction::CreateTable(MnemonicSchemaEntry 
 		mnemonicdb::Schema::WriteAttribute(writer, schema, attr);
 	}
 	SetSchema(schema.WithTable(table, attributes));
+	statement.Commit();
 	return generation->GetTable(schema_name, table_name).get();
 }
 
@@ -244,6 +281,7 @@ void MnemonicTransaction::AlterTable(const string &schema_name, AlterTableInfo &
 		throw NotImplementedException("MnemonicDB: sys tables cannot be altered, except ADD COLUMN on sys.tx");
 	}
 	auto &writer = GetWriter();
+	MnemonicStatement statement(*this);
 	auto find_column = [&](const string &name) -> const mnemonicdb::AttributeDef & {
 		auto attr = schema.FindAttribute(*table, name);
 		if (!attr) {
@@ -287,6 +325,7 @@ void MnemonicTransaction::AlterTable(const string &schema_name, AlterTableInfo &
 		auto &name = add.new_column.Name().GetIdentifierName();
 		if (schema.FindAttribute(*table, name) || StringUtil::CIEquals(name, "id")) {
 			if (add.if_column_not_exists) {
+				statement.Commit();
 				return;
 			}
 			throw CatalogException("MnemonicDB: table \"%s\" already has a column \"%s\"", table->name, name);
@@ -302,6 +341,7 @@ void MnemonicTransaction::AlterTable(const string &schema_name, AlterTableInfo &
 		auto attr_ptr = schema.FindAttribute(*table, name);
 		if (!attr_ptr) {
 			if (remove.if_column_exists) {
+				statement.Commit();
 				return;
 			}
 			find_column(name);
@@ -352,6 +392,7 @@ void MnemonicTransaction::AlterTable(const string &schema_name, AlterTableInfo &
 		throw NotImplementedException("MnemonicDB does not support ALTER TABLE %s",
 		                              EnumUtil::ToString(info.alter_table_type));
 	}
+	statement.Commit();
 }
 
 mnemonicdb::EntityId MnemonicTransaction::CurrentTxEntity() {
@@ -440,6 +481,7 @@ void MnemonicTransaction::CreateIndex(MnemonicTableEntry &table_entry, const str
 		                       attr->index_name);
 	}
 	auto &writer = GetWriter();
+	MnemonicStatement statement(*this);
 	auto indexed = *attr;
 	indexed.indexed = true;
 	indexed.index_name = index_name;
@@ -448,6 +490,7 @@ void MnemonicTransaction::CreateIndex(MnemonicTableEntry &table_entry, const str
 	}
 	mnemonicdb::Schema::WriteAttribute(writer, schema, indexed);
 	SetSchema(schema.WithAttribute(std::move(indexed)));
+	statement.Commit();
 }
 
 void MnemonicTransaction::DropIndex(const string &index_name, bool if_exists) {
@@ -460,6 +503,7 @@ void MnemonicTransaction::DropIndex(const string &index_name, bool if_exists) {
 		throw CatalogException("MnemonicDB: index \"%s\" does not exist", index_name);
 	}
 	auto &writer = GetWriter();
+	MnemonicStatement statement(*this);
 	auto &sys_indexed = schema.GetAttribute(mnemonicdb::sys::ATTRIBUTES_INDEXED);
 	auto &sys_index = schema.GetAttribute(mnemonicdb::sys::ATTRIBUTES_INDEX);
 	writer.RetractAll(sys_indexed, attr->id);
@@ -471,6 +515,7 @@ void MnemonicTransaction::DropIndex(const string &index_name, bool if_exists) {
 		writer.RebuildAvet(*attr, true);
 	}
 	SetSchema(schema.WithAttribute(std::move(dropped)));
+	statement.Commit();
 }
 
 //===--------------------------------------------------------------------===//

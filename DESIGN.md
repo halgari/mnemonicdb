@@ -302,6 +302,13 @@ commits nothing and gets no `sys.tx` row. "Changed" means at least one
   are done (this is the Halloween problem). Writers within one transaction
   are serialized by a per-transaction mutex, because the actions of a MERGE
   run as separate pipelines.
+- **Statements are atomic.** Each statement runs under a write-batch
+  savepoint. If it fails, its writes, tempid bindings, ID allocations and
+  schema changes are undone. A transaction that rolls back gives its IDs
+  back, so neither failures nor rollbacks use up table or attribute
+  numbers.
+- **Rows without values** assert nothing, create no entity, and are not
+  counted as inserted.
 - **Uniqueness is checked per statement.** Unique values asserted by a
   statement are verified when it finishes, so a statement may move or swap
   unique values between entities.

@@ -224,6 +224,16 @@ EntityId Store::AllocateId(uint8_t part) {
 	return MakeEntityId(part, local);
 }
 
+Store::CounterState Store::SaveCounters() const {
+	return CounterState {next_local, next_local_dirty};
+}
+
+void Store::RestoreCounters(const CounterState &state) {
+	D_ASSERT(writer_active);
+	next_local = state.next_local;
+	next_local_dirty = state.next_local_dirty;
+}
+
 void Store::CheckAllocated(EntityId id) const {
 	auto part = PartitionOf(id);
 	auto local = LocalOf(id);

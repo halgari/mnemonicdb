@@ -20,7 +20,29 @@ struct BoundCreateTableInfo;
 struct AlterTableInfo;
 class ColumnDefinition;
 
+class MnemonicTransaction;
+
+//! Makes one statement's writes atomic within the transaction: on failure (an exception before Commit), the write
+//! batch, tempid bindings, ID counters and schema are restored to their state at the start of the statement
+class MnemonicStatement {
+public:
+	explicit MnemonicStatement(MnemonicTransaction &transaction);
+	~MnemonicStatement();
+	//! Check deferred constraints and keep the statement's writes
+	void Commit();
+
+private:
+	MnemonicTransaction &transaction;
+	bool done = false;
+	mnemonicdb::Store::CounterState counters;
+	unordered_map<mnemonicdb::EntityId, mnemonicdb::EntityId> tempids;
+	shared_ptr<MnemonicCatalogGeneration> generation;
+	bool schema_changed;
+};
+
 class MnemonicTransaction : public Transaction {
+	friend class MnemonicStatement;
+
 public:
 	MnemonicTransaction(MnemonicTransactionManager &manager, ClientContext &context, MnemonicCatalog &catalog);
 	~MnemonicTransaction() override;
@@ -98,6 +120,8 @@ private:
 	mnemonicdb::ReadView view;
 	unique_ptr<mnemonicdb::TxWriter> writer;
 	bool holds_writer = false;
+	//! The ID counters when this transaction took the writer, restored if it does not commit
+	mnemonicdb::Store::CounterState counters_at_start;
 	bool read_data = false;
 	shared_ptr<MnemonicCatalogGeneration> generation;
 	bool schema_changed = false;

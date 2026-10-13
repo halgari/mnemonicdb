@@ -96,6 +96,7 @@ static void DatomFunction(ClientContext &context, TableFunctionInput &input, Dat
 	auto &data = input.bind_data->Cast<DatomFunctionData>();
 	auto &transaction = MnemonicTransaction::Get(context, data.table.catalog);
 	lock_guard<mutex> guard(transaction.GetWriteLock());
+	MnemonicStatement statement(transaction);
 	auto &writer = transaction.GetWriter();
 	string v;
 	writer.GetView().GetStore().CheckAllocated(data.entity);
@@ -111,8 +112,8 @@ static void DatomFunction(ClientContext &context, TableFunctionInput &input, Dat
 	} else {
 		writer.Retract(data.attr, data.entity, v);
 	}
-	writer.FinishStatement();
 	auto after = writer.CurrentDatoms(data.entity, data.attr.Local());
+	statement.Commit();
 	output.data[0].Append(Value::BOOLEAN(before != after));
 }
 
