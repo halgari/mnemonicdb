@@ -25,21 +25,38 @@ using mnemonicdb::AttributeDef;
 using mnemonicdb::ColumnFamily;
 using mnemonicdb::EntityId;
 
-struct MnemonicScanBindData : public TableFunctionData {
-	MnemonicScanBindData(MnemonicTableEntry &table, optional_idx as_of) : table(table), as_of(as_of) {
-	}
-	MnemonicTableEntry &table;
-	//! The transaction to read as of (AT clause); unset reads the current state
-	optional_idx as_of;
+unique_ptr<FunctionData> MnemonicScanBindData::Copy() const {
+	auto result = make_uniq<MnemonicScanBindData>();
+	result->tables = tables;
+	result->fused = fused;
+	result->as_of = as_of;
+	return std::move(result);
+}
 
-	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<MnemonicScanBindData>(table, as_of);
+bool MnemonicScanBindData::Equals(const FunctionData &other_p) const {
+	auto &other = other_p.Cast<MnemonicScanBindData>();
+	if (tables.size() != other.tables.size() || fused != other.fused || as_of != other.as_of) {
+		return false;
 	}
-	bool Equals(const FunctionData &other) const override {
-		auto &other_data = other.Cast<MnemonicScanBindData>();
-		return &table == &other_data.table && as_of == other_data.as_of;
+	for (idx_t i = 0; i < tables.size(); i++) {
+		if (&tables[i].table.get() != &other.tables[i].table.get() || tables[i].required != other.tables[i].required) {
+			return false;
+		}
 	}
-};
+	return true;
+}
+
+idx_t MnemonicScanBindData::ColumnCount() const {
+	idx_t count = 0;
+	for (auto &table : tables) {
+		count += table.table.get().GetColumns().PhysicalColumnCount();
+	}
+	return count;
+}
+
+column_t FusedRowIdColumn(idx_t index) {
+	return VIRTUAL_COLUMN_START + 1 + index;
+}
 
 //! Iterates the datoms of one attribute in AEVT order. Reading the current state uses the current index only;
 //! reading as of transaction T merges in the history index and keeps datoms with Tassert <= T < Tretract.
@@ -176,8 +193,16 @@ static void ForEachVisible(mnemonicdb::ReadView &view, ColumnFamily cf, ColumnFa
 //! What one scanned column holds
 struct ScanColumn {
 	enum class Kind { ID, ATTRIBUTE, EMPTY } kind;
-	//! Index into the table's attributes for ATTRIBUTE columns
+	//! The table (index into the bind data's tables) for ID columns
+	idx_t table = 0;
+	//! Index into the scan's attributes for ATTRIBUTE columns
 	idx_t attribute = 0;
+};
+
+//! One attribute read by the scan, over all tables
+struct ScanAttribute {
+	idx_t table;
+	reference<const AttributeDef> attr;
 };
 
 //! A pushed-down filter, applied exactly to every produced row
@@ -203,10 +228,13 @@ struct MnemonicScanState : public GlobalTableFunctionState {
 	vector<LogicalType> column_types;
 	vector<idx_t> projection_ids;
 	vector<ScanFilter> filters;
-	//! For each table attribute, the scanned columns it fills (a column may be scanned more than once)
+	//! Every attribute of every table, and per attribute the scanned columns it fills (possibly several)
+	vector<ScanAttribute> attributes;
 	vector<vector<idx_t>> attribute_columns;
-	//! Columns holding the entity id
-	vector<idx_t> id_columns;
+	//! Per table, its attributes' range in `attributes`, whether it is required, and its id columns
+	vector<std::pair<idx_t, idx_t>> table_attributes;
+	vector<bool> table_required;
+	vector<vector<idx_t>> id_columns;
 	DataChunk scan_chunk;
 
 	//! Merge mode: one cursor per attribute over AEVT
@@ -434,39 +462,88 @@ static vector<EntityId> EntitiesInRanges(mnemonicdb::ReadView &view, const Attri
 	return result;
 }
 
-static unique_ptr<GlobalTableFunctionState> MnemonicScanInit(ClientContext &context, TableFunctionInitInput &input) {
-	auto &bind_data = input.bind_data->Cast<MnemonicScanBindData>();
-	auto &table = bind_data.table;
-	auto &transaction = MnemonicTransaction::Get(context, table.catalog);
-	transaction.MarkDataRead();
-	auto &view = transaction.GetReadView();
-	auto &def = table.GetTableDef();
-
-	auto state = make_uniq<MnemonicScanState>();
-	state->attribute_columns.resize(def.attributes.size());
-	for (idx_t i = 0; i < input.column_ids.size(); i++) {
-		auto column_id = input.column_ids[i];
-		ScanColumn column;
+//! Resolve a column id of the scan to a table and column
+static ScanColumn ResolveColumn(const MnemonicScanBindData &bind_data, const MnemonicScanState &state,
+                                column_t column_id) {
+	ScanColumn column;
+	if (column_id == COLUMN_IDENTIFIER_EMPTY) {
+		column.kind = ScanColumn::Kind::EMPTY;
+		return column;
+	}
+	if (!bind_data.fused) {
 		if (column_id == MNEMONIC_ROWID_COLUMN || column_id == MNEMONIC_ID_COLUMN_INDEX) {
 			column.kind = ScanColumn::Kind::ID;
-			state->id_columns.push_back(i);
-			state->column_types.push_back(mnemonicdb::RefType());
-		} else if (column_id == COLUMN_IDENTIFIER_EMPTY) {
-			column.kind = ScanColumn::Kind::EMPTY;
-			state->column_types.push_back(LogicalType::BOOLEAN);
 		} else {
 			column.kind = ScanColumn::Kind::ATTRIBUTE;
 			column.attribute = column_id - 1;
+		}
+		return column;
+	}
+	if (column_id >= FusedRowIdColumn(0) && column_id < FusedRowIdColumn(bind_data.tables.size())) {
+		column.kind = ScanColumn::Kind::ID;
+		column.table = column_id - FusedRowIdColumn(0);
+		return column;
+	}
+	for (idx_t t = 0; t < bind_data.tables.size(); t++) {
+		auto &scan_table = bind_data.tables[t];
+		auto count = scan_table.table.get().GetColumns().PhysicalColumnCount();
+		if (column_id < scan_table.column_offset || column_id >= scan_table.column_offset + count) {
+			continue;
+		}
+		auto local = column_id - scan_table.column_offset;
+		column.table = t;
+		if (local == MNEMONIC_ID_COLUMN_INDEX) {
+			column.kind = ScanColumn::Kind::ID;
+		} else {
+			column.kind = ScanColumn::Kind::ATTRIBUTE;
+			column.attribute = state.table_attributes[t].first + local - 1;
+		}
+		return column;
+	}
+	throw InternalException("MnemonicDB: unknown scan column %d", column_id);
+}
+
+static unique_ptr<GlobalTableFunctionState> MnemonicScanInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<MnemonicScanBindData>();
+	auto &catalog = bind_data.tables[0].table.get().catalog;
+	auto &transaction = MnemonicTransaction::Get(context, catalog);
+	transaction.MarkDataRead();
+	auto &view = transaction.GetReadView();
+
+	auto state = make_uniq<MnemonicScanState>();
+	for (idx_t t = 0; t < bind_data.tables.size(); t++) {
+		auto &table = bind_data.tables[t].table.get();
+		auto first = state->attributes.size();
+		for (idx_t a = 1; a <= table.GetTableDef().attributes.size(); a++) {
+			state->attributes.push_back(ScanAttribute {t, table.GetAttribute(a)});
+		}
+		state->table_attributes.emplace_back(first, state->attributes.size());
+		state->table_required.push_back(bind_data.tables[t].required);
+	}
+	state->attribute_columns.resize(state->attributes.size());
+	state->id_columns.resize(bind_data.tables.size());
+	for (idx_t i = 0; i < input.column_ids.size(); i++) {
+		auto column = ResolveColumn(bind_data, *state, input.column_ids[i]);
+		switch (column.kind) {
+		case ScanColumn::Kind::ID:
+			state->id_columns[column.table].push_back(i);
+			state->column_types.push_back(mnemonicdb::RefType());
+			break;
+		case ScanColumn::Kind::EMPTY:
+			state->column_types.push_back(LogicalType::BOOLEAN);
+			break;
+		case ScanColumn::Kind::ATTRIBUTE:
 			state->attribute_columns[column.attribute].push_back(i);
-			state->column_types.push_back(table.GetAttribute(column_id).type);
+			state->column_types.push_back(state->attributes[column.attribute].attr.get().type);
+			break;
 		}
 		state->columns.push_back(column);
 	}
 	state->projection_ids = input.projection_ids;
 	state->scan_chunk.Initialize(context, state->column_types);
 
-	// Every pushed filter is accepted and applied exactly to each row. Filters on `id` or on an AVET-indexed column
-	// may also narrow the scan to candidate entities.
+	// Every pushed filter is accepted and applied exactly to each row. Filters on an id or on an AVET-indexed
+	// column may also narrow the scan to candidate entities.
 	optional_idx id_points_filter;
 	vector<EntityId> id_points;
 	optional_idx range_filter;
@@ -493,7 +570,7 @@ static unique_ptr<GlobalTableFunctionState> MnemonicScanInit(ClientContext &cont
 					}
 				}
 			} else if (scan_column.kind == ScanColumn::Kind::ATTRIBUTE && !range_filter.IsValid()) {
-				auto &attr = table.GetAttribute(scan_column.attribute + 1);
+				auto &attr = state->attributes[scan_column.attribute].attr.get();
 				vector<ValueRange> attr_ranges;
 				if (attr.HasAvet() && !attr.many && ExtractRanges(*expression_filter.expr, attr.codec, attr_ranges)) {
 					range_filter = column;
@@ -508,12 +585,11 @@ static unique_ptr<GlobalTableFunctionState> MnemonicScanInit(ClientContext &cont
 		state->candidates = std::move(id_points);
 	} else if (range_filter.IsValid()) {
 		state->lookup_mode = true;
-		auto &attr = table.GetAttribute(state->columns[range_filter.GetIndex()].attribute + 1);
+		auto &attr = state->attributes[state->columns[range_filter.GetIndex()].attribute].attr.get();
 		state->candidates = EntitiesInRanges(view, attr, ranges, bind_data.as_of);
 	} else {
-		auto &schema = table.GetMnemonicSchema();
-		for (auto local : def.attributes) {
-			state->cursors.emplace_back(view, schema.GetAttribute(local), bind_data.as_of);
+		for (auto &attribute : state->attributes) {
+			state->cursors.emplace_back(view, attribute.attr.get(), bind_data.as_of);
 		}
 	}
 	if (state->lookup_mode) {
@@ -524,9 +600,27 @@ static unique_ptr<GlobalTableFunctionState> MnemonicScanInit(ClientContext &cont
 	return std::move(state);
 }
 
-//! Write one entity's values into row `row` of the scan chunk. `values[a]` holds the encoded values of attribute a.
-static void WriteRow(MnemonicScanState &state, MnemonicTableEntry &table, EntityId entity,
-                     const vector<vector<string>> &values, idx_t row) {
+//! Whether the entity is a member of table `t`, given the values read for every attribute
+static bool IsMember(const MnemonicScanState &state, const vector<vector<string>> &values, idx_t t) {
+	for (idx_t a = state.table_attributes[t].first; a < state.table_attributes[t].second; a++) {
+		if (!values[a].empty()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! Write one entity's values into row `row` of the scan chunk, or return false if it is not a member of every
+//! required table. `values[a]` holds the encoded values of attribute a.
+static bool WriteRow(MnemonicScanState &state, EntityId entity, const vector<vector<string>> &values, idx_t row) {
+	auto table_count = state.table_required.size();
+	vector<bool> member(table_count);
+	for (idx_t t = 0; t < table_count; t++) {
+		member[t] = IsMember(state, values, t);
+		if (state.table_required[t] && !member[t]) {
+			return false;
+		}
+	}
 	auto &chunk = state.scan_chunk;
 	for (idx_t a = 0; a < values.size(); a++) {
 		auto &columns = state.attribute_columns[a];
@@ -539,7 +633,7 @@ static void WriteRow(MnemonicScanState &state, MnemonicTableEntry &table, Entity
 			}
 			continue;
 		}
-		auto &attr = table.GetAttribute(a + 1);
+		auto &attr = state.attributes[a].attr.get();
 		if (!attr.many) {
 			for (auto column : columns) {
 				attr.codec.Decode(values[a][0], chunk.data[column], row);
@@ -555,9 +649,16 @@ static void WriteRow(MnemonicScanState &state, MnemonicTableEntry &table, Entity
 			chunk.data[column].SetValue(row, list);
 		}
 	}
-	for (auto column : state.id_columns) {
-		FlatVector::GetDataMutable<uint64_t>(chunk.data[column])[row] = entity;
+	for (idx_t t = 0; t < table_count; t++) {
+		for (auto column : state.id_columns[t]) {
+			if (member[t]) {
+				FlatVector::GetDataMutable<uint64_t>(chunk.data[column])[row] = entity;
+			} else {
+				FlatVector::SetNull(chunk.data[column], row, true);
+			}
+		}
 	}
+	return true;
 }
 
 //! Produce the next entity from the AEVT cursors; false when exhausted
@@ -574,9 +675,10 @@ static bool NextMerged(MnemonicScanState &state, EntityId &entity, vector<vector
 	}
 	for (idx_t a = 0; a < state.cursors.size(); a++) {
 		auto &cursor = state.cursors[a];
+		// Membership needs every attribute's presence, but values are only kept for projected ones
 		bool wanted = !state.attribute_columns[a].empty();
 		while (cursor.valid && cursor.entity == entity) {
-			if (wanted) {
+			if (wanted || values[a].empty()) {
 				values[a].emplace_back(cursor.Value());
 			}
 			cursor.Next();
@@ -585,28 +687,27 @@ static bool NextMerged(MnemonicScanState &state, EntityId &entity, vector<vector
 	return true;
 }
 
-//! Produce the next candidate entity that is a member of the table; false when exhausted
-static bool NextCandidate(MnemonicScanState &state, MnemonicTableEntry &table, mnemonicdb::ReadView &view,
-                          optional_idx as_of, EntityId &entity, vector<vector<string>> &values) {
-	auto &def = table.GetTableDef();
+//! Produce the next candidate entity's values; false when exhausted
+static bool NextCandidate(MnemonicScanState &state, mnemonicdb::ReadView &view, optional_idx as_of, EntityId &entity,
+                          vector<vector<string>> &values) {
 	constexpr size_t head = mnemonicdb::PACKED_ID_SIZE + mnemonicdb::PACKED_ATTR_SIZE;
 	while (state.next_candidate < state.candidates.size()) {
 		entity = state.candidates[state.next_candidate++];
 		if (!mnemonicdb::IsWellFormed(entity)) {
 			continue;
 		}
-		bool member = false;
-		for (idx_t a = 0; a < def.attributes.size(); a++) {
-			auto &attr = table.GetAttribute(a + 1);
+		bool any = false;
+		for (idx_t a = 0; a < state.attributes.size(); a++) {
+			auto &attr = state.attributes[a].attr.get();
 			auto prefix = mnemonicdb::EavtPrefix(entity, attr.Local());
 			ForEachVisible(view, ColumnFamily::EAVT, ColumnFamily::EAVT_HIST, prefix, as_of, [&](std::string_view key) {
-				member = true;
+				any = true;
 				values[a].emplace_back(key.substr(head, key.size() - head - mnemonicdb::PACKED_TX_SIZE));
 			});
 			// Values from the history index arrive after the current ones; keep them in value order
 			std::sort(values[a].begin(), values[a].end());
 		}
-		if (member) {
+		if (any) {
 			return true;
 		}
 	}
@@ -615,13 +716,11 @@ static bool NextCandidate(MnemonicScanState &state, MnemonicTableEntry &table, m
 
 static void MnemonicScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &bind_data = input.bind_data->Cast<MnemonicScanBindData>();
-	auto &table = bind_data.table;
 	auto &state = input.global_state->Cast<MnemonicScanState>();
-	auto &view = MnemonicTransaction::Get(context, table.catalog).GetReadView();
-	auto attribute_count = table.GetTableDef().attributes.size();
+	auto &view = MnemonicTransaction::Get(context, bind_data.tables[0].table.get().catalog).GetReadView();
 	auto &chunk = state.scan_chunk;
 
-	vector<vector<string>> values(attribute_count);
+	vector<vector<string>> values(state.attributes.size());
 	while (true) {
 		chunk.Reset();
 		idx_t count = 0;
@@ -631,19 +730,19 @@ static void MnemonicScan(ClientContext &context, TableFunctionInput &input, Data
 				v.clear();
 			}
 			EntityId entity = 0;
-			bool found = state.lookup_mode ? NextCandidate(state, table, view, bind_data.as_of, entity, values)
+			bool found = state.lookup_mode ? NextCandidate(state, view, bind_data.as_of, entity, values)
 			                               : NextMerged(state, entity, values);
 			if (!found) {
 				exhausted = true;
 				break;
 			}
-			WriteRow(state, table, entity, values, count);
-			count++;
+			if (WriteRow(state, entity, values, count)) {
+				count++;
+			}
 		}
 		chunk.SetChildCardinality(count);
 
 		// Apply every pushed filter exactly
-		SelectionVector sel(STANDARD_VECTOR_SIZE);
 		idx_t selected = count;
 		for (auto &filter : state.filters) {
 			if (selected == 0) {
@@ -715,22 +814,43 @@ static optional_idx ResolveAtClause(ClientContext &context, MnemonicTableEntry &
 	return optional_idx(tx);
 }
 
-TableFunction MnemonicScanFunction(ClientContext &context, MnemonicTableEntry &table,
-                                   unique_ptr<FunctionData> &bind_data, optional_ptr<BoundAtClause> at_clause) {
-	optional_idx as_of;
-	if (at_clause) {
-		as_of = ResolveAtClause(context, table, *at_clause);
-	}
-	bind_data = make_uniq<MnemonicScanBindData>(table, as_of);
+static TableFunction BaseScanFunction() {
 	TableFunction function("mnemonicdb_scan", {}, MnemonicScan, nullptr, MnemonicScanInit);
 	function.projection_pushdown = true;
 	function.filter_pushdown = true;
 	function.filter_prune = true;
-	function.get_virtual_columns = [](ClientContext &, optional_ptr<FunctionData> data) {
-		return data->Cast<MnemonicScanBindData>().table.GetVirtualColumns();
-	};
+	return function;
+}
+
+TableFunction MnemonicScanFunction(ClientContext &context, MnemonicTableEntry &table,
+                                   unique_ptr<FunctionData> &bind_data_p, optional_ptr<BoundAtClause> at_clause) {
+	auto bind_data = make_uniq<MnemonicScanBindData>();
+	bind_data->tables.push_back(MnemonicScanTable {table, true, 0});
+	if (at_clause) {
+		bind_data->as_of = ResolveAtClause(context, table, *at_clause);
+	}
+	bind_data_p = std::move(bind_data);
+	auto function = BaseScanFunction();
 	function.get_bind_info = [](const optional_ptr<FunctionData> data) {
-		return BindInfo(data->Cast<MnemonicScanBindData>().table);
+		return BindInfo(data->Cast<MnemonicScanBindData>().tables[0].table.get());
+	};
+	function.get_virtual_columns = [](ClientContext &, optional_ptr<FunctionData> data) {
+		return data->Cast<MnemonicScanBindData>().tables[0].table.get().GetVirtualColumns();
+	};
+	return function;
+}
+
+TableFunction MnemonicFusedScanFunction() {
+	auto function = BaseScanFunction();
+	function.get_virtual_columns = [](ClientContext &, optional_ptr<FunctionData> data) {
+		virtual_column_map_t result;
+		auto &bind_data = data->Cast<MnemonicScanBindData>();
+		for (idx_t t = 0; t < bind_data.tables.size(); t++) {
+			result.emplace(FusedRowIdColumn(t),
+			               TableColumn(Identifier(bind_data.tables[t].table.get().name.GetIdentifierName() + ".rowid"),
+			                           mnemonicdb::RefType()));
+		}
+		return result;
 	};
 	return function;
 }

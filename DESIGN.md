@@ -237,9 +237,34 @@ AEVT ranges. (Declining filters through `supports_pushdown_type` breaks
 DuckDB's plan when the filtered column isn't projected, so the scan accepts
 them all.)
 
-Joins between tables are ordinary DuckDB joins for now. Because every scan
-comes out sorted by E, a later optimizer pass can fuse scans of the same
-database into a single merge join.
+### Scan fusion
+
+An optimizer pass (`src/optimizer/mnemonic_fusion.cpp`) runs after
+DuckDB's own optimizers and fuses joins on entity id into a single scan.
+
+- **What qualifies:** an INNER, LEFT or RIGHT comparison join whose only
+  condition is `id = id` (or `rowid`) between two MnemonicDB scans of the
+  same database, read at the same `AT` version.
+- **The fused scan** reads every attribute of every table in one AEVT merge,
+  in entity order, so no hash join is needed. An entity is produced when it
+  is a member of every required table. A table on the optional side of an
+  outer join is optional, and its columns (including `id`) are NULL when the
+  entity isn't a member.
+- **Bindings:** the fused scan's `projection_ids` reproduce the join's
+  output exactly, position for position, because parent joins' projection
+  maps refer to positions. Column bindings above the join are rewritten.
+  Joins fuse one at a time, bottom-up, so chains of three or more tables
+  collapse into one scan.
+- **Filters** from both sides move into the fused scan, so an indexed
+  filter on either table still drives it from AVET.
+- **Not fused:** plans containing DML (UPDATE ... FROM needs a single
+  table's row ids), joins on other columns or with extra conditions, joins
+  across different `AT` versions, and joins with non-MnemonicDB tables.
+- **Turning it off:** `SET mnemonicdb_fuse_scans = false` (used by the
+  tests to compare against unfused plans).
+
+A further step would seek the cursors of required tables forward
+(leapfrog) instead of reading every attribute in full.
 
 ## 6. Writing and transactions
 

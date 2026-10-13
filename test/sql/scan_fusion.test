@@ -1,0 +1,490 @@
+# name: test/sql/scan_fusion.test
+# description: Joins of tables on their entity id are fused into one scan; results match the unfused plan exactly
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/fusion.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.person (name VARCHAR, age INTEGER, email VARCHAR UNIQUE, tags VARCHAR[])
+
+statement ok
+CREATE TABLE d.account (balance INTEGER)
+
+statement ok
+CREATE TABLE d.address (city VARCHAR)
+
+statement ok
+CREATE TABLE d.owns (owner REF, label VARCHAR)
+
+# tx 6
+statement ok
+INSERT INTO d.person (name, age, email, tags) SELECT 'p' || i, i % 50, 'e' || i, CASE WHEN i % 3 = 0 THEN ['a', 'b'] END FROM range(3000) t(i)
+
+# tx 7
+statement ok
+INSERT INTO d.account (id, balance) SELECT id, age * 10 FROM d.person WHERE age < 25
+
+# tx 8: change history so AT queries differ
+statement ok
+UPDATE d.person SET age = age + 100 WHERE age % 7 = 0
+
+statement ok
+UPDATE d.account SET balance = balance + 1 WHERE balance % 20 = 0
+
+statement ok
+DELETE FROM d.person WHERE age = 3
+
+statement ok
+INSERT INTO d.address (id, city) SELECT id, 'c' || (age % 3) FROM d.person WHERE age % 2 = 0
+
+statement ok
+INSERT INTO d.owns (owner, label) SELECT id, 'thing of ' || name FROM d.person WHERE age = 5
+
+statement ok
+CREATE INDEX person_age ON d.person (age)
+
+# inner
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.id, p.name, a.balance FROM d.person p JOIN d.account a ON a.id = p.id
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.id, p.name, a.balance FROM d.person p JOIN d.account a ON a.id = p.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# inner_reversed
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, a.balance FROM d.account a JOIN d.person p ON p.id = a.id
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, a.balance FROM d.account a JOIN d.person p ON p.id = a.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# left
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, a.balance, a.id FROM d.person p LEFT JOIN d.account a ON a.id = p.id
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, a.balance, a.id FROM d.person p LEFT JOIN d.account a ON a.id = p.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# three_way
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, a.balance, c.city FROM d.person p JOIN d.account a ON a.id = p.id JOIN d.address c ON c.id = a.id
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, a.balance, c.city FROM d.person p JOIN d.account a ON a.id = p.id JOIN d.address c ON c.id = a.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# inner_left
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, a.balance, c.city FROM d.person p JOIN d.account a ON a.id = p.id LEFT JOIN d.address c ON c.id = p.id
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, a.balance, c.city FROM d.person p JOIN d.account a ON a.id = p.id LEFT JOIN d.address c ON c.id = p.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# filter_both
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.id = p.id WHERE p.age > 10 AND a.balance < 150
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.id = p.id WHERE p.age > 10 AND a.balance < 150
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# filter_indexed
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.id = p.id WHERE p.age = 7
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.id = p.id WHERE p.age = 7
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# filter_unique
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.id = p.id WHERE p.email = 'e14'
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.id = p.id WHERE p.email = 'e14'
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# filter_id
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.id = p.id WHERE p.id = (SELECT min(id) FROM d.account)
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.id = p.id WHERE p.id = (SELECT min(id) FROM d.account)
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# list_columns
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, p.tags, a.balance FROM d.person p JOIN d.account a ON a.id = p.id
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, p.tags, a.balance FROM d.person p JOIN d.account a ON a.id = p.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# self_join
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p1.name, p2.age FROM d.person p1 JOIN d.person p2 ON p1.id = p2.id
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p1.name, p2.age FROM d.person p1 JOIN d.person p2 ON p1.id = p2.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# count_only
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT count(*) FROM d.person p JOIN d.account a ON a.id = p.id
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT count(*) FROM d.person p JOIN d.account a ON a.id = p.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# aggregate
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.age % 5 k, sum(a.balance), count(c.city) FROM d.person p JOIN d.account a ON a.id = p.id LEFT JOIN d.address c ON c.id = p.id GROUP BY k
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.age % 5 k, sum(a.balance), count(c.city) FROM d.person p JOIN d.account a ON a.id = p.id LEFT JOIN d.address c ON c.id = p.id GROUP BY k
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# at_version
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, a.balance FROM d.person p AT (VERSION => 6) JOIN d.account a AT (VERSION => 6) ON a.id = p.id
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, a.balance FROM d.person p AT (VERSION => 6) JOIN d.account a AT (VERSION => 6) ON a.id = p.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# at_mixed
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, a.balance FROM d.person p AT (VERSION => 6) JOIN d.account a ON a.id = p.id
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, a.balance FROM d.person p AT (VERSION => 6) JOIN d.account a ON a.id = p.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# rowid_join
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.rowid = p.rowid
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.rowid = p.rowid
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# non_id_join
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.balance = p.age
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.balance = p.age
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# extra_condition
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.id = p.id AND a.balance > p.age
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.id = p.id AND a.balance > p.age
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# subquery
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT name FROM d.person p WHERE p.id IN (SELECT a.id FROM d.account a JOIN d.address c ON c.id = a.id)
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT name FROM d.person p WHERE p.id IN (SELECT a.id FROM d.account a JOIN d.address c ON c.id = a.id)
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# ref_join
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, o.label FROM d.person p JOIN d.owns o ON o.owner = p.id
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, o.label FROM d.person p JOIN d.owns o ON o.owner = p.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# history_values
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, p.age, a.balance FROM d.person p AT (VERSION => 7) LEFT JOIN d.account a AT (VERSION => 7) ON a.id = p.id
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, p.age, a.balance FROM d.person p AT (VERSION => 7) LEFT JOIN d.account a AT (VERSION => 7) ON a.id = p.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# right
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT a.balance, p.name, a.id FROM d.account a RIGHT JOIN d.person p ON p.id = a.id
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT a.balance, p.name, a.id FROM d.account a RIGHT JOIN d.person p ON p.id = a.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# Results are not trivially empty
+query I
+SELECT count(*) FROM d.person p JOIN d.account a ON a.id = p.id LEFT JOIN d.address c ON c.id = p.id
+----
+1440
+
+# Plans: id joins become one scan; anything else keeps its join
+query II
+EXPLAIN SELECT p.name, a.balance, c.city FROM d.person p JOIN d.account a ON a.id = p.id LEFT JOIN d.address c ON c.id = p.id
+----
+physical_plan	<!REGEX>:.*Join.*
+
+query II
+EXPLAIN SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.balance = p.age
+----
+physical_plan	<REGEX>:.*Hash Join.*
+
+query II
+EXPLAIN SELECT p.name, a.balance FROM d.person p AT (VERSION => 6) JOIN d.account a ON a.id = p.id
+----
+physical_plan	<REGEX>:.*Hash Join.*
+
+query II
+EXPLAIN SELECT p.name, o.label FROM d.person p JOIN d.owns o ON o.owner = p.id
+----
+physical_plan	<REGEX>:.*Hash Join.*
+
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+query II
+EXPLAIN SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.id = p.id
+----
+physical_plan	<REGEX>:.*Hash Join.*
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+# DML is never fused (UPDATE / DELETE need a single table's row ids)
+statement ok
+UPDATE d.account SET balance = 0 FROM d.person p WHERE p.id = account.id AND p.age = 10
+
+query I
+SELECT count(*) FROM d.account WHERE balance = 0
+----
+60

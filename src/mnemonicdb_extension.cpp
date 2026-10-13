@@ -3,6 +3,7 @@
 #include "mnemonicdb_extension.hpp"
 #include "mnemonicdb/codec_functions.hpp"
 #include "mnemonicdb/mnemonic_datom_functions.hpp"
+#include "mnemonicdb/mnemonic_fusion.hpp"
 #include "mnemonicdb/mnemonic_catalog.hpp"
 #include "mnemonicdb/mnemonic_transaction_manager.hpp"
 #include "mnemonicdb/mnemonicdb_info.hpp"
@@ -66,6 +67,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(MnemonicInfoTableFunction());
 	RegisterCodecFunctions(loader);
 	RegisterDatomFunctions(loader);
+	RegisterScanFusion(loader);
 }
 
 void MnemonicdbExtension::Load(ExtensionLoader &loader) {
