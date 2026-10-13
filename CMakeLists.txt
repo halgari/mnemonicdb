@@ -56,6 +56,7 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/third_party/rocksdb ${CMAKE_CURRENT
 target_include_directories(rocksdb BEFORE PRIVATE ${MNEMONICDB_ZSTD_DIR} ${MNEMONICDB_LZ4_DIR})
 if(MSVC)
   target_compile_definitions(rocksdb PRIVATE LZ4 ZSTD)
+  cmake_policy(SET CMP0079 NEW)
   target_link_libraries(rocksdb PRIVATE mnemonicdb_lz4 mnemonicdb_zstd)
 endif()
 
