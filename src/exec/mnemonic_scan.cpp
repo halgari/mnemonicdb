@@ -677,7 +677,7 @@ static void PlanTasks(ClientContext &context, const MnemonicScanBindData &bind_d
 		for (idx_t begin = 0; begin < count || begin == 0; begin += per_task) {
 			ScanTask task;
 			task.candidate_begin = begin;
-			task.candidate_end = MinValue(count, begin + per_task);
+			task.candidate_end = MinValue<idx_t>(count, begin + per_task);
 			state.tasks.push_back(task);
 			if (count == 0) {
 				break;
