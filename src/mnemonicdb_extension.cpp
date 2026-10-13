@@ -28,7 +28,7 @@ static void Bootstrap(mnemonicdb::Store &store) {
 		mnemonicdb::Schema::WriteBootstrap(writer);
 		auto instant = Timestamp::GetCurrentTimestamp().value;
 		mnemonicdb::Schema::WriteTxEntity(writer, *mnemonicdb::Schema::Builtin(), 1, instant);
-		store.Commit(writer.GetWriteBatch(), 1, instant);
+		store.Commit(writer.GetWriteBatch(), 1, instant, writer.GetCountDeltas());
 	} catch (...) {
 		store.ReleaseWriter();
 		throw;
@@ -66,6 +66,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	StorageExtension::Register(config, "mnemonicdb", make_shared_ptr<MnemonicStorageExtension>());
 	loader.RegisterFunction(MnemonicInfoTableFunction());
+	loader.RegisterFunction(MnemonicCompactTableFunction());
 	RegisterCodecFunctions(loader);
 	RegisterDatomFunctions(loader);
 	RegisterScanFusion(loader);

@@ -30,6 +30,9 @@ struct MnemonicScanBindData : public TableFunctionData {
 	idx_t ColumnCount() const;
 };
 
+//! Estimated number of rows the scan produces (from per-attribute datom counts)
+idx_t EstimateScanRows(const MnemonicScanBindData &bind_data);
+
 //! The row-id column of table `index` in a fused scan
 column_t FusedRowIdColumn(idx_t index);
 

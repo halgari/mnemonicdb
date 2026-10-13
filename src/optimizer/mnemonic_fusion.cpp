@@ -219,9 +219,7 @@ static bool TryFuse(Binder &binder, unique_ptr<LogicalOperator> &op, vector<Repl
 		replacements.emplace_back(ColumnBinding(right.table_index, ProjectionIndex(i)),
 		                          ColumnBinding(table_index, ProjectionIndex(left_count + i)));
 	}
-	if (join.has_estimated_cardinality) {
-		get->SetEstimatedCardinality(join.estimated_cardinality);
-	}
+	get->SetEstimatedCardinality(EstimateScanRows(get->bind_data->Cast<MnemonicScanBindData>()));
 	get->ResolveOperatorTypes();
 	op = std::move(get);
 	return true;

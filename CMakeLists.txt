@@ -19,14 +19,39 @@ set(WITH_GFLAGS OFF CACHE BOOL "" FORCE)
 set(WITH_LIBURING OFF CACHE BOOL "" FORCE)
 set(WITH_JEMALLOC OFF CACHE BOOL "" FORCE)
 set(WITH_SNAPPY OFF CACHE BOOL "" FORCE)
-set(WITH_LZ4 OFF CACHE BOOL "" FORCE)
+set(WITH_LZ4 ON CACHE BOOL "" FORCE)
 set(WITH_ZLIB OFF CACHE BOOL "" FORCE)
-set(WITH_ZSTD OFF CACHE BOOL "" FORCE)
+set(WITH_ZSTD ON CACHE BOOL "" FORCE)
 set(FAIL_ON_WARNINGS OFF CACHE BOOL "" FORCE)
 set(USE_RTTI ON CACHE STRING "" FORCE)
 set(PORTABLE 1 CACHE STRING "" FORCE)
+# Compression libraries, vendored and built static so the extension is self-contained. RocksDB's find modules
+# are pointed at them through their cache variables and the imported target names they would create.
+set(MNEMONICDB_LZ4_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lib)
+add_library(mnemonicdb_lz4 STATIC ${MNEMONICDB_LZ4_DIR}/lz4.c ${MNEMONICDB_LZ4_DIR}/lz4hc.c
+                                  ${MNEMONICDB_LZ4_DIR}/lz4frame.c ${MNEMONICDB_LZ4_DIR}/xxhash.c)
+target_include_directories(mnemonicdb_lz4 PUBLIC $<BUILD_INTERFACE:${MNEMONICDB_LZ4_DIR}>)
+# lz4's xxhash must not clash with other copies linked into DuckDB
+target_compile_definitions(mnemonicdb_lz4 PUBLIC XXH_NAMESPACE=MNEMONICDB_LZ4_)
+set(MNEMONICDB_ZSTD_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd/lib)
+file(GLOB MNEMONICDB_ZSTD_SOURCES ${MNEMONICDB_ZSTD_DIR}/common/*.c ${MNEMONICDB_ZSTD_DIR}/compress/*.c
+     ${MNEMONICDB_ZSTD_DIR}/decompress/*.c ${MNEMONICDB_ZSTD_DIR}/dictBuilder/*.c)
+add_library(mnemonicdb_zstd STATIC ${MNEMONICDB_ZSTD_SOURCES})
+target_include_directories(mnemonicdb_zstd PUBLIC $<BUILD_INTERFACE:${MNEMONICDB_ZSTD_DIR}>)
+target_compile_definitions(mnemonicdb_zstd PRIVATE ZSTD_DISABLE_ASM ZSTD_MULTITHREAD=0)
+set_target_properties(mnemonicdb_lz4 mnemonicdb_zstd PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET
+                                                                hidden)
+set(lz4_INCLUDE_DIRS ${MNEMONICDB_LZ4_DIR} CACHE PATH "" FORCE)
+set(lz4_LIBRARIES mnemonicdb_lz4 CACHE STRING "" FORCE)
+set(ZSTD_INCLUDE_DIRS ${MNEMONICDB_ZSTD_DIR} CACHE PATH "" FORCE)
+set(ZSTD_LIBRARIES mnemonicdb_zstd CACHE STRING "" FORCE)
+add_library(lz4::lz4 ALIAS mnemonicdb_lz4)
+add_library(zstd::zstd ALIAS mnemonicdb_zstd)
+
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/third_party/rocksdb ${CMAKE_CURRENT_BINARY_DIR}/rocksdb
                  EXCLUDE_FROM_ALL)
+# DuckDB's own (namespaced) zstd headers are on the global include path; RocksDB must see the real ones first
+target_include_directories(rocksdb BEFORE PRIVATE ${MNEMONICDB_ZSTD_DIR} ${MNEMONICDB_LZ4_DIR})
 
 include_directories(src/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party/rocksdb/include)
 
@@ -62,7 +87,7 @@ target_link_libraries(${EXTENSION_NAME} rocksdb)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} rocksdb)
 
 install(
-  TARGETS ${EXTENSION_NAME} rocksdb
+  TARGETS ${EXTENSION_NAME} rocksdb mnemonicdb_lz4 mnemonicdb_zstd
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")

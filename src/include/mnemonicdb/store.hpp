@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <unordered_map>
 
 namespace rocksdb {
 class DB;
@@ -85,15 +86,23 @@ public:
 
 	//! Atomically write `batch` as transaction `tx`, together with the updated metadata. Only the current writer
 	//! may commit, and `tx` must be GetLastTx() + 1.
-	void Commit(rocksdb::WriteBatch &batch, TxId tx, int64_t instant);
+	//! `count_deltas` is the change in current datoms per attribute.
+	void Commit(rocksdb::WriteBatch &batch, TxId tx, int64_t instant,
+	            const std::unordered_map<AttrId, int64_t> &count_deltas = {});
+
+	//! Number of current datoms of an attribute, as of the last commit (a planner estimate)
+	uint64_t GetAttributeCount(AttrId attr) const;
 	//! Flush all column families to disk
 	void Flush();
+	//! Compact every column family down to the bottommost level (after large loads)
+	void Compact();
 	//! Approximate on-disk size in bytes
 	uint64_t ApproximateSize();
 
 private:
 	Store(string path, bool read_only);
 	void LoadMeta(bool created);
+	void LoadAttributeCounts();
 
 private:
 	string path;
@@ -112,6 +121,9 @@ private:
 	//! Next local number per partition, and which ones changed since the last commit
 	std::array<uint64_t, 256> next_local {};
 	std::array<bool, 256> next_local_dirty {};
+
+	mutable std::mutex count_lock;
+	std::unordered_map<AttrId, uint64_t> attribute_counts;
 };
 
 } // namespace mnemonicdb

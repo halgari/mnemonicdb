@@ -118,13 +118,17 @@ private:
 			partition = default_partition;
 		}
 		if (partition == mnemonicdb::partition::ATTR || partition == mnemonicdb::partition::TABLE) {
-			return transaction.GetWriter().GetView().GetStore().AllocateId(partition);
+			auto id = transaction.GetWriter().GetView().GetStore().AllocateId(partition);
+			transaction.GetWriter().MarkFresh(id);
+			return id;
 		}
 		if (partition < mnemonicdb::partition::DB ||
 		    (partition >= mnemonicdb::partition::FIRST_RESERVED && partition < mnemonicdb::partition::FIRST_USER)) {
 			throw InvalidInputException("MnemonicDB: cannot allocate entity IDs in reserved partition %d", partition);
 		}
-		return transaction.GetWriter().GetView().GetStore().AllocateId(partition);
+		auto id = transaction.GetWriter().GetView().GetStore().AllocateId(partition);
+		transaction.GetWriter().MarkFresh(id);
+		return id;
 	}
 
 	void Reserve(EntityId id) {

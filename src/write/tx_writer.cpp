@@ -24,6 +24,101 @@ ReadView::ReadView(Store &store_p, const rocksdb::Snapshot *snapshot_p, rocksdb:
     : store(&store_p), snapshot(snapshot_p), batch(batch_p) {
 }
 
+ReadView::ReadView(ReadView &&other) noexcept
+    : store(other.store), snapshot(other.snapshot), batch(other.batch), reader(nullptr) {
+	other.ClearCache();
+}
+
+ReadView &ReadView::operator=(ReadView &&other) noexcept {
+	ClearCache();
+	other.ClearCache();
+	store = other.store;
+	snapshot = other.snapshot;
+	batch = other.batch;
+	return *this;
+}
+
+ReadView::~ReadView() = default;
+
+PrefixReader &ReadView::GetReader() {
+	if (!reader) {
+		reader = duckdb::make_uniq<PrefixReader>(*this);
+	}
+	return *reader;
+}
+
+void ReadView::ClearCache() {
+	reader.reset();
+}
+
+//===--------------------------------------------------------------------===//
+// PrefixReader
+//===--------------------------------------------------------------------===//
+PrefixReader::PrefixReader(ReadView &view_p) : view(view_p) {
+}
+
+PrefixReader::~PrefixReader() = default;
+
+rocksdb::Iterator &PrefixReader::GetIterator(ColumnFamily cf, bool prefix_mode) {
+	auto &slot = iterators[static_cast<size_t>(cf)][prefix_mode ? 1 : 0];
+	if (!slot) {
+		rocksdb::ReadOptions options;
+		options.snapshot = view.snapshot;
+		// Prefix mode: iteration stays within the seek key's 8-byte prefix, and Bloom filters apply
+		options.prefix_same_as_start = prefix_mode;
+		options.total_order_seek = !prefix_mode;
+		slot.reset(view.store->GetDB().NewIterator(options, &view.store->GetHandle(cf)));
+	}
+	return *slot;
+}
+
+void PrefixReader::Scan(ColumnFamily cf, const string &prefix,
+                        const std::function<void(std::string_view key, std::string_view value)> &callback) {
+	bool prefix_mode = HasPrefixBloom(cf) && prefix.size() >= BLOOM_PREFIX_LENGTH;
+	auto &base = GetIterator(cf, prefix_mode);
+	base.Seek(prefix);
+	std::unique_ptr<rocksdb::WBWIIterator> delta;
+	if (view.batch) {
+		delta.reset(view.batch->NewIterator(&view.store->GetHandle(cf)));
+		delta->Seek(prefix);
+	}
+	auto base_valid = [&]() {
+		return base.Valid() && base.key().starts_with(prefix);
+	};
+	auto delta_valid = [&]() {
+		return delta && delta->Valid() && delta->Entry().key.starts_with(prefix);
+	};
+	auto view_of = [](const rocksdb::Slice &slice) {
+		return std::string_view(slice.data(), slice.size());
+	};
+	// Merge the snapshot with the pending writes; with overwrite_key each key appears once in the batch
+	while (true) {
+		bool has_base = base_valid();
+		bool has_delta = delta_valid();
+		if (!has_base && !has_delta) {
+			break;
+		}
+		int cmp = !has_base ? 1 : !has_delta ? -1 : base.key().compare(delta->Entry().key);
+		if (cmp < 0) {
+			callback(view_of(base.key()), view_of(base.value()));
+			base.Next();
+			continue;
+		}
+		auto entry = delta->Entry();
+		if (entry.type == rocksdb::kPutRecord) {
+			callback(view_of(entry.key), view_of(entry.value));
+		}
+		if (cmp == 0) {
+			base.Next();
+		}
+		delta->Next();
+	}
+	CheckStatus(base.status());
+	if (delta) {
+		CheckStatus(delta->status());
+	}
+}
+
 //! The smallest key greater than every key starting with `prefix`, or empty if there is none (all 0xFF)
 static string PrefixSuccessor(const string &prefix) {
 	string result = prefix;
@@ -110,14 +205,12 @@ std::unique_ptr<rocksdb::Iterator> ReadView::NewIterator(ColumnFamily cf, const 
 vector<Datom> ReadView::ScanPrefix(ColumnFamily cf, const string &prefix, vector<TxId> *retracted_by) {
 	vector<Datom> result;
 	auto kind = IndexKindOf(cf);
-	auto it = NewIterator(cf, prefix);
-	for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
-		result.push_back(DecodeKey(kind, std::string_view(it->key().data(), it->key().size())));
+	GetReader().Scan(cf, prefix, [&](std::string_view key, std::string_view value) {
+		result.push_back(DecodeKey(kind, key));
 		if (retracted_by) {
-			retracted_by->push_back(DecodeHistoryValue(std::string_view(it->value().data(), it->value().size())));
+			retracted_by->push_back(DecodeHistoryValue(value));
 		}
-	}
-	CheckStatus(it->status());
+	});
 	return result;
 }
 
@@ -170,6 +263,8 @@ static vector<std::pair<ColumnFamily, ColumnFamily>> IndexesOf(const AttributeDe
 }
 
 void TxWriter::PutIndexes(const AttributeDef &attr, const Datom &datom) {
+	touched.insert({datom.e, datom.a});
+	count_deltas[datom.a]++;
 	for (auto &index : IndexesOf(attr)) {
 		Put(index.first, EncodeKey(IndexKindOf(index.first), datom), string());
 	}
@@ -184,6 +279,7 @@ void TxWriter::CheckUnique(const AttributeDef &attr, EntityId, const string &v) 
 void TxWriter::BeginStatement() {
 	batch->SetSavePoint();
 	pending_unique.clear();
+	statement_count_deltas = count_deltas;
 }
 
 void TxWriter::PopStatement() {
@@ -191,8 +287,10 @@ void TxWriter::PopStatement() {
 }
 
 void TxWriter::RollbackStatement() {
+	view.ClearCache();
 	CheckStatus(batch->RollbackToSavePoint());
 	pending_unique.clear();
+	count_deltas = statement_count_deltas;
 }
 
 void TxWriter::FinishStatement() {
@@ -217,7 +315,7 @@ void TxWriter::FinishStatement() {
 }
 
 void TxWriter::Assert(const AttributeDef &attr, EntityId e, const string &v) {
-	auto current = CurrentDatoms(e, attr.Local());
+	auto current = KnownEmpty(e, attr.Local()) ? vector<Datom>() : CurrentDatoms(e, attr.Local());
 	for (auto &datom : current) {
 		if (datom.v == v) {
 			return;
@@ -242,6 +340,9 @@ void TxWriter::Assert(const AttributeDef &attr, EntityId e, const string &v) {
 }
 
 void TxWriter::Retract(const AttributeDef &attr, EntityId e, const string &v) {
+	if (KnownEmpty(e, attr.Local())) {
+		return;
+	}
 	for (auto &datom : CurrentDatoms(e, attr.Local())) {
 		if (datom.v == v) {
 			RetractDatom(attr, datom);
@@ -250,6 +351,9 @@ void TxWriter::Retract(const AttributeDef &attr, EntityId e, const string &v) {
 }
 
 void TxWriter::RetractAll(const AttributeDef &attr, EntityId e) {
+	if (KnownEmpty(e, attr.Local())) {
+		return;
+	}
 	for (auto &datom : CurrentDatoms(e, attr.Local())) {
 		RetractDatom(attr, datom);
 	}
@@ -259,6 +363,7 @@ void TxWriter::RetractDatom(const AttributeDef &attr, const Datom &datom) {
 	Datom log_entry = datom;
 	log_entry.t = tx;
 	auto log_key = EncodeKey(IndexKind::TXLOG, log_entry);
+	count_deltas[datom.a]--;
 	if (datom.t == tx) {
 		// Asserted earlier in this transaction: it never becomes visible, so it leaves no history
 		for (auto &index : IndexesOf(attr)) {
@@ -268,6 +373,8 @@ void TxWriter::RetractDatom(const AttributeDef &attr, const Datom &datom) {
 		return;
 	}
 	auto history_value = EncodeHistoryValue(tx);
+	touched.insert({datom.e, datom.a});
+	retracted.insert({datom.e, datom.a});
 	for (auto &index : IndexesOf(attr)) {
 		auto key = EncodeKey(IndexKindOf(index.first), datom);
 		Delete(index.first, key);
@@ -278,6 +385,9 @@ void TxWriter::RetractDatom(const AttributeDef &attr, const Datom &datom) {
 
 bool TxWriter::UndoRetraction(const AttributeDef &attr, EntityId e, const string &v) {
 	// A value retracted earlier in this transaction and asserted again is simply restored
+	if (!retracted.count({e, attr.Local()})) {
+		return false;
+	}
 	vector<TxId> retracted_by;
 	auto history = view.ScanPrefix(ColumnFamily::EAVT_HIST, EavtPrefix(e, attr.Local()) + v, &retracted_by);
 	for (idx_t i = 0; i < history.size(); i++) {
@@ -285,6 +395,7 @@ bool TxWriter::UndoRetraction(const AttributeDef &attr, EntityId e, const string
 		if (datom.v != v || retracted_by[i] != tx) {
 			continue;
 		}
+		count_deltas[datom.a]++;
 		for (auto &index : IndexesOf(attr)) {
 			auto key = EncodeKey(IndexKindOf(index.first), datom);
 			Delete(index.second, key);

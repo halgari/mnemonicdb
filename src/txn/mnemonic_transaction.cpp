@@ -34,6 +34,7 @@ MnemonicTransaction::MnemonicTransaction(MnemonicTransactionManager &manager, Cl
 
 void MnemonicTransaction::TakeSnapshot() {
 	lock_guard<mutex> guard(catalog.GetSnapshotLock());
+	view.ClearCache();
 	if (snapshot) {
 		store.GetDB().ReleaseSnapshot(snapshot);
 	}
@@ -80,6 +81,7 @@ MnemonicTransaction::~MnemonicTransaction() {
 	}
 	writer.reset();
 	ReleaseWriter();
+	view.ClearCache();
 	store.GetDB().ReleaseSnapshot(snapshot);
 }
 
@@ -530,7 +532,7 @@ void MnemonicTransaction::Commit() {
 		auto instant = MaxValue<int64_t>(Timestamp::GetCurrentTimestamp().value, store.GetLastInstant() + 1);
 		mnemonicdb::Schema::WriteTxEntity(*writer, GetSchema(), tx, instant);
 		lock_guard<mutex> guard(catalog.GetSnapshotLock());
-		store.Commit(writer->GetWriteBatch(), tx, instant);
+		store.Commit(writer->GetWriteBatch(), tx, instant, writer->GetCountDeltas());
 		if (schema_changed) {
 			catalog.SetGeneration(generation);
 		}

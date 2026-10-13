@@ -53,6 +53,44 @@ static void MnemonicInfoFunction(ClientContext &, TableFunctionInput &input, Dat
 	output.SetCardinality(1);
 }
 
+struct MnemonicCompactState : public GlobalTableFunctionState {
+	bool done = false;
+};
+
+static unique_ptr<FunctionData> MnemonicCompactBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
+	auto name = input.inputs[0].GetValue<string>();
+	auto &catalog = Catalog::GetCatalog(context, Identifier(name));
+	if (catalog.GetCatalogType() != MnemonicCatalog::CATALOG_TYPE) {
+		throw BinderException("mnemonicdb_compact: \"%s\" is not a MnemonicDB database", name);
+	}
+	names = {Identifier("size_before"), Identifier("size_after")};
+	return_types = {LogicalType::UBIGINT, LogicalType::UBIGINT};
+	return make_uniq<MnemonicInfoBindData>(catalog.Cast<MnemonicCatalog>());
+}
+
+static unique_ptr<GlobalTableFunctionState> MnemonicCompactInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<MnemonicCompactState>();
+}
+
+static void MnemonicCompactFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+	auto &state = input.global_state->Cast<MnemonicCompactState>();
+	if (state.done) {
+		return;
+	}
+	state.done = true;
+	auto &store = input.bind_data->Cast<MnemonicInfoBindData>().catalog.GetStore();
+	auto before = store.ApproximateSize();
+	store.Compact();
+	output.data[0].Append(Value::UBIGINT(before));
+	output.data[1].Append(Value::UBIGINT(store.ApproximateSize()));
+}
+
+TableFunction MnemonicCompactTableFunction() {
+	return TableFunction("mnemonicdb_compact", {LogicalType::VARCHAR}, MnemonicCompactFunction, MnemonicCompactBind,
+	                     MnemonicCompactInit);
+}
+
 TableFunction MnemonicInfoTableFunction() {
 	return TableFunction("mnemonicdb_info", {LogicalType::VARCHAR}, MnemonicInfoFunction, MnemonicInfoBind,
 	                     MnemonicInfoInit);

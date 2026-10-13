@@ -1,0 +1,81 @@
+# name: test/sql/statistics.test
+# description: Scans report row estimates from exact per-attribute datom counts, kept through writes and rollbacks
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/stats.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.person (name VARCHAR, age INTEGER, tags VARCHAR[])
+
+statement ok
+CREATE TABLE d.account (balance INTEGER)
+
+statement ok
+INSERT INTO d.person (name, age, tags) SELECT 'p' || i, i % 100, ['a', 'b'] FROM range(10000) t(i)
+
+statement ok
+INSERT INTO d.account (id, balance) SELECT id, 1 FROM d.person WHERE age < 10
+
+# List columns (one datom per element) do not inflate the estimate
+query II
+EXPLAIN SELECT * FROM d.person
+----
+physical_plan	<REGEX>:.*~10,000 rows.*
+
+# A fused inner join is no larger than its smallest table
+query II
+EXPLAIN SELECT * FROM d.person p JOIN d.account a ON a.id = p.id
+----
+physical_plan	<REGEX>:.*~1,000 rows.*
+
+# Retractions lower the counts; a rolled-back transaction and a failed statement leave them alone
+statement ok
+DELETE FROM d.person WHERE age >= 90
+
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM d.person WHERE age < 50
+
+statement ok
+ROLLBACK
+
+statement error
+INSERT INTO d.account (id, balance) VALUES (12345, 1)
+----
+does not exist
+
+query II
+EXPLAIN SELECT name FROM d.person
+----
+physical_plan	<REGEX>:.*~9,000 rows.*
+
+# Updates that replace a value keep the count
+statement ok
+UPDATE d.person SET age = age + 1
+
+query II
+EXPLAIN SELECT age FROM d.person
+----
+physical_plan	<REGEX>:.*~9,000 rows.*
+
+# Counts persist
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/stats.mnemonic' AS d (TYPE mnemonicdb)
+
+query II
+EXPLAIN SELECT name FROM d.person
+----
+physical_plan	<REGEX>:.*~9,000 rows.*
+
+query II
+EXPLAIN SELECT * FROM d.account
+----
+physical_plan	<REGEX>:.*~1,000 rows.*

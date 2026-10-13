@@ -9,3 +9,9 @@
 [submodule "third_party/rocksdb"]
 	path = third_party/rocksdb
 	url = https://github.com/facebook/rocksdb
+[submodule "third_party/lz4"]
+	path = third_party/lz4
+	url = https://github.com/lz4/lz4
+[submodule "third_party/zstd"]
+	path = third_party/zstd
+	url = https://github.com/facebook/zstd

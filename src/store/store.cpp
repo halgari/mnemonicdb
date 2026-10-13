@@ -15,12 +15,22 @@
 namespace mnemonicdb {
 
 using duckdb::IOException;
+using duckdb::MaxValue;
 
 static constexpr const char *META_FORMAT_VERSION = "format_version";
 static constexpr const char *META_LAST_TX = "last_tx";
 static constexpr const char *META_LAST_INSTANT = "last_instant";
 //! Followed by one partition byte
 static constexpr const char *META_NEXT_LOCAL = "next_local/";
+//! Followed by a 2-byte attribute id: the number of current datoms of the attribute
+static constexpr const char *META_COUNT = "count/";
+static constexpr const char *META_COUNTS_READY = "counts_ready";
+
+static string CountKey(AttrId attr) {
+	string key = META_COUNT;
+	PutBigEndian(key, attr, PACKED_ATTR_SIZE);
+	return key;
+}
 
 //! First local number handed out per partition; lower numbers are reserved for built-in entities
 static uint64_t FirstLocal(uint8_t part) {
@@ -72,9 +82,7 @@ const char *ColumnFamilyName(ColumnFamily cf) {
 //! is what every per-datom lookup is, then skips files that cannot contain the prefix. Iterators opt in through
 //! iterate_upper_bound + auto_prefix_mode (see ReadView::NewIterator), so seeks spanning several prefixes still
 //! use total order. Every key is at least 13 bytes, so no key is shorter than the prefix.
-static constexpr size_t BLOOM_PREFIX_LENGTH = 8;
-
-static bool HasPrefixBloom(ColumnFamily cf) {
+bool HasPrefixBloom(ColumnFamily cf) {
 	switch (cf) {
 	case ColumnFamily::EAVT:
 	case ColumnFamily::EAVT_HIST:
@@ -90,6 +98,10 @@ static bool HasPrefixBloom(ColumnFamily cf) {
 
 static rocksdb::ColumnFamilyOptions ColumnFamilyOptionsFor(ColumnFamily cf) {
 	rocksdb::ColumnFamilyOptions options;
+	// Datoms repeat a lot (shared key prefixes, values stored in several indexes): LZ4 for the levels that churn,
+	// ZSTD for the bottommost level that holds most of the data
+	options.compression = rocksdb::kLZ4Compression;
+	options.bottommost_compression = rocksdb::kZSTD;
 	if (!HasPrefixBloom(cf)) {
 		return options;
 	}
@@ -166,6 +178,7 @@ unique_ptr<Store> Store::Open(const string &path, bool read_only) {
 
 	store->created = created;
 	store->LoadMeta(created);
+	store->LoadAttributeCounts();
 	return store;
 }
 
@@ -181,6 +194,7 @@ void Store::LoadMeta(bool created) {
 		batch.Put(&meta, META_LAST_TX, tx);
 		rocksdb::WriteOptions write_options;
 		write_options.sync = true;
+		CheckStatus(batch.Put(&meta, META_COUNTS_READY, ""), path);
 		CheckStatus(db->Write(write_options, &batch), path);
 	}
 
@@ -222,6 +236,50 @@ void Store::LoadMeta(bool created) {
 		next_local[part] = GetBigEndian(val.data(), 8);
 	}
 	CheckStatus(it->status(), path);
+}
+
+void Store::LoadAttributeCounts() {
+	auto &meta = GetHandle(ColumnFamily::META);
+	string ready;
+	auto status = db->Get(rocksdb::ReadOptions(), &meta, META_COUNTS_READY, &ready);
+	if (status.ok()) {
+		std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(rocksdb::ReadOptions(), &meta));
+		for (it->Seek(META_COUNT); it->Valid() && it->key().starts_with(META_COUNT); it->Next()) {
+			if (it->key().size() != strlen(META_COUNT) + PACKED_ATTR_SIZE || it->value().size() != 8) {
+				throw IOException("MnemonicDB: \"%s\" has a malformed attribute count", path);
+			}
+			auto attr = GetAttrId(it->key().data() + strlen(META_COUNT));
+			attribute_counts[attr] = GetBigEndian(it->value().data(), 8);
+		}
+		CheckStatus(it->status(), path);
+		return;
+	}
+	if (!status.IsNotFound()) {
+		CheckStatus(status, path);
+	}
+	// A database written before counts existed: count the current datoms once
+	std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(rocksdb::ReadOptions(), &GetHandle(ColumnFamily::AEVT)));
+	for (it->SeekToFirst(); it->Valid(); it->Next()) {
+		attribute_counts[GetAttrId(it->key().data())]++;
+	}
+	CheckStatus(it->status(), path);
+	if (read_only) {
+		return;
+	}
+	rocksdb::WriteBatch batch;
+	for (auto &entry : attribute_counts) {
+		string value;
+		PutBigEndian(value, entry.second, 8);
+		CheckStatus(batch.Put(&meta, CountKey(entry.first), value), path);
+	}
+	CheckStatus(batch.Put(&meta, META_COUNTS_READY, ""), path);
+	CheckStatus(db->Write(rocksdb::WriteOptions(), &batch), path);
+}
+
+uint64_t Store::GetAttributeCount(AttrId attr) const {
+	std::lock_guard<std::mutex> guard(count_lock);
+	auto entry = attribute_counts.find(attr);
+	return entry == attribute_counts.end() ? 0 : entry->second;
 }
 
 void Store::AcquireWriter(const std::function<void()> &check_interrupt) {
@@ -292,7 +350,8 @@ void Store::CheckAllocated(EntityId id) const {
 	}
 }
 
-void Store::Commit(rocksdb::WriteBatch &batch, TxId tx, int64_t instant) {
+void Store::Commit(rocksdb::WriteBatch &batch, TxId tx, int64_t instant,
+                   const std::unordered_map<AttrId, int64_t> &count_deltas) {
 	D_ASSERT(writer_active);
 	if (tx != last_tx + 1) {
 		throw duckdb::InternalException("MnemonicDB: committing tx %d after tx %d", tx, last_tx.load());
@@ -313,10 +372,34 @@ void Store::Commit(rocksdb::WriteBatch &batch, TxId tx, int64_t instant) {
 		CheckStatus(batch.Put(&meta, NextLocalKey(static_cast<uint8_t>(part)), value), path);
 	}
 
+	std::unordered_map<AttrId, uint64_t> new_counts;
+	{
+		std::lock_guard<std::mutex> guard(count_lock);
+		for (auto &delta : count_deltas) {
+			if (delta.second == 0) {
+				continue;
+			}
+			auto entry = attribute_counts.find(delta.first);
+			int64_t current = entry == attribute_counts.end() ? 0 : int64_t(entry->second);
+			new_counts[delta.first] = uint64_t(MaxValue<int64_t>(current + delta.second, 0));
+		}
+	}
+	for (auto &entry : new_counts) {
+		string value;
+		PutBigEndian(value, entry.second, 8);
+		CheckStatus(batch.Put(&meta, CountKey(entry.first), value), path);
+	}
+
 	rocksdb::WriteOptions write_options;
 	write_options.sync = true;
 	CheckStatus(db->Write(write_options, &batch), path);
 	next_local_dirty.fill(false);
+	{
+		std::lock_guard<std::mutex> guard(count_lock);
+		for (auto &entry : new_counts) {
+			attribute_counts[entry.first] = entry.second;
+		}
+	}
 	last_instant = instant;
 	last_tx = tx;
 }
@@ -327,6 +410,18 @@ void Store::Flush() {
 	}
 	rocksdb::FlushOptions options;
 	CheckStatus(db->Flush(options, handles), path);
+}
+
+void Store::Compact() {
+	if (read_only) {
+		throw duckdb::InvalidInputException("MnemonicDB: database \"%s\" is attached read-only", path);
+	}
+	Flush();
+	for (auto handle : handles) {
+		rocksdb::CompactRangeOptions options;
+		options.bottommost_level_compaction = rocksdb::BottommostLevelCompaction::kForce;
+		CheckStatus(db->CompactRange(options, handle, nullptr, nullptr), path);
+	}
 }
 
 uint64_t Store::ApproximateSize() {

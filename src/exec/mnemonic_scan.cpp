@@ -7,6 +7,7 @@
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -169,24 +170,20 @@ static bool VisibleAsOf(optional_idx as_of, std::string_view key, const rocksdb:
 
 //! Iterate the visible entries of `cf` (and, when reading as of a tx, its history index) under `prefix`
 template <class CALLBACK>
-static void ForEachVisible(mnemonicdb::ReadView &view, ColumnFamily cf, ColumnFamily history_cf, const string &prefix,
-                           optional_idx as_of, CALLBACK &&callback) {
-	auto scan = [&](ColumnFamily family, bool is_history) {
-		auto it = view.NewIterator(family, prefix);
-		for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
-			auto value = it->value();
-			std::string_view key(it->key().data(), it->key().size());
-			if (VisibleAsOf(as_of, key, is_history ? &value : nullptr)) {
+static void ForEachVisible(mnemonicdb::PrefixReader &reader, ColumnFamily cf, ColumnFamily history_cf,
+                           const string &prefix, optional_idx as_of, CALLBACK &&callback) {
+	reader.Scan(cf, prefix, [&](std::string_view key, std::string_view) {
+		if (VisibleAsOf(as_of, key, nullptr)) {
+			callback(key);
+		}
+	});
+	if (as_of.IsValid()) {
+		reader.Scan(history_cf, prefix, [&](std::string_view key, std::string_view value) {
+			rocksdb::Slice value_slice(value.data(), value.size());
+			if (VisibleAsOf(as_of, key, &value_slice)) {
 				callback(key);
 			}
-		}
-		if (!it->status().ok()) {
-			throw IOException("MnemonicDB: RocksDB error: %s", it->status().ToString());
-		}
-	};
-	scan(cf, false);
-	if (as_of.IsValid()) {
-		scan(history_cf, true);
+		});
 	}
 }
 
@@ -241,6 +238,7 @@ struct MnemonicScanState : public GlobalTableFunctionState {
 	vector<AttributeCursor> cursors;
 	//! Lookup mode: the candidate entities, sorted, and the next one to produce
 	bool lookup_mode = false;
+	unique_ptr<mnemonicdb::PrefixReader> reader;
 	vector<EntityId> candidates;
 	idx_t next_candidate = 0;
 
@@ -593,6 +591,7 @@ static unique_ptr<GlobalTableFunctionState> MnemonicScanInit(ClientContext &cont
 		}
 	}
 	if (state->lookup_mode) {
+		state->reader = make_uniq<mnemonicdb::PrefixReader>(view);
 		std::sort(state->candidates.begin(), state->candidates.end());
 		state->candidates.erase(std::unique(state->candidates.begin(), state->candidates.end()),
 		                        state->candidates.end());
@@ -700,7 +699,7 @@ static bool NextCandidate(MnemonicScanState &state, mnemonicdb::ReadView &view, 
 		for (idx_t a = 0; a < state.attributes.size(); a++) {
 			auto &attr = state.attributes[a].attr.get();
 			auto prefix = mnemonicdb::EavtPrefix(entity, attr.Local());
-			ForEachVisible(view, ColumnFamily::EAVT, ColumnFamily::EAVT_HIST, prefix, as_of, [&](std::string_view key) {
+			ForEachVisible(*state.reader, ColumnFamily::EAVT, ColumnFamily::EAVT_HIST, prefix, as_of, [&](std::string_view key) {
 				any = true;
 				values[a].emplace_back(key.substr(head, key.size() - head - mnemonicdb::PACKED_TX_SIZE));
 			});
@@ -814,11 +813,47 @@ static optional_idx ResolveAtClause(ClientContext &context, MnemonicTableEntry &
 	return optional_idx(tx);
 }
 
+//! Estimated rows of one table: the largest current-datom count of its single-valued attributes (a list column
+//! has one datom per element), falling back to list columns for tables that only have those
+static idx_t EstimateTableRows(MnemonicTableEntry &table) {
+	auto &store = table.catalog.Cast<MnemonicCatalog>().GetStore();
+	idx_t single = 0;
+	idx_t many = 0;
+	for (idx_t a = 1; a <= table.GetTableDef().attributes.size(); a++) {
+		auto &attr = table.GetAttribute(a);
+		auto count = store.GetAttributeCount(attr.Local());
+		if (attr.many) {
+			many = MaxValue<idx_t>(many, count);
+		} else {
+			single = MaxValue<idx_t>(single, count);
+		}
+	}
+	return single > 0 ? single : many;
+}
+
+idx_t EstimateScanRows(const MnemonicScanBindData &bind_data) {
+	optional_idx required_rows;
+	idx_t any_rows = 0;
+	for (auto &table : bind_data.tables) {
+		auto rows = EstimateTableRows(table.table.get());
+		any_rows = MaxValue(any_rows, rows);
+		if (table.required) {
+			required_rows = required_rows.IsValid() ? MinValue(required_rows.GetIndex(), rows) : rows;
+		}
+	}
+	return required_rows.IsValid() ? required_rows.GetIndex() : any_rows;
+}
+
+static unique_ptr<NodeStatistics> MnemonicScanCardinality(ClientContext &, const FunctionData *bind_data) {
+	return make_uniq<NodeStatistics>(EstimateScanRows(bind_data->Cast<MnemonicScanBindData>()));
+}
+
 static TableFunction BaseScanFunction() {
 	TableFunction function("mnemonicdb_scan", {}, MnemonicScan, nullptr, MnemonicScanInit);
 	function.projection_pushdown = true;
 	function.filter_pushdown = true;
 	function.filter_prune = true;
+	function.cardinality = MnemonicScanCardinality;
 	return function;
 }
 
