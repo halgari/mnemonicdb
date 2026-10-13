@@ -59,6 +59,9 @@ public:
 	                             PhysicalOperator &plan) override;
 
 	DatabaseSize GetDatabaseSize(ClientContext &context) override;
+	bool SupportsTimeTravel() const override {
+		return true;
+	}
 	bool InMemory() override {
 		return false;
 	}

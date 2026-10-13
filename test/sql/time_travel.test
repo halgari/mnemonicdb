@@ -1,0 +1,389 @@
+# name: test/sql/time_travel.test
+# description: AT (VERSION => n) and AT (TIMESTAMP => ts) read the database as of an earlier transaction
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/time_travel.mnemonic' AS d (TYPE mnemonicdb)
+
+# Timeline. Version numbers below are tx local numbers (mnemonicdb_id_local(sys.tx.id)).
+#  tx 1   bootstrap
+#  tx 2   CREATE TABLE person
+#  tx 3   CREATE TABLE account
+#  tx 4   Alice (30, [a, b]) and Bob (40, [x]) join person
+#  tx 5   Alice: age 31, tags [a, c]
+#  tx 6   Alice joins account (100)
+#  tx 7   Carol joins person
+#  tx 8   Bob deleted from person
+#  tx 9   Alice's tags get 'd'; Alice's balance 150   (one transaction)
+#  tx 10  Carol 50 -> 99 -> 50; Dave inserted with age 1, then age set to NULL   (one transaction)
+#  tx 11  Alice deleted from person (still in account)
+#  tx 12  Bob rejoins person with the same entity id and a new email
+#  tx 13  CREATE TABLE later
+
+statement ok
+CREATE TABLE d.person (name VARCHAR, email VARCHAR PRIMARY KEY, tags VARCHAR[], age INTEGER)
+
+statement ok
+CREATE TABLE d.account (balance DECIMAL(18,2))
+
+statement ok
+INSERT INTO d.person (name, email, tags, age) VALUES ('Alice', 'alice@x.com', ['a', 'b'], 30), ('Bob', 'bob@x.com', ['x'], 40)
+
+statement ok
+UPDATE d.person SET age = 31, tags = ['c', 'a'] WHERE name = 'Alice'
+
+statement ok
+INSERT INTO d.account (id, balance) SELECT id, 100 FROM d.person WHERE name = 'Alice'
+
+statement ok
+INSERT INTO d.person (name, email, age) VALUES ('Carol', 'carol@x.com', 50)
+
+statement ok
+DELETE FROM d.person WHERE name = 'Bob'
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE d.person SET tags = list_append(tags, 'd') WHERE name = 'Alice'
+
+statement ok
+UPDATE d.account SET balance = 150
+
+statement ok
+COMMIT
+
+# Retract then re-assert (Carol's age) restores the original datom; assert then retract (Dave's age) leaves no trace
+statement ok
+BEGIN
+
+statement ok
+UPDATE d.person SET age = 99 WHERE name = 'Carol'
+
+statement ok
+UPDATE d.person SET age = 50 WHERE name = 'Carol'
+
+statement ok
+INSERT INTO d.person (name, email, age) VALUES ('Dave', 'dave@x.com', 1)
+
+statement ok
+UPDATE d.person SET age = NULL WHERE name = 'Dave'
+
+statement ok
+COMMIT
+
+statement ok
+DELETE FROM d.person WHERE name = 'Alice'
+
+statement ok
+SET VARIABLE bob = (SELECT id FROM d.person AT (VERSION => 4) WHERE name = 'Bob')
+
+statement ok
+INSERT INTO d.person (id, name, email) VALUES (getvariable('bob'), 'Bob', 'bob2@x.com')
+
+statement ok
+CREATE TABLE d.later (x INTEGER)
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+13
+
+# Every committed transaction has a sys.tx row; instants strictly increase
+query II
+SELECT count(*), max(mnemonicdb_id_local(id)) FROM d.sys.tx
+----
+13	13
+
+query I
+SELECT count(*) FROM (SELECT instant, lag(instant) OVER (ORDER BY id) AS prev FROM d.sys.tx) WHERE prev >= instant
+----
+0
+
+#
+# AT (VERSION => n): person at every version.
+# Shows values before/after UPDATE, deleted entities still visible in the past, cardinality-many sets
+# as of earlier transactions, entities that joined later absent in the past, and empty results
+# before the table had data (including versions before the table existed: data is read through the current schema).
+#
+
+query ITTTI
+SELECT 1 AS v, name, email, tags, age FROM d.person AT (VERSION => 1)
+UNION ALL SELECT 2, name, email, tags, age FROM d.person AT (VERSION => 2)
+UNION ALL SELECT 3, name, email, tags, age FROM d.person AT (VERSION => 3)
+UNION ALL SELECT 4, name, email, tags, age FROM d.person AT (VERSION => 4)
+UNION ALL SELECT 5, name, email, tags, age FROM d.person AT (VERSION => 5)
+UNION ALL SELECT 6, name, email, tags, age FROM d.person AT (VERSION => 6)
+UNION ALL SELECT 7, name, email, tags, age FROM d.person AT (VERSION => 7)
+UNION ALL SELECT 8, name, email, tags, age FROM d.person AT (VERSION => 8)
+UNION ALL SELECT 9, name, email, tags, age FROM d.person AT (VERSION => 9)
+UNION ALL SELECT 10, name, email, tags, age FROM d.person AT (VERSION => 10)
+UNION ALL SELECT 11, name, email, tags, age FROM d.person AT (VERSION => 11)
+UNION ALL SELECT 12, name, email, tags, age FROM d.person AT (VERSION => 12)
+UNION ALL SELECT 13, name, email, tags, age FROM d.person AT (VERSION => 13)
+ORDER BY v, name
+----
+4	Alice	alice@x.com	[a, b]	30
+4	Bob	bob@x.com	[x]	40
+5	Alice	alice@x.com	[a, c]	31
+5	Bob	bob@x.com	[x]	40
+6	Alice	alice@x.com	[a, c]	31
+6	Bob	bob@x.com	[x]	40
+7	Alice	alice@x.com	[a, c]	31
+7	Bob	bob@x.com	[x]	40
+7	Carol	carol@x.com	NULL	50
+8	Alice	alice@x.com	[a, c]	31
+8	Carol	carol@x.com	NULL	50
+9	Alice	alice@x.com	[a, c, d]	31
+9	Carol	carol@x.com	NULL	50
+10	Alice	alice@x.com	[a, c, d]	31
+10	Carol	carol@x.com	NULL	50
+10	Dave	dave@x.com	NULL	NULL
+11	Carol	carol@x.com	NULL	50
+11	Dave	dave@x.com	NULL	NULL
+12	Bob	bob2@x.com	NULL	NULL
+12	Carol	carol@x.com	NULL	50
+12	Dave	dave@x.com	NULL	NULL
+13	Bob	bob2@x.com	NULL	NULL
+13	Carol	carol@x.com	NULL	50
+13	Dave	dave@x.com	NULL	NULL
+
+# The latest version equals the current state
+query TTTI
+SELECT name, email, tags, age FROM d.person ORDER BY name
+----
+Bob	bob2@x.com	NULL	NULL
+Carol	carol@x.com	NULL	50
+Dave	dave@x.com	NULL	NULL
+
+# account: Alice joined at tx 6, balance changed at tx 9, and she is still there after leaving person
+query IR
+SELECT 3 AS v, balance FROM d.account AT (VERSION => 3)
+UNION ALL SELECT 5, balance FROM d.account AT (VERSION => 5)
+UNION ALL SELECT 6, balance FROM d.account AT (VERSION => 6)
+UNION ALL SELECT 8, balance FROM d.account AT (VERSION => 8)
+UNION ALL SELECT 9, balance FROM d.account AT (VERSION => 9)
+UNION ALL SELECT 11, balance FROM d.account AT (VERSION => 11)
+ORDER BY v
+----
+6	100.00
+8	100.00
+9	150.00
+11	150.00
+
+# A table created after the version asked for reads as empty
+query I
+SELECT count(*) FROM d.later AT (VERSION => 4)
+----
+0
+
+# Filters apply to the as-of data
+query T
+SELECT name FROM d.person AT (VERSION => 7) WHERE age > 45
+----
+Carol
+
+query TI
+SELECT name, age FROM d.person AT (VERSION => 4) WHERE email = 'bob@x.com'
+----
+Bob	40
+
+# Entity ids are stable over time: Bob at tx 4 and Bob now are the same entity
+query TT
+SELECT old.email, p.email FROM d.person old AT (VERSION => 4) JOIN d.person p ON p.id = old.id
+----
+bob@x.com	bob2@x.com
+
+# A full tx id from sys.tx is accepted as VERSION too (tx 5 = partition 2, local 5)
+query TI
+SELECT name, age FROM d.person AT (VERSION => 144115188075855877) ORDER BY name
+----
+Alice	31
+Bob	40
+
+#
+# Joins where the two sides are read at different versions
+#
+
+query TIR
+SELECT p.name, p.age, a.balance FROM d.person p AT (VERSION => 5) JOIN d.account a AT (VERSION => 9) ON a.id = p.id
+----
+Alice	31	150.00
+
+# Current account joined with a past person: Alice is gone from person now, but visible at tx 10
+query TR
+SELECT p.name, a.balance FROM d.account a JOIN d.person p AT (VERSION => 10) ON p.id = a.id
+----
+Alice	150.00
+
+query I
+SELECT count(*) FROM d.account a AT (VERSION => 6) JOIN d.person p ON p.id = a.id
+----
+0
+
+# Same table at two versions: what changed between tx 4 and tx 7
+query TII
+SELECT old.name, old.age, new.age FROM d.person old AT (VERSION => 4) JOIN d.person new AT (VERSION => 7) ON new.id = old.id ORDER BY old.name
+----
+Alice	30	31
+Bob	40	40
+
+# Who from tx 7 is still in person now
+query TT
+SELECT old.name, cur.name FROM d.person old AT (VERSION => 7) LEFT JOIN d.person cur ON cur.id = old.id ORDER BY old.name
+----
+Alice	NULL
+Bob	Bob
+Carol	Carol
+
+#
+# AT on sys tables: schema history
+#
+
+query T
+SELECT name FROM d.sys.tables AT (VERSION => 1) ORDER BY id
+----
+tables
+attributes
+tx
+
+query T
+SELECT name FROM d.sys.tables AT (VERSION => 2) WHERE schema = 'main' ORDER BY id
+----
+person
+
+query T
+SELECT name FROM d.sys.tables AT (VERSION => 12) WHERE schema = 'main' ORDER BY id
+----
+person
+account
+
+query T
+SELECT name FROM d.sys.tables WHERE schema = 'main' ORDER BY id
+----
+person
+account
+later
+
+query T
+SELECT name FROM d.sys.attributes AT (VERSION => 2) WHERE mnemonicdb_id_local(id) >= 64 ORDER BY id
+----
+name
+email
+tags
+age
+
+query T
+SELECT name FROM d.sys.attributes AT (VERSION => 3) WHERE mnemonicdb_id_local(id) >= 64 ORDER BY id
+----
+name
+email
+tags
+age
+balance
+
+query II
+SELECT count(*), max(mnemonicdb_id_local(id)) FROM d.sys.tx AT (VERSION => 5)
+----
+5	5
+
+#
+# AT (TIMESTAMP => ts): the latest tx whose instant <= ts.
+# Timestamps are derived from sys.tx.instant, never from the wall clock.
+#
+
+statement ok
+SET VARIABLE t5 = (SELECT instant FROM d.sys.tx WHERE mnemonicdb_id_local(id) = 5)
+
+statement ok
+SET VARIABLE before_t5 = (SELECT make_timestamp(epoch_us(instant) - 1)::TIMESTAMPTZ FROM d.sys.tx WHERE mnemonicdb_id_local(id) = 5)
+
+statement ok
+SET VARIABLE between_8_9 = (
+	SELECT make_timestamp((epoch_us(a.instant) + epoch_us(b.instant)) // 2)::TIMESTAMPTZ
+	FROM d.sys.tx a, d.sys.tx b WHERE mnemonicdb_id_local(a.id) = 8 AND mnemonicdb_id_local(b.id) = 9)
+
+# Exactly at tx 5's instant: tx 5 is included
+query TTI
+SELECT name, tags, age FROM d.person AT (TIMESTAMP => getvariable('t5')) ORDER BY name
+----
+Alice	[a, c]	31
+Bob	[x]	40
+
+# One microsecond earlier: tx 4
+query TTI
+SELECT name, tags, age FROM d.person AT (TIMESTAMP => getvariable('before_t5')) ORDER BY name
+----
+Alice	[a, b]	30
+Bob	[x]	40
+
+# Between two instants: the earlier tx
+query TTI
+SELECT name, tags, age FROM d.person AT (TIMESTAMP => getvariable('between_8_9')) ORDER BY name
+----
+Alice	[a, c]	31
+Carol	NULL	50
+
+query I
+SELECT max(mnemonicdb_id_local(id)) FROM d.sys.tx AT (TIMESTAMP => getvariable('between_8_9'))
+----
+8
+
+# The tx's own instant, read as of that tx
+query I
+SELECT instant = getvariable('t5') FROM d.sys.tx AT (VERSION => 5) WHERE mnemonicdb_id_local(id) = 5
+----
+true
+
+# Far in the future: the latest tx
+query T
+SELECT name FROM d.person AT (TIMESTAMP => TIMESTAMPTZ '2999-01-01 00:00:00+00') ORDER BY name
+----
+Bob
+Carol
+Dave
+
+# VERSION and TIMESTAMP sides in one join
+query TR
+SELECT p.name, a.balance FROM d.person p AT (TIMESTAMP => getvariable('between_8_9')) JOIN d.account a AT (VERSION => 6) ON a.id = p.id
+----
+Alice	100.00
+
+#
+# Errors
+#
+
+# A version after the last committed tx
+statement error
+SELECT * FROM d.person AT (VERSION => 14)
+----
+later than the last committed transaction
+
+# An unknown AT unit (DuckDB's grammar only knows VERSION and TIMESTAMP, so this fails in the parser)
+statement error
+SELECT * FROM d.person AT (SNAPSHOT => 1)
+----
+Parser Error
+
+#
+# History survives reattaching
+#
+
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/time_travel.mnemonic' AS d (TYPE mnemonicdb)
+
+query TTI
+SELECT name, tags, age FROM d.person AT (VERSION => 9) ORDER BY name
+----
+Alice	[a, c, d]	31
+Carol	NULL	50
+
+query TR
+SELECT p.name, a.balance FROM d.person p AT (VERSION => 8) JOIN d.account a AT (VERSION => 6) ON a.id = p.id
+----
+Alice	100.00

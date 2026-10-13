@@ -56,8 +56,12 @@ TxWriter::TxWriter(Store &store_p, const rocksdb::Snapshot *snapshot, TxId tx_p)
 
 TxWriter::~TxWriter() = default;
 
-bool TxWriter::HasChanges() const {
-	return batch->GetWriteBatch()->Count() > 0;
+bool TxWriter::HasChanges() {
+	// Writes that cancel out leave deletes in the batch but no txlog entry for this transaction
+	auto prefix = TxlogPrefix(tx);
+	auto it = view.NewIterator(ColumnFamily::TXLOG);
+	it->Seek(prefix);
+	return it->Valid() && it->key().starts_with(prefix);
 }
 
 rocksdb::WriteBatch &TxWriter::GetWriteBatch() {

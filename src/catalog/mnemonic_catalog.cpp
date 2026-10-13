@@ -1,5 +1,6 @@
 #include "mnemonicdb/mnemonic_catalog.hpp"
 #include "mnemonicdb/mnemonic_insert.hpp"
+#include "mnemonicdb/mnemonic_modify.hpp"
 #include "mnemonicdb/mnemonic_schema_entry.hpp"
 #include "mnemonicdb/mnemonic_table_entry.hpp"
 #include "mnemonicdb/mnemonic_transaction.hpp"
@@ -136,14 +137,14 @@ PhysicalOperator &MnemonicCatalog::PlanInsert(ClientContext &context, PhysicalPl
 	return PlanMnemonicInsert(context, planner, op, plan);
 }
 
-PhysicalOperator &MnemonicCatalog::PlanDelete(ClientContext &, PhysicalPlanGenerator &, LogicalDelete &,
-                                              PhysicalOperator &) {
-	throw NotImplementedException("MnemonicDB does not support DELETE yet");
+PhysicalOperator &MnemonicCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
+                                              LogicalDelete &op, PhysicalOperator &plan) {
+	return PlanMnemonicDelete(context, planner, op, plan);
 }
 
-PhysicalOperator &MnemonicCatalog::PlanUpdate(ClientContext &, PhysicalPlanGenerator &, LogicalUpdate &,
-                                              PhysicalOperator &) {
-	throw NotImplementedException("MnemonicDB does not support UPDATE yet");
+PhysicalOperator &MnemonicCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
+                                              LogicalUpdate &op, PhysicalOperator &plan) {
+	return PlanMnemonicUpdate(context, planner, op, plan);
 }
 
 DatabaseSize MnemonicCatalog::GetDatabaseSize(ClientContext &) {

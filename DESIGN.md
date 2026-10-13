@@ -207,8 +207,9 @@ to start with.
 
 ### `AT` clause
 
-- `AT (VERSION => n)`: `n` is the tx local number (an `id` from `sys.tx`
-  is also accepted).
+- `AT (VERSION => n)`: `n` is the tx local number, or the full `id` of a
+  `sys.tx` row. A version later than the reading transaction's basis is an
+  error.
 - `AT (TIMESTAMP => ts)`: the latest tx whose `sys.tx.instant <= ts`. Tx
   instants are monotonic, so this is a seek on `sys.tx/instant` (always
   AVET-indexed).
@@ -250,6 +251,11 @@ database into a single merge join.
 5. **Rollback.** Drop the batch and release the mutex. The tx ID and any
    allocated entity IDs are wasted.
 
+A transaction whose writes cancel out (assert then retract, retract then
+re-assert, DELETE then re-INSERT of the same values) changes no datom. It
+commits nothing and gets no `sys.tx` row. "Changed" means at least one
+`txlog` entry for the transaction remains in the batch.
+
 ### Tempids
 
 - `tempid('label')` returns a placeholder in partition `temp`. Placeholders
@@ -283,7 +289,9 @@ database into a single merge join.
   different current value. A unique-value conflict is an error. A
   unique-identity conflict is an error unless `ON CONFLICT (col) DO UPDATE`,
   in which case it upserts into the existing entity.
-- **UPDATE** compares old and new values. Cardinality-one: retract and
+- **UPDATE** compares old and new values. Cardinality-many columns compare
+  as sets, so a reordered or duplicated list equal to the current set is a
+  no-op, and `[]` retracts every element (reads back as NULL). Cardinality-one: retract and
   assert, or skip if unchanged. Cardinality-many: retract the removed
   elements and assert the added ones, so `SET tags = list_append(tags, 'x')`
   works.

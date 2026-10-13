@@ -1,0 +1,703 @@
+# name: test/sql/update_delete.test
+# description: UPDATE and DELETE retract and assert datoms; redundant writes are skipped; cardinality-many is a set; write conflicts
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/update_delete.mnemonic' AS d (TYPE mnemonicdb)
+
+# tx 2
+statement ok
+CREATE TABLE d.person (name VARCHAR, email VARCHAR PRIMARY KEY, nick VARCHAR UNIQUE, tags VARCHAR[], age INTEGER)
+
+# tx 3
+statement ok
+CREATE TABLE d.account (balance DECIMAL(18,2))
+
+# tx 4
+statement ok
+INSERT INTO d.person (name, email, nick, tags, age) VALUES
+	('Alice', 'alice@x.com', 'al', ['a', 'b'], 30),
+	('Bob', 'bob@x.com', 'bobby', ['x'], 40),
+	('Carol', 'carol@x.com', NULL, NULL, 50),
+	('Dave', 'dave@x.com', 'dd', ['d'], 60)
+
+# tx 5: Alice, Bob and Dave also get account attributes on the same entities
+statement ok
+INSERT INTO d.account (id, balance)
+SELECT id, CASE name WHEN 'Alice' THEN 100 WHEN 'Bob' THEN 200 ELSE 300 END FROM d.person WHERE name <> 'Carol'
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+5
+
+#
+# Cardinality-one: retract the old value, assert the new one
+#
+
+# tx 6
+statement ok
+UPDATE d.person SET age = 31 WHERE name = 'Alice'
+
+query TI
+SELECT name, age FROM d.person ORDER BY name
+----
+Alice	31
+Bob	40
+Carol	50
+Dave	60
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+6
+
+# Redundant writes are skipped: an UPDATE that changes nothing commits no transaction
+statement ok
+UPDATE d.person SET age = 31 WHERE name = 'Alice'
+
+statement ok
+UPDATE d.person SET age = age, name = name, tags = tags
+
+statement ok
+UPDATE d.person SET age = 99 WHERE name = 'nobody'
+
+# Cardinality-many compares as a set: same elements in a different order are unchanged
+statement ok
+UPDATE d.person SET tags = ['b', 'a', 'b'] WHERE name = 'Alice'
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+6
+
+# tx 7: several rows and columns at once; Carol's NULL nick stays NULL (no change for that column)
+statement ok
+UPDATE d.person SET age = age + 1, nick = upper(nick) WHERE age >= 40
+
+query TTI
+SELECT name, nick, age FROM d.person ORDER BY name
+----
+Alice	al	31
+Bob	BOBBY	41
+Carol	NULL	51
+Dave	DD	61
+
+#
+# Setting a column to NULL retracts the attribute
+#
+
+# tx 8
+statement ok
+UPDATE d.person SET age = NULL, tags = NULL WHERE name = 'Bob'
+
+query TTTTI
+SELECT name, email, nick, tags, age FROM d.person WHERE email = 'bob@x.com'
+----
+Bob	bob@x.com	BOBBY	NULL	NULL
+
+# Bob still has attributes of person, so he is still a member
+query I
+SELECT count(*) FROM d.person
+----
+4
+
+# tx 9: retracting the entity's last person attributes removes it from person...
+statement ok
+UPDATE d.person SET name = NULL, email = NULL, nick = NULL WHERE email = 'bob@x.com'
+
+query T
+SELECT name FROM d.person ORDER BY name
+----
+Alice
+Carol
+Dave
+
+# ...but it stays in account
+query RT
+SELECT a.balance, p.name FROM d.account a LEFT JOIN d.person p ON p.id = a.id ORDER BY a.balance
+----
+100.00	Alice
+200.00	NULL
+300.00	Dave
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+9
+
+# tx 10: the entity can rejoin person; old values are not resurrected, and its old unique email is free again
+statement ok
+INSERT INTO d.person (id, name, email) SELECT id, 'Bob', 'bob@x.com' FROM d.account WHERE balance = 200
+
+query TTTTI
+SELECT name, email, nick, tags, age FROM d.person ORDER BY name
+----
+Alice	alice@x.com	al	[a, b]	31
+Bob	bob@x.com	NULL	NULL	NULL
+Carol	carol@x.com	NULL	NULL	51
+Dave	dave@x.com	DD	[d]	61
+
+query I
+SELECT count(*) FROM d.person p JOIN d.account a ON a.id = p.id WHERE p.name = 'Bob' AND a.balance = 200
+----
+1
+
+#
+# Cardinality-many: the new list replaces the set
+#
+
+# tx 11: 'b' retracted, 'c' asserted, 'a' untouched
+statement ok
+UPDATE d.person SET tags = ['c', 'a'] WHERE name = 'Alice'
+
+query T
+SELECT tags FROM d.person WHERE name = 'Alice'
+----
+[a, c]
+
+# tx 12: list_append adds one element; elements come back sorted
+statement ok
+UPDATE d.person SET tags = list_append(tags, 'b') WHERE name = 'Alice'
+
+query T
+SELECT tags FROM d.person WHERE name = 'Alice'
+----
+[a, b, c]
+
+# Appending an element already present, or rewriting the same set, changes nothing
+statement ok
+UPDATE d.person SET tags = list_append(tags, 'a') WHERE name = 'Alice'
+
+statement ok
+UPDATE d.person SET tags = ['c', 'b', 'a', 'b'] WHERE name = 'Alice'
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+12
+
+# tx 13: setting a list on an entity that had none; duplicates collapse
+statement ok
+UPDATE d.person SET tags = ['z', 'z', 'y', 'y'] WHERE name = 'Carol'
+
+query T
+SELECT tags FROM d.person WHERE name = 'Carol'
+----
+[y, z]
+
+# tx 14: removing one element
+statement ok
+UPDATE d.person SET tags = list_filter(tags, lambda x: x <> 'b') WHERE name = 'Alice'
+
+query T
+SELECT tags FROM d.person WHERE name = 'Alice'
+----
+[a, c]
+
+# tx 15: elements are ordered by encoded value (VARCHAR: bytewise, so 'B' < '_' < 'a')
+statement ok
+UPDATE d.person SET tags = ['b', 'B', 'a', '_'] WHERE name = 'Dave'
+
+query T
+SELECT tags FROM d.person WHERE name = 'Dave'
+----
+[B, _, a, b]
+
+# tx 16: an empty list is the empty set: every element is retracted and the column reads as NULL
+statement ok
+UPDATE d.person SET tags = [] WHERE name = 'Dave'
+
+query TT
+SELECT name, tags FROM d.person WHERE name = 'Dave'
+----
+Dave	NULL
+
+# NULL elements are rejected, and the failed statement commits nothing
+statement error
+UPDATE d.person SET tags = ['ok', NULL] WHERE name = 'Alice'
+----
+cannot hold NULL elements
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+16
+
+# tx 17: list_append over every row (list_append on a NULL list gives a one-element list)
+statement ok
+UPDATE d.person SET tags = list_append(tags, 'all')
+
+query TT
+SELECT name, tags FROM d.person ORDER BY name
+----
+Alice	[a, all, c]
+Bob	[all]
+Carol	[all, y, z]
+Dave	[all]
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+17
+
+#
+# Unique and identity constraints
+#
+
+# PRIMARY KEY (identity) taken by another entity
+statement error
+UPDATE d.person SET email = 'alice@x.com' WHERE name = 'Carol'
+----
+Duplicate key
+
+# UNIQUE (value) taken by another entity
+statement error
+UPDATE d.person SET nick = 'al' WHERE name = 'Dave'
+----
+Duplicate key
+
+# Two rows in one statement given the same new unique value
+statement error
+UPDATE d.person SET nick = 'same' WHERE name IN ('Carol', 'Dave')
+----
+Duplicate key
+
+# Failed statements leave nothing behind
+query TTT
+SELECT name, email, nick FROM d.person ORDER BY name
+----
+Alice	alice@x.com	al
+Bob	bob@x.com	NULL
+Carol	carol@x.com	NULL
+Dave	dave@x.com	DD
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+17
+
+# tx 18: changing your own unique value is fine
+statement ok
+UPDATE d.person SET email = 'carol@y.com' WHERE name = 'Carol'
+
+# tx 19: a unique value freed earlier in the same transaction can be taken by another entity
+statement ok
+BEGIN
+
+statement ok
+UPDATE d.person SET nick = NULL WHERE name = 'Alice'
+
+statement ok
+UPDATE d.person SET nick = 'al' WHERE name = 'Carol'
+
+statement ok
+COMMIT
+
+query TTT
+SELECT name, email, nick FROM d.person ORDER BY name
+----
+Alice	alice@x.com	NULL
+Bob	bob@x.com	NULL
+Carol	carol@y.com	al
+Dave	dave@x.com	DD
+
+# The id column cannot be updated
+statement error
+UPDATE d.person SET id = 12345 WHERE name = 'Alice'
+----
+the id column cannot be updated
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+19
+
+#
+# UPDATE ... FROM
+#
+
+statement ok
+CREATE TABLE raises (email VARCHAR, amount INTEGER)
+
+statement ok
+INSERT INTO raises VALUES ('alice@x.com', 5), ('carol@y.com', 10), ('nobody@x.com', 1)
+
+# tx 20: FROM a regular DuckDB table
+statement ok
+UPDATE d.person p SET age = p.age + r.amount FROM raises r WHERE r.email = p.email
+
+query TI
+SELECT name, age FROM d.person ORDER BY name
+----
+Alice	36
+Bob	NULL
+Carol	61
+Dave	61
+
+# tx 21: FROM another MnemonicDB table, joined on the shared entity id
+statement ok
+UPDATE d.account a SET balance = a.balance + p.age FROM d.person p WHERE p.id = a.id AND p.name = 'Alice'
+
+query RT
+SELECT a.balance, p.name FROM d.account a LEFT JOIN d.person p ON p.id = a.id ORDER BY a.balance
+----
+136.00	Alice
+200.00	Bob
+300.00	Dave
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+21
+
+#
+# DELETE: retract every attribute of this table; the entity stays in other tables
+#
+
+# tx 22
+statement ok
+DELETE FROM d.person WHERE name = 'Dave'
+
+query T
+SELECT name FROM d.person ORDER BY name
+----
+Alice
+Bob
+Carol
+
+query RT
+SELECT a.balance, p.name FROM d.account a LEFT JOIN d.person p ON p.id = a.id ORDER BY a.balance
+----
+136.00	Alice
+200.00	Bob
+300.00	NULL
+
+# A DELETE that matches nothing commits nothing
+statement ok
+DELETE FROM d.person WHERE name = 'nobody'
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+22
+
+# tx 23: DELETE then re-INSERT of the same entity id; the deleted unique values are free again,
+# and attributes that were not re-inserted stay gone
+statement ok
+INSERT INTO d.person (id, name, email, nick) SELECT id, 'Dave', 'dave@x.com', 'DD' FROM d.account WHERE balance = 300
+
+query TTTTI
+SELECT name, email, nick, tags, age FROM d.person WHERE name = 'Dave'
+----
+Dave	dave@x.com	DD	NULL	NULL
+
+query RT
+SELECT a.balance, p.name FROM d.account a JOIN d.person p ON p.id = a.id ORDER BY a.balance
+----
+136.00	Alice
+200.00	Bob
+300.00	Dave
+
+# tx 24: deleting from account leaves person untouched
+statement ok
+DELETE FROM d.account WHERE balance = 200
+
+query I
+SELECT count(*) FROM d.account
+----
+2
+
+# tx 25: DELETE without WHERE empties the table, other tables keep the entities
+statement ok
+DELETE FROM d.account
+
+query I
+SELECT count(*) FROM d.account
+----
+0
+
+query T
+SELECT name FROM d.person ORDER BY name
+----
+Alice
+Bob
+Carol
+Dave
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+25
+
+#
+# Within one transaction
+#
+
+# tx 26: assert then retract of the same value leaves no trace (Eve's age, all of Frank);
+# reads inside the transaction see the transaction's own writes
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.person (name, email) VALUES ('Eve', 'eve@x.com'), ('Frank', 'frank@x.com')
+
+statement ok
+UPDATE d.person SET age = 70 WHERE name = 'Eve'
+
+query TI
+SELECT name, age FROM d.person WHERE name = 'Eve'
+----
+Eve	70
+
+statement ok
+UPDATE d.person SET age = NULL WHERE name = 'Eve'
+
+statement ok
+DELETE FROM d.person WHERE name = 'Frank'
+
+query TI
+SELECT name, age FROM d.person WHERE name IN ('Eve', 'Frank')
+----
+Eve	NULL
+
+statement ok
+COMMIT
+
+query TTTTI
+SELECT name, email, nick, tags, age FROM d.person ORDER BY name
+----
+Alice	alice@x.com	NULL	[a, all, c]	36
+Bob	bob@x.com	NULL	[all]	NULL
+Carol	carol@y.com	al	[all, y, z]	61
+Dave	dave@x.com	DD	NULL	NULL
+Eve	eve@x.com	NULL	NULL	NULL
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+26
+
+# A transaction whose writes cancel out commits nothing:
+# retract then re-assert restores the original datom instead of creating a new one
+statement ok
+BEGIN
+
+statement ok
+UPDATE d.person SET age = 99 WHERE name = 'Alice'
+
+statement ok
+UPDATE d.person SET age = 36 WHERE name = 'Alice'
+
+statement ok
+COMMIT
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+26
+
+statement ok
+SET VARIABLE bob = (SELECT id FROM d.person WHERE name = 'Bob')
+
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM d.person WHERE name = 'Bob'
+
+query I
+SELECT count(*) FROM d.person
+----
+4
+
+statement ok
+INSERT INTO d.person (id, name, email, tags) VALUES (getvariable('bob'), 'Bob', 'bob@x.com', ['all'])
+
+statement ok
+COMMIT
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+26
+
+query TTTTI
+SELECT name, email, nick, tags, age FROM d.person WHERE id = getvariable('bob')
+----
+Bob	bob@x.com	NULL	[all]	NULL
+
+# ROLLBACK discards UPDATEs and DELETEs
+statement ok
+BEGIN
+
+statement ok
+UPDATE d.person SET age = 0, tags = list_append(tags, 'gone')
+
+statement ok
+DELETE FROM d.person WHERE name = 'Carol'
+
+query TI
+SELECT name, age FROM d.person ORDER BY name
+----
+Alice	0
+Bob	0
+Dave	0
+Eve	0
+
+statement ok
+ROLLBACK
+
+query TTI
+SELECT name, tags, age FROM d.person ORDER BY name
+----
+Alice	[a, all, c]	36
+Bob	[all]	NULL
+Carol	[all, y, z]	61
+Dave	NULL	NULL
+Eve	NULL	NULL
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+26
+
+#
+# Write conflicts (single writer, optimistic check at the first write).
+# Only one transaction holds pending writes at a time: a second writer would block, not fail.
+#
+
+statement ok con1
+BEGIN
+
+# con1's first read fixes its basis (tx 26)
+query I con1
+SELECT age FROM d.person WHERE name = 'Alice'
+----
+36
+
+# tx 27, committed by another connection
+statement ok con2
+UPDATE d.person SET age = 37 WHERE name = 'Alice'
+
+# con1 still reads its snapshot
+query I con1
+SELECT age FROM d.person WHERE name = 'Alice'
+----
+36
+
+# con1's first write fails: a transaction committed after its basis
+statement error con1
+UPDATE d.person SET age = 40 WHERE name = 'Carol'
+----
+<REGEX>:.*TransactionContext Error:.*transaction conflict.*[Rr]etry.*
+
+statement ok con1
+ROLLBACK
+
+# tx 28: the retry sees the new data and succeeds
+query I con1
+SELECT age FROM d.person WHERE name = 'Alice'
+----
+37
+
+statement ok con1
+UPDATE d.person SET age = 40 WHERE name = 'Carol'
+
+# The same applies to DELETE
+statement ok con1
+BEGIN
+
+query I con1
+SELECT count(*) FROM d.person
+----
+5
+
+# tx 29
+statement ok con2
+UPDATE d.person SET age = 20 WHERE name = 'Bob'
+
+statement error con1
+DELETE FROM d.person WHERE name = 'Eve'
+----
+<REGEX>:.*TransactionContext Error:.*transaction conflict.*[Rr]etry.*
+
+statement ok con1
+ROLLBACK
+
+# A read-only transaction never conflicts, even if others commit meanwhile
+statement ok con1
+BEGIN
+
+query I con1
+SELECT age FROM d.person WHERE name = 'Bob'
+----
+20
+
+# tx 30
+statement ok con2
+UPDATE d.person SET age = 21 WHERE name = 'Bob'
+
+query I con1
+SELECT age FROM d.person WHERE name = 'Bob'
+----
+20
+
+statement ok con1
+COMMIT
+
+query TI
+SELECT name, age FROM d.person ORDER BY name
+----
+Alice	37
+Bob	21
+Carol	40
+Dave	NULL
+Eve	NULL
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+30
+
+#
+# Everything survives reattaching
+#
+
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/update_delete.mnemonic' AS d (TYPE mnemonicdb)
+
+query TTTTI
+SELECT name, email, nick, tags, age FROM d.person ORDER BY name
+----
+Alice	alice@x.com	NULL	[a, all, c]	37
+Bob	bob@x.com	NULL	[all]	21
+Carol	carol@y.com	al	[all, y, z]	40
+Dave	dave@x.com	DD	NULL	NULL
+Eve	eve@x.com	NULL	NULL	NULL
+
+query I
+SELECT count(*) FROM d.account
+----
+0
+
+# One sys.tx row per committed transaction: locals 1..30 with no gaps, instants strictly increasing
+query IIII
+SELECT count(*), min(mnemonicdb_id_local(id)), max(mnemonicdb_id_local(id)), count(DISTINCT mnemonicdb_id_partition(id)) FROM d.sys.tx
+----
+30	1	30	1
+
+query I
+SELECT DISTINCT mnemonicdb_id_partition(id) FROM d.sys.tx
+----
+2
+
+query I
+SELECT count(*) FROM (SELECT instant, lag(instant) OVER (ORDER BY id) AS prev FROM d.sys.tx) WHERE prev >= instant
+----
+0

@@ -33,6 +33,10 @@ public:
 	}
 	//! Reads see the snapshot, plus this transaction's own writes once it writes
 	mnemonicdb::ReadView &GetReadView();
+	//! Only what was committed when this transaction began
+	mnemonicdb::ReadView &GetCommittedView() {
+		return view;
+	}
 	//! The writer of a read-write transaction
 	mnemonicdb::TxWriter &GetWriter();
 	MnemonicCatalog &GetCatalog() {

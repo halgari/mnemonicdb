@@ -45,7 +45,8 @@ public:
 	ReadView &GetView() {
 		return view;
 	}
-	bool HasChanges() const;
+	//! Whether the transaction changes any datom, after writes that cancel out
+	bool HasChanges();
 	rocksdb::WriteBatch &GetWriteBatch();
 
 	//! Current datoms of (e, a), including this transaction's writes
