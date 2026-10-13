@@ -1,0 +1,317 @@
+# name: test/sql/codec/value_ordering.test
+# description: memcmp order of mnemonicdb_encode(x) matches ORDER BY x
+# group: [codec]
+
+require mnemonicdb
+
+# Each section builds a table o_<name>(x). The loop at the end ranks every table both ways:
+# dense_rank() over x and over the encoding (BLOB compares as memcmp) must agree on every row,
+# which checks both the order and that equal values (and only those) share an encoding.
+
+#
+# Integers: dense values near zero plus ±(2^k - 1, 2^k, 2^k + 1)
+#
+
+statement ok
+CREATE TABLE int_strs AS
+WITH RECURSIVE p(k, v) AS (SELECT 0, 1::UHUGEINT UNION ALL SELECT k + 1, v * 2 FROM p WHERE k < 127)
+SELECT DISTINCT s FROM (
+	SELECT range::VARCHAR s FROM range(-300, 301)
+	UNION ALL SELECT (v - 1)::VARCHAR FROM p
+	UNION ALL SELECT v::VARCHAR FROM p
+	UNION ALL SELECT (v + 1)::VARCHAR FROM p
+	UNION ALL SELECT '-' || v::VARCHAR FROM p
+	UNION ALL SELECT '-' || (v + 1)::VARCHAR FROM p
+	UNION ALL VALUES ('340282366920938463463374607431768211455')
+) WHERE s <> '-0'
+
+foreach type TINYINT SMALLINT INTEGER BIGINT HUGEINT UTINYINT USMALLINT UINTEGER UBIGINT UHUGEINT
+
+statement ok
+CREATE TABLE o_{type} AS SELECT TRY_CAST(s AS {type}) x FROM int_strs WHERE TRY_CAST(s AS {type}) IS NOT NULL
+
+endloop
+
+# BIGNUM: also values of very different magnitudes and byte lengths
+statement ok
+CREATE TABLE o_BIGNUM AS SELECT x FROM (
+	SELECT s::BIGNUM x FROM int_strs
+	UNION ALL SELECT ('1' || repeat('0', n))::BIGNUM FROM range(30, 400, 37) r(n)
+	UNION ALL SELECT ('-1' || repeat('0', n))::BIGNUM FROM range(30, 400, 37) r(n)
+	UNION ALL SELECT ('-' || repeat('9', n))::BIGNUM FROM range(30, 400, 37) r(n)
+	UNION ALL VALUES ('-255'::BIGNUM), ('-256'::BIGNUM), ('255'::BIGNUM), ('256'::BIGNUM), ('-65536'::BIGNUM), ('65535'::BIGNUM)
+)
+
+statement ok
+CREATE TABLE o_BOOLEAN AS SELECT * FROM (VALUES (true), (false), (NULL)) t(x)
+
+# DECIMAL at each physical width (int16, int32, int64, int128)
+foreach w,s 4,1 9,4 18,6 38,10
+
+statement ok
+CREATE TABLE o_dec_{w}_{s} AS SELECT DISTINCT x FROM (
+	SELECT TRY_CAST(i.s || '.' || f AS DECIMAL({w},{s})) x
+	FROM int_strs i, (VALUES ('0'), ('05'), ('5'), ('999999')) t(f)
+) WHERE x IS NOT NULL
+
+endloop
+
+# FLOAT / DOUBLE: -inf < negatives < -0.0 = 0.0 < subnormals < positives < inf < NaN
+statement ok
+CREATE TABLE o_DOUBLE AS SELECT DISTINCT x FROM (
+	SELECT TRY_CAST(s AS DOUBLE) x FROM int_strs
+	UNION ALL SELECT pow(2.0, k) FROM range(-1074, 1024, 3) r(k)
+	UNION ALL SELECT -pow(2.0, k) FROM range(-1074, 1024, 3) r(k)
+	UNION ALL SELECT 1.0 / k FROM range(1, 300) r(k)
+	UNION ALL SELECT -1.0 / k FROM range(1, 300) r(k)
+	UNION ALL VALUES ('inf'::DOUBLE), ('-inf'::DOUBLE), ('nan'::DOUBLE), (-0.0::DOUBLE), (0.0::DOUBLE),
+	                 (4.9e-324), (-4.9e-324), (1.7976931348623157e308), (-1.7976931348623157e308), (NULL)
+)
+
+statement ok
+CREATE TABLE o_FLOAT AS SELECT DISTINCT TRY_CAST(x AS FLOAT) x FROM o_DOUBLE
+
+#
+# Dates and times
+#
+
+statement ok
+CREATE TABLE o_DATE AS SELECT x FROM (
+	SELECT DATE '1970-01-01' + r::INTEGER x FROM range(-800000, 800000, 4999) t(r)
+	UNION ALL VALUES ('infinity'::DATE), ('-infinity'::DATE), ('1969-12-31'::DATE), ('1970-01-01'::DATE), (NULL)
+)
+
+statement ok
+CREATE TABLE o_TIME AS SELECT x FROM (
+	SELECT TIME '00:00:00' + to_microseconds(r * 77777777) x FROM range(0, 1200) t(r)
+	UNION ALL VALUES ('00:00:00'::TIME), ('24:00:00'::TIME), (NULL)
+)
+
+statement ok
+CREATE TABLE o_TIME_NS AS SELECT x::TIME_NS x FROM o_TIME UNION ALL VALUES ('12:00:00.000000001'::TIME_NS), ('12:00:00.000000002'::TIME_NS)
+
+statement ok
+CREATE TABLE ts_vals AS
+SELECT x FROM generate_series(TIMESTAMP '1700-01-01', TIMESTAMP '2250-01-01', INTERVAL '9773 hours 13 minutes 7.123456 seconds') t(x)
+
+foreach type TIMESTAMP TIMESTAMP_S TIMESTAMP_MS TIMESTAMP_NS TIMESTAMPTZ TIMESTAMPTZ_NS
+
+statement ok
+CREATE TABLE o_{type} AS SELECT x FROM (
+	SELECT x::{type} x FROM ts_vals
+	UNION ALL VALUES ('infinity'::{type}), ('-infinity'::{type}), ('1969-12-31 23:59:59.999'::{type}), ('1970-01-01'::{type}), (NULL)
+)
+
+endloop
+
+#
+# Strings and blobs: prefixes of each other, bytes 0x00/0x01/0xFF, unicode
+#
+
+statement ok
+CREATE TABLE o_VARCHAR AS SELECT x FROM (
+	SELECT chr(r::INTEGER) x FROM range(0, 1000) t(r)
+	UNION ALL SELECT chr(r::INTEGER) FROM range(1000, 1114112, 3331) t(r) WHERE r NOT BETWEEN 55296 AND 57343
+	UNION ALL SELECT 'a' || chr(r::INTEGER) FROM range(0, 300) t(r)
+	UNION ALL SELECT left('abcabc', n::INTEGER) FROM range(0, 7) t(n)
+	UNION ALL SELECT repeat('a', n::INTEGER) || chr(0) FROM range(0, 4) t(n)
+	UNION ALL SELECT repeat('a', n::INTEGER) || chr(1) FROM range(0, 4) t(n)
+	UNION ALL VALUES (''), ('a' || chr(0) || 'b'), ('a' || chr(0) || chr(0)), ('é'), ('e'), ('f'), ('🦆'), ('🦆🦆'), (NULL)
+)
+
+statement ok
+CREATE TABLE bytes AS SELECT unhex(printf('%02X', r)) b FROM range(0, 256) t(r)
+
+statement ok
+CREATE TABLE o_BLOB AS SELECT x FROM (
+	SELECT b x FROM bytes
+	UNION ALL SELECT p.b || q.b FROM bytes p, bytes q WHERE p.b IN ('\x00'::BLOB, '\x01'::BLOB, '\x02'::BLOB, '\xFF'::BLOB)
+	UNION ALL SELECT p.b || q.b || r.b
+	FROM (VALUES ('\x00'::BLOB), ('\x01'::BLOB), ('\xFF'::BLOB)) p(b), (VALUES ('\x00'::BLOB), ('\x01'::BLOB), ('\xFF'::BLOB)) q(b),
+	     (VALUES ('\x00'::BLOB), ('\x01'::BLOB), ('\x02'::BLOB), ('\xFF'::BLOB)) r(b)
+	UNION ALL SELECT unhex(repeat('00', n::INTEGER)) FROM range(0, 20) t(n)
+	UNION ALL SELECT unhex(repeat('FF', n::INTEGER)) FROM range(0, 20) t(n)
+	UNION ALL VALUES (NULL::BLOB)
+)
+
+statement ok
+CREATE TABLE o_UUID AS SELECT x FROM (
+	SELECT md5(r::VARCHAR)::UUID x FROM range(0, 1000) t(r)
+	UNION ALL VALUES ('00000000-0000-0000-0000-000000000000'::UUID), ('ffffffff-ffff-ffff-ffff-ffffffffffff'::UUID),
+	                 ('7fffffff-ffff-ffff-ffff-ffffffffffff'::UUID), ('80000000-0000-0000-0000-000000000000'::UUID), (NULL)
+)
+
+# ENUMs order by declaration position, not by label text
+statement ok
+CREATE TYPE mood AS ENUM ('zeta', 'alpha', 'mid')
+
+statement ok
+CREATE TYPE big_enum AS ENUM (SELECT 'e' || (70000 - range) FROM range(70000))
+
+statement ok
+CREATE TABLE o_ENUM AS SELECT unnest(enum_range(NULL::mood))::mood x UNION ALL VALUES (NULL::mood)
+
+statement ok
+CREATE TABLE o_ENUM_big AS SELECT x FROM (SELECT unnest(enum_range(NULL::big_enum))::big_enum x) USING SAMPLE 3000 ROWS (reservoir, 42)
+
+query I
+SELECT list(x ORDER BY mnemonicdb_encode(x)) FROM o_ENUM
+----
+[zeta, alpha, mid, NULL]
+
+#
+# Nested types. Inside nested values NULL sorts after every non-NULL value (as in ORDER BY ... ASC).
+#
+
+statement ok
+CREATE TABLE o_STRUCT AS SELECT x FROM (
+	SELECT {'a': a, 'b': b} x
+	FROM (VALUES (NULL), (-1), (0), (1)) t(a), (VALUES (NULL), (''), ('a'), ('a' || chr(0)), ('ab'), ('b')) u(b)
+	UNION ALL VALUES (NULL::STRUCT(a INTEGER, b VARCHAR))
+)
+
+statement ok
+CREATE TABLE o_LIST AS SELECT x FROM (
+	SELECT [a, b, c][1:n] x
+	FROM (VALUES (NULL), (-1), (0), (1)) t1(a), (VALUES (NULL), (0), (2)) t2(b), (VALUES (NULL), (-5), (5)) t3(c),
+	     (VALUES (0), (1), (2), (3)) t4(n)
+	UNION ALL VALUES ([]::INTEGER[]), (NULL::INTEGER[])
+)
+
+statement ok
+CREATE TABLE o_LIST_VARCHAR AS SELECT x FROM (
+	SELECT [a, b][1:n] x
+	FROM (VALUES (NULL), (''), ('a'), ('ab'), (chr(0)), ('a' || chr(0))) t1(a),
+	     (VALUES (NULL), (''), ('a'), (chr(1))) t2(b), (VALUES (0), (1), (2)) t3(n)
+	UNION ALL VALUES (NULL::VARCHAR[])
+)
+
+statement ok
+CREATE TABLE o_LIST_LIST AS SELECT x FROM (
+	VALUES ([]::INTEGER[][]), ([[]]::INTEGER[][]), ([[], []]::INTEGER[][]), ([NULL]::INTEGER[][]), ([[NULL]]::INTEGER[][]),
+	       ([[1]]), ([[1], []]), ([[1, 2]]), ([[1], [2]]), ([[0, 9], [9]]), ([[], [1]]), ([[1], NULL]), (NULL::INTEGER[][])
+) t(x)
+
+statement ok
+CREATE TABLE o_MAP AS SELECT x FROM (
+	VALUES (MAP {}::MAP(VARCHAR, INTEGER)), (MAP {'a': 1}), (MAP {'a': 0}), (MAP {'a': NULL}), (MAP {'a': 1, 'b': 2}),
+	       (MAP {'b': 0}), (MAP {'': 5}), (NULL::MAP(VARCHAR, INTEGER))
+) t(x)
+
+statement ok
+CREATE TABLE o_ARRAY AS SELECT x FROM (
+	SELECT [a, b, c]::INTEGER[3] x
+	FROM (VALUES (NULL), (-1), (0), (1)) t1(a), (VALUES (NULL), (0), (2)) t2(b), (VALUES (NULL), (-5), (5)) t3(c)
+	UNION ALL VALUES (NULL::INTEGER[3])
+)
+
+# UNION orders by tag first, then by the member value
+statement ok
+CREATE TABLE o_UNION AS SELECT x FROM (
+	SELECT union_value(a := r::INTEGER)::UNION(a INTEGER, b VARCHAR) x FROM range(-3, 4) t(r)
+	UNION ALL SELECT union_value(b := s)::UNION(a INTEGER, b VARCHAR) FROM (VALUES (''), ('x'), ('a'), (NULL)) t(s)
+	UNION ALL VALUES (NULL::UNION(a INTEGER, b VARCHAR))
+)
+
+statement ok
+CREATE TABLE o_DEEP AS SELECT x FROM (
+	SELECT [{'k': k, 'v': [v, NULL]}, {'k': NULL, 'v': []}][1:n] x
+	FROM (VALUES (NULL), (''), ('a')) t1(k), (VALUES (NULL), ([1]::INTEGER[]), ([]::INTEGER[]), ([NULL]::INTEGER[])) t2(v),
+	     (VALUES (0), (1), (2)) t3(n)
+)
+
+#
+# Check every o_ table
+#
+
+foreach tbl o_TINYINT o_SMALLINT o_INTEGER o_BIGINT o_HUGEINT o_UTINYINT o_USMALLINT o_UINTEGER o_UBIGINT o_UHUGEINT o_BIGNUM o_BOOLEAN o_dec_4_1 o_dec_9_4 o_dec_18_6 o_dec_38_10 o_DOUBLE o_FLOAT o_DATE o_TIME o_TIME_NS o_TIMESTAMP o_TIMESTAMP_S o_TIMESTAMP_MS o_TIMESTAMP_NS o_TIMESTAMPTZ o_TIMESTAMPTZ_NS o_VARCHAR o_BLOB o_UUID o_ENUM o_ENUM_big o_STRUCT o_LIST o_LIST_VARCHAR o_LIST_LIST o_MAP o_ARRAY o_UNION o_DEEP
+
+query II
+SELECT count(*) FILTER (WHERE r1 <> r2), count(*) >= 3
+FROM (SELECT dense_rank() OVER (ORDER BY x) r1, dense_rank() OVER (ORDER BY mnemonicdb_encode(x)) r2 FROM {tbl})
+----
+0	true
+
+endloop
+
+#
+# Spot checks of the tricky cases, with the order spelled out
+#
+
+# Negative numbers sort before positive ones at every width
+query II
+SELECT list(x ORDER BY mnemonicdb_encode(x)), list(x ORDER BY mnemonicdb_encode(x::HUGEINT))
+FROM (VALUES (1), (-1), (0), (-2147483648), (2147483647), (-2)) t(x)
+----
+[-2147483648, -2, -1, 0, 1, 2147483647]	[-2147483648, -2, -1, 0, 1, 2147483647]
+
+query I
+SELECT list(x ORDER BY mnemonicdb_encode(x)) FROM (VALUES ('nan'::DOUBLE), ('inf'), ('-inf'), (-1.5), (0.0), (4.9e-324), (-4.9e-324)) t(x)
+----
+[-inf, -1.5, -5e-324, 0.0, 5e-324, inf, nan]
+
+# A string sorts before every string it is a proper prefix of, even when the next byte is 0x00
+query I
+SELECT list(octet_length(x::BLOB) ORDER BY mnemonicdb_encode(x)) FROM (VALUES ('a'), ('a' || chr(0)), ('a' || chr(0) || chr(0)), ('a' || chr(1)), ('ab'), ('')) t(x)
+----
+[0, 1, 2, 3, 2, 2]
+
+query I
+SELECT list(hex(x) ORDER BY mnemonicdb_encode(x))
+FROM (VALUES ('\x01'::BLOB), ('\x00'::BLOB), (''::BLOB), ('\x00\x00'::BLOB), ('\x00\xFF'::BLOB), ('\x01\x00'::BLOB), ('\xFF'::BLOB), ('\xFF\x00'::BLOB), ('\x02'::BLOB)) t(x)
+----
+['', 00, 0000, 00FF, 01, 0100, 02, FF, FF00]
+
+# Lists: [] < [x...]; a NULL element sorts after any value; shorter prefix first
+query I
+SELECT list(x ORDER BY mnemonicdb_encode(x))
+FROM (VALUES ([NULL]::INTEGER[]), ([]::INTEGER[]), ([1]), ([1, NULL]), ([1, 2]), ([0, 100]), ([NULL, 1]), (NULL::INTEGER[])) t(x)
+----
+[[], [0, 100], [1], [1, 2], [1, NULL], [NULL], [NULL, 1], NULL]
+
+# Structs: compared field by field; a NULL field sorts after any value but before a NULL struct
+query I
+SELECT list(x ORDER BY mnemonicdb_encode(x))
+FROM (VALUES ({'a': NULL, 'b': 'a'}), ({'a': 1, 'b': NULL}), ({'a': 1, 'b': 'z'}), ({'a': 0, 'b': 'zz'}), (NULL)) t(x)
+----
+[{'a': 0, 'b': zz}, {'a': 1, 'b': z}, {'a': 1, 'b': NULL}, {'a': NULL, 'b': a}, NULL]
+
+query I
+SELECT list(x ORDER BY mnemonicdb_encode(x))
+FROM (VALUES (union_value(b := 'a')::UNION(a INTEGER, b VARCHAR)), (union_value(a := 5)), (union_value(a := -5))) t(x)
+----
+[-5, 5, a]
+
+#
+# Known divergences from ORDER BY: these come from DuckDB's sort-key format, which is not
+# normalized for these types. They are documented in DESIGN.md (value encoding caveats).
+#
+
+statement ok
+CREATE TABLE o_INTERVAL AS SELECT * FROM (VALUES (INTERVAL '1 month'), (INTERVAL '30 days'), (INTERVAL '40 days'), (INTERVAL '25 hours'), (INTERVAL '1 day'), (INTERVAL '24 hours')) t(x)
+
+statement ok
+CREATE TABLE o_TIME_TZ AS SELECT * FROM (VALUES ('12:00:00+00'::TIMETZ), ('13:00:00+05'::TIMETZ), ('11:00:00-01'::TIMETZ), ('12:30:00+00'::TIMETZ)) t(x)
+
+statement ok
+CREATE TABLE o_BIT AS SELECT * FROM (VALUES ('0'::BIT), ('1'::BIT), ('10'::BIT), ('0000'::BIT), ('1010'::BIT), ('11111111'::BIT), ('111111110'::BIT)) t(x)
+
+# INTERVAL is encoded as raw (months, days, micros), so '25 hours' sorts before '1 day' and
+# '40 days' before '1 month', and '1 month' / '30 days' (equal in SQL) get different encodings.
+query II
+SELECT list(x ORDER BY mnemonicdb_encode(x)), mnemonicdb_encode(INTERVAL '1 month') = mnemonicdb_encode(INTERVAL '30 days') FROM o_INTERVAL
+----
+['24:00:00', '25:00:00', 1 day, 30 days, 40 days, 1 month]	false
+
+# TIME_TZ is encoded by its packed bits, not by UTC instant as ORDER BY does
+query I
+SELECT list(x ORDER BY mnemonicdb_encode(x)) FROM o_TIME_TZ
+----
+['11:00:00-01', '12:00:00+00', '12:30:00+00', '13:00:00+05']
+
+
+# Collations are ignored: the encoding always uses binary order
+query I
+SELECT mnemonicdb_encode('a' COLLATE NOCASE) < mnemonicdb_encode('B' COLLATE NOCASE)
+----
+false

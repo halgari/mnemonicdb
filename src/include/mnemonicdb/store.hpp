@@ -1,12 +1,18 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "mnemonicdb/column_family.hpp"
+#include "mnemonicdb/entity_id.hpp"
 
+#include <array>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 
 namespace rocksdb {
 class DB;
 class ColumnFamilyHandle;
+class WriteBatch;
 } // namespace rocksdb
 
 namespace mnemonicdb {
@@ -16,25 +22,8 @@ using duckdb::unique_ptr;
 using duckdb::vector;
 using duckdb::idx_t;
 
-//! The RocksDB column families making up a database
-enum class ColumnFamily : uint8_t {
-	EAVT,
-	EAVT_HIST,
-	AEVT,
-	AEVT_HIST,
-	AVET,
-	AVET_HIST,
-	VAET,
-	VAET_HIST,
-	TXLOG,
-	META,
-	COUNT
-};
-
 //! On-disk format version written to and checked against `meta`
 static constexpr uint32_t FORMAT_VERSION = 1;
-
-const char *ColumnFamilyName(ColumnFamily cf);
 
 //! An open RocksDB database holding one MnemonicDB database
 class Store {
@@ -60,10 +49,30 @@ public:
 	uint32_t GetFormatVersion() const {
 		return format_version;
 	}
+	//! Whether Open created a new, empty database (which still needs bootstrapping)
+	bool WasCreated() const {
+		return created;
+	}
 	//! The last committed transaction number
-	uint64_t GetLastTx() const {
+	TxId GetLastTx() const {
 		return last_tx.load();
 	}
+	//! The instant (microseconds since epoch) of the last committed transaction
+	int64_t GetLastInstant() const {
+		return last_instant.load();
+	}
+
+	//! Block until this caller is the only writer; paired with ReleaseWriter, possibly from another thread
+	void AcquireWriter();
+	void ReleaseWriter();
+
+	//! Allocate a new entity ID in `part`. Only the current writer may allocate. IDs allocated by a transaction
+	//! that rolls back are simply never used.
+	EntityId AllocateId(uint8_t part);
+
+	//! Atomically write `batch` as transaction `tx`, together with the updated metadata. Only the current writer
+	//! may commit, and `tx` must be GetLastTx() + 1.
+	void Commit(rocksdb::WriteBatch &batch, TxId tx, int64_t instant);
 	//! Flush all column families to disk
 	void Flush();
 	//! Approximate on-disk size in bytes
@@ -78,8 +87,18 @@ private:
 	bool read_only;
 	unique_ptr<rocksdb::DB> db;
 	vector<rocksdb::ColumnFamilyHandle *> handles;
+	bool created = false;
 	uint32_t format_version = 0;
-	std::atomic<uint64_t> last_tx {0};
+	std::atomic<TxId> last_tx {0};
+	std::atomic<int64_t> last_instant {0};
+
+	std::mutex writer_lock;
+	std::condition_variable writer_released;
+	bool writer_active = false;
+
+	//! Next local number per partition, and which ones changed since the last commit
+	std::array<uint64_t, 256> next_local {};
+	std::array<bool, 256> next_local_dirty {};
 };
 
 } // namespace mnemonicdb

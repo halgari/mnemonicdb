@@ -1,0 +1,290 @@
+# name: test/sql/codec/keys.test
+# description: Index key encoding: eavt E6 A2 V T5, aevt A2 E6 V T5, avet A2 V E6 T5, vaet V6 A2 E6 T5, txlog T5 E6 A2 V
+# group: [codec]
+
+require mnemonicdb
+
+#
+# Byte layout, hand-computed. Components:
+#   e = make_id(3, 0x0102030405)  -> packed 03 0102030405
+#   a = 0x0A0B                    -> 0A0B
+#   v = encode('hi')              -> 69 6A 00
+#   t = 0x0C0D0E0F10              -> 0C0D0E0F10
+# For vaet, v is the packed ID of make_id(16, 42) -> 10 000000002A
+#
+
+query I
+SELECT hex(mnemonicdb_encode('hi'))
+----
+696A00
+
+query I
+SELECT hex(mnemonicdb_encode_key('eavt', mnemonicdb_make_id(3, 4328719365), 2571, mnemonicdb_encode('hi'), 51758632720))
+----
+0301020304050A0B696A000C0D0E0F10
+
+query I
+SELECT hex(mnemonicdb_encode_key('aevt', mnemonicdb_make_id(3, 4328719365), 2571, mnemonicdb_encode('hi'), 51758632720))
+----
+0A0B030102030405696A000C0D0E0F10
+
+query I
+SELECT hex(mnemonicdb_encode_key('avet', mnemonicdb_make_id(3, 4328719365), 2571, mnemonicdb_encode('hi'), 51758632720))
+----
+0A0B696A000301020304050C0D0E0F10
+
+query I
+SELECT hex(mnemonicdb_encode_key('vaet', mnemonicdb_make_id(3, 4328719365), 2571, unhex('10000000002A'), 51758632720))
+----
+10000000002A0A0B0301020304050C0D0E0F10
+
+query I
+SELECT hex(mnemonicdb_encode_key('txlog', mnemonicdb_make_id(3, 4328719365), 2571, mnemonicdb_encode('hi'), 51758632720))
+----
+0C0D0E0F100301020304050A0B696A00
+
+# Index names are case-insensitive
+query I
+SELECT mnemonicdb_encode_key('EAVT', 1, 2, ''::BLOB, 3) = mnemonicdb_encode_key('eavt', 1, 2, ''::BLOB, 3)
+----
+true
+
+# Decoding the hand-computed keys gives the components back
+query I
+SELECT mnemonicdb_decode_key('avet', unhex('0A0B696A000301020304050C0D0E0F10'))
+----
+{'e': 216172786442503173, 'a': 2571, 'v': ij\x00, 't': 51758632720}
+
+query I
+SELECT mnemonicdb_decode_key('vaet', unhex('10000000002A0A0B0301020304050C0D0E0F10'))
+----
+{'e': 216172786442503173, 'a': 2571, 'v': \x10\x00\x00\x00\x00*, 't': 51758632720}
+
+# NULL in any argument gives NULL
+query IIIIII
+SELECT mnemonicdb_encode_key(NULL, 1, 2, ''::BLOB, 3), mnemonicdb_encode_key('eavt', NULL, 2, ''::BLOB, 3),
+       mnemonicdb_encode_key('eavt', 1, NULL, ''::BLOB, 3), mnemonicdb_encode_key('eavt', 1, 2, NULL, 3),
+       mnemonicdb_encode_key('eavt', 1, 2, ''::BLOB, NULL), mnemonicdb_decode_key('eavt', NULL)
+----
+NULL	NULL	NULL	NULL	NULL	NULL
+
+#
+# Round trips for every index over a grid of components at their edges
+#
+
+statement ok
+CREATE TABLE ids AS SELECT * FROM (VALUES
+	(mnemonicdb_make_id(0, 0)), (mnemonicdb_make_id(0, 1)), (mnemonicdb_make_id(3, 1099511627775)),
+	(mnemonicdb_make_id(16, 256)), (mnemonicdb_make_id(255, 0)), (mnemonicdb_make_id(255, 1099511627775))
+) t(id)
+
+statement ok
+CREATE TABLE attrs AS SELECT * FROM (VALUES (0::USMALLINT), (1), (255), (256), (65535)) t(a)
+
+statement ok
+CREATE TABLE txs AS SELECT * FROM (VALUES (0::UBIGINT), (1), (256), (1099511627775)) t(t)
+
+# Encoded values of several types
+statement ok
+CREATE TABLE vals AS
+SELECT mnemonicdb_encode(s) v FROM (VALUES (''), ('a'), ('a' || chr(0)), ('ab'), ('🦆')) t(s)
+UNION ALL SELECT mnemonicdb_encode(i) FROM (VALUES (-1), (0), (2147483647)) t(i)
+UNION ALL SELECT mnemonicdb_encode([NULL, 'x'])
+
+foreach idx eavt aevt avet txlog
+
+query II
+SELECT count(*) FILTER (WHERE mnemonicdb_decode_key('{idx}', mnemonicdb_encode_key('{idx}', id, a, v, t)) <> {'e': id, 'a': a, 'v': v, 't': t}), count(*)
+FROM ids, attrs, vals, txs
+----
+0	1080
+
+endloop
+
+# vaet: V is a packed 6-byte entity ID (partition byte, 5-byte local)
+statement ok
+CREATE MACRO packed(id) AS unhex(printf('%02X', mnemonicdb_id_partition(id)) || printf('%010X', mnemonicdb_id_local(id)))
+
+query I
+SELECT hex(packed(mnemonicdb_make_id(255, 1099511627775)))
+----
+FFFFFFFFFFFF
+
+query II
+SELECT count(*) FILTER (WHERE mnemonicdb_decode_key('vaet', mnemonicdb_encode_key('vaet', e.id, a, packed(v.id), t)) <> {'e': e.id, 'a': a, 'v': packed(v.id), 't': t}), count(*)
+FROM ids e, attrs, ids v, txs
+----
+0	720
+
+# Key length is the 13 fixed bytes plus the value length
+query I
+SELECT count(*) FROM ids, attrs, vals, txs, (VALUES ('eavt'), ('aevt'), ('avet'), ('txlog')) i(idx)
+WHERE octet_length(mnemonicdb_encode_key(idx, id, a, v, t)) <> 13 + octet_length(v)
+----
+0
+
+# decode_key splits keys by the fixed widths and does not validate V
+query I
+SELECT mnemonicdb_decode_key('eavt', unhex('000000000001' || '0002' || 'FFFFFF' || '0000000003'))
+----
+{'e': 1, 'a': 2, 'v': \xFF\xFF\xFF, 't': 3}
+
+#
+# Key order = intended component order. For each index, sort a grid of datoms by key bytes and by
+# the component tuple; the two orders must agree. The grid has values that are prefixes of each
+# other and extreme values in every position, so comparing a later component first would
+# give a different order.
+#
+
+statement ok
+CREATE TABLE datoms AS
+SELECT e.id e, a, s, mnemonicdb_encode(s) v, t
+FROM (SELECT * FROM ids WHERE id IN (mnemonicdb_make_id(0, 1), mnemonicdb_make_id(3, 1099511627775), mnemonicdb_make_id(16, 256))) e,
+     (SELECT * FROM attrs WHERE a IN (0, 256, 65535)),
+     (VALUES (''), ('a'), ('a' || chr(0)), ('a' || chr(1)), ('ab'), ('b')) v(s),
+     (SELECT * FROM txs WHERE t IN (0, 256, 1099511627775))
+
+query I
+SELECT count(*) FROM (
+	SELECT row_number() OVER (ORDER BY mnemonicdb_encode_key('eavt', e, a, v, t)) r1, row_number() OVER (ORDER BY e, a, s, t) r2 FROM datoms
+) WHERE r1 <> r2
+----
+0
+
+query I
+SELECT count(*) FROM (
+	SELECT row_number() OVER (ORDER BY mnemonicdb_encode_key('aevt', e, a, v, t)) r1, row_number() OVER (ORDER BY a, e, s, t) r2 FROM datoms
+) WHERE r1 <> r2
+----
+0
+
+query I
+SELECT count(*) FROM (
+	SELECT row_number() OVER (ORDER BY mnemonicdb_encode_key('avet', e, a, v, t)) r1, row_number() OVER (ORDER BY a, s, e, t) r2 FROM datoms
+) WHERE r1 <> r2
+----
+0
+
+query I
+SELECT count(*) FROM (
+	SELECT row_number() OVER (ORDER BY mnemonicdb_encode_key('txlog', e, a, v, t)) r1, row_number() OVER (ORDER BY t, e, a, s) r2 FROM datoms
+) WHERE r1 <> r2
+----
+0
+
+# vaet: V (a packed ref) sorts by the referenced ID's numeric value
+query I
+SELECT count(*) FROM (
+	SELECT row_number() OVER (ORDER BY mnemonicdb_encode_key('vaet', d.e, a, packed(r.id), t)) r1,
+	       row_number() OVER (ORDER BY r.id, a, d.e, t) r2
+	FROM (SELECT DISTINCT e, a, t FROM datoms) d, ids r
+) WHERE r1 <> r2
+----
+0
+
+# Spelled-out cases where only the first differing component may decide
+query IIIII
+SELECT mnemonicdb_encode_key('eavt', 1, 65535, mnemonicdb_encode('zzz'), 1099511627775) < mnemonicdb_encode_key('eavt', 2, 0, mnemonicdb_encode(''), 0),
+       mnemonicdb_encode_key('aevt', 72057594037927936, 1, mnemonicdb_encode('z'), 1099511627775) < mnemonicdb_encode_key('aevt', 0, 2, mnemonicdb_encode(''), 0),
+       mnemonicdb_encode_key('avet', 72057594037927936, 7, mnemonicdb_encode('a'), 1099511627775) < mnemonicdb_encode_key('avet', 0, 7, mnemonicdb_encode('ab'), 0),
+       mnemonicdb_encode_key('vaet', 72057594037927936, 65535, unhex('000000000001'), 1099511627775) < mnemonicdb_encode_key('vaet', 0, 0, unhex('000000000002'), 0),
+       mnemonicdb_encode_key('txlog', 72057594037927936, 65535, mnemonicdb_encode('z'), 1) < mnemonicdb_encode_key('txlog', 0, 0, mnemonicdb_encode(''), 2)
+----
+true	true	true	true	true
+
+# V followed by T: 'a' < 'ab' even when 'a' has the larger T, because the encoded V is prefix-free.
+# (With the raw bytes 'a' || T, T's first byte would be compared with 'b'.)
+query II
+SELECT mnemonicdb_encode_key('eavt', 1, 1, mnemonicdb_encode('a'), 1099511627775) < mnemonicdb_encode_key('eavt', 1, 1, mnemonicdb_encode('ab'), 0),
+       mnemonicdb_encode_key('eavt', 1, 1, 'a'::BLOB, 1099511627775) < mnemonicdb_encode_key('eavt', 1, 1, 'ab'::BLOB, 0)
+----
+true	false
+
+# Negative values sort before positive ones inside keys too
+query I
+SELECT list(i ORDER BY mnemonicdb_encode_key('avet', 1, 1, mnemonicdb_encode(i), 1)) FROM (VALUES (5), (-5), (0), (-2147483648), (2147483647)) t(i)
+----
+[-2147483648, -5, 0, 5, 2147483647]
+
+#
+# Errors. All of these are raised at execution time, which currently surfaces as an INTERNAL
+# error because mnemonicdb_encode_key / mnemonicdb_decode_key are not marked SetFallible().
+#
+
+
+statement error
+SELECT mnemonicdb_encode_key('eavx', 1, 1, ''::BLOB, 1)
+----
+unknown index "eavx"
+
+statement error
+SELECT mnemonicdb_decode_key('hist', unhex('00000000000100020000000003'))
+----
+unknown index "hist"
+
+# vaet requires a 6-byte packed ID as V
+statement error
+SELECT mnemonicdb_encode_key('vaet', 1, 1, unhex('0000000001'), 1)
+----
+VAET value must be a packed entity ID
+
+statement error
+SELECT mnemonicdb_encode_key('vaet', 1, 1, unhex('00000000000001'), 1)
+----
+VAET value must be a packed entity ID
+
+statement error
+SELECT mnemonicdb_encode_key('vaet', 1, 1, ''::BLOB, 1)
+----
+VAET value must be a packed entity ID
+
+# t must fit in 40 bits
+statement error
+SELECT mnemonicdb_encode_key('eavt', 1, 1, ''::BLOB, 1099511627776)
+----
+transaction number exceeds 40 bits
+
+statement error
+SELECT mnemonicdb_encode_key('txlog', 1, 1, ''::BLOB, 18446744073709551615)
+----
+transaction number exceeds 40 bits
+
+# e must have zero middle bits
+statement error
+SELECT mnemonicdb_encode_key('eavt', 1099511627776, 1, ''::BLOB, 1)
+----
+non-zero bits between partition and local number
+
+statement error
+SELECT mnemonicdb_encode_key('avet', 72058693549555712, 1, ''::BLOB, 1)
+----
+non-zero bits between partition and local number
+
+# (the vaet V bytes are copied as-is, but E is still checked)
+statement error
+SELECT mnemonicdb_encode_key('vaet', 1099511627776, 1, unhex('000000000001'), 1)
+----
+non-zero bits between partition and local number
+
+# Keys shorter than the 13 fixed bytes
+statement error
+SELECT mnemonicdb_decode_key('eavt', unhex('000000000001000200000000'))
+----
+malformed index key
+
+statement error
+SELECT mnemonicdb_decode_key('txlog', ''::BLOB)
+----
+malformed index key
+
+# vaet keys must be exactly 19 bytes (18 and 20 here)
+statement error
+SELECT mnemonicdb_decode_key('vaet', unhex('000000000001000200000000000100000003'))
+----
+malformed index key
+
+statement error
+SELECT mnemonicdb_decode_key('vaet', unhex('000000000001000200000000000100000000030F'))
+----
+malformed index key
+

@@ -1,0 +1,140 @@
+# name: test/sql/insert.test
+# description: INSERT asserts datoms; tables share one entity space; tempids link rows across tables
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/insert.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.person (name VARCHAR, email VARCHAR PRIMARY KEY, nick VARCHAR UNIQUE, tags VARCHAR[], age INTEGER)
+
+statement ok
+CREATE TABLE d.account (owner REF, balance DECIMAL(18,2))
+
+# Omitted id allocates a fresh entity in the default partition
+statement ok
+INSERT INTO d.person (name, email, age) VALUES ('Alice', 'alice@x.com', 30)
+
+query IIII
+SELECT mnemonicdb_id_partition(id), name, email, age FROM d.person
+----
+3	Alice	alice@x.com	30
+
+# One transaction, two tables, tempids tie the rows together
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.person (id, name, email, tags) VALUES (tempid('bob'), 'Bob', 'bob@x.com', ['a', 'b', 'a'])
+
+statement ok
+INSERT INTO d.account (id, owner, balance) VALUES (tempid('bob-acct'), tempid('bob'), 12.50)
+
+statement ok
+COMMIT
+
+query IIR
+SELECT p.name, p.tags, a.balance FROM d.person p JOIN d.account a ON a.owner = p.id
+----
+Bob	[a, b]	12.50
+
+# The same tempid label in a later transaction is a different entity
+statement ok
+INSERT INTO d.account (owner, balance) VALUES (tempid('bob'), 1.00)
+
+query I
+SELECT count(*) FROM d.person p JOIN d.account a ON a.owner = p.id
+----
+1
+
+# An entity can gain attributes from another table by inserting with its id
+statement ok
+INSERT INTO d.account (id, balance) SELECT id, 99.00 FROM d.person WHERE name = 'Alice'
+
+query TR
+SELECT p.name, a.balance FROM d.person p JOIN d.account a ON a.id = p.id
+----
+Alice	99.00
+
+# Membership: an entity is in a table iff it has any of its attributes
+query I
+SELECT count(*) FROM d.account
+----
+3
+
+query I
+SELECT count(*) FROM d.person
+----
+2
+
+# A tempid matching an existing unique identity resolves to that entity (upsert)
+statement ok
+INSERT INTO d.person (id, email, age) VALUES (tempid('again'), 'alice@x.com', 31)
+
+query III
+SELECT name, email, age FROM d.person ORDER BY name
+----
+Alice	alice@x.com	31
+Bob	bob@x.com	NULL
+
+# Without a tempid, a duplicate identity is a constraint violation
+statement error
+INSERT INTO d.person (email) VALUES ('alice@x.com')
+----
+Duplicate key
+
+statement error
+INSERT INTO d.person (nick, email) VALUES ('ally', 'a2@x.com'), ('ally', 'a3@x.com')
+----
+Duplicate key
+
+# Re-asserting an identical value is skipped: no new transaction content beyond the tx entity
+statement ok
+INSERT INTO d.person (id, age) SELECT id, 31 FROM d.person WHERE name = 'Alice'
+
+query I
+SELECT age FROM d.person WHERE name = 'Alice'
+----
+31
+
+# Partitioned tempids
+statement ok
+INSERT INTO d.person (id, name, email) VALUES (tempid('carol', 20), 'Carol', 'carol@x.com')
+
+query I
+SELECT mnemonicdb_id_partition(id) FROM d.person WHERE name = 'Carol'
+----
+20
+
+statement error
+SELECT tempid('x', 3)
+----
+partition must be between
+
+# NULLs are absent attributes; cardinality-many lists may not contain NULL
+statement error
+INSERT INTO d.person (email, tags) VALUES ('d@x.com', ['x', NULL])
+----
+cannot hold NULL elements
+
+# Data survives reattaching
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/insert.mnemonic' AS d (TYPE mnemonicdb)
+
+query TTI
+SELECT name, email, age FROM d.person ORDER BY name
+----
+Alice	alice@x.com	31
+Bob	bob@x.com	NULL
+Carol	carol@x.com	NULL
+
+# Bootstrap, two CREATE TABLEs and six data transactions; failed and no-op statements commit nothing
+query I
+SELECT count(*) FROM d.sys.tx
+----
+9

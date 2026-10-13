@@ -1,0 +1,227 @@
+# name: test/sql/codec/value_errors.test
+# description: Unsupported types, NULL handling and malformed input for the value codec
+# group: [codec]
+
+require mnemonicdb
+
+#
+# NULL in, NULL out
+#
+
+query IIII
+SELECT mnemonicdb_encode(NULL), mnemonicdb_encode(NULL::VARCHAR), mnemonicdb_encode(NULL::INTEGER[]),
+       mnemonicdb_decode(NULL::BLOB, 'STRUCT(a INTEGER)')
+----
+NULL	NULL	NULL	NULL
+
+# NULL rows mixed with non-NULL rows in one vector
+query II
+SELECT count(*) FILTER (WHERE e IS NULL), count(*) FILTER (WHERE mnemonicdb_decode(e, 'INTEGER') IS NOT DISTINCT FROM x)
+FROM (SELECT x, mnemonicdb_encode(x) e FROM (SELECT CASE WHEN r % 3 = 0 THEN NULL ELSE r::INTEGER END x FROM range(5000) t(r)))
+----
+1667	5000
+
+# A NULL nested inside a value is not a NULL value: it encodes to bytes
+query II
+SELECT mnemonicdb_encode([NULL]::INTEGER[]) IS NOT NULL, mnemonicdb_encode({'a': NULL::INTEGER}) IS NOT NULL
+----
+true	true
+
+#
+# Types that are not on the allowlist are rejected when the query is bound
+#
+
+statement error
+SELECT mnemonicdb_encode(1::VARIANT)
+----
+MnemonicDB cannot store values of type VARIANT
+
+statement error
+SELECT mnemonicdb_encode(geometry) FROM test_all_types()
+----
+MnemonicDB cannot store values of type GEOMETRY
+
+statement error
+SELECT mnemonicdb_encode(tuple) FROM test_all_types()
+----
+MnemonicDB cannot store values of type TUPLE
+
+# The untyped empty list / NULL struct field have element type "NULL"
+statement error
+SELECT mnemonicdb_encode([])
+----
+MnemonicDB cannot store values of type "NULL"
+
+statement error
+SELECT mnemonicdb_encode({'a': NULL})
+----
+MnemonicDB cannot store values of type "NULL"
+
+# Unsupported types nested anywhere are rejected too
+statement error
+SELECT mnemonicdb_encode([1::VARIANT])
+----
+MnemonicDB cannot store values of type VARIANT
+
+statement error
+SELECT mnemonicdb_encode({'a': 1, 'b': 1::VARIANT})
+----
+MnemonicDB cannot store values of type VARIANT
+
+statement error
+SELECT mnemonicdb_encode(MAP {'a': 1::VARIANT})
+----
+MnemonicDB cannot store values of type VARIANT
+
+statement error
+SELECT mnemonicdb_encode([1::VARIANT, 2::VARIANT]::VARIANT[2])
+----
+MnemonicDB cannot store values of type VARIANT
+
+statement error
+SELECT mnemonicdb_encode(union_value(a := 1::VARIANT))
+----
+MnemonicDB cannot store values of type VARIANT
+
+statement error
+SELECT mnemonicdb_encode([[{'x': [1::VARIANT]}]])
+----
+MnemonicDB cannot store values of type VARIANT
+
+# Decoding to an unsupported type fails the same way
+statement error
+SELECT mnemonicdb_decode(''::BLOB, 'VARIANT')
+----
+MnemonicDB cannot store values of type VARIANT
+
+statement error
+SELECT mnemonicdb_decode(''::BLOB, 'GEOMETRY')
+----
+MnemonicDB cannot store values of type GEOMETRY
+
+statement error
+SELECT mnemonicdb_decode(''::BLOB, 'STRUCT(a INTEGER, b VARIANT[])')
+----
+MnemonicDB cannot store values of type VARIANT
+
+#
+# Bad type names
+#
+
+statement error
+SELECT mnemonicdb_decode(mnemonicdb_encode(1), 'NOTATYPE')
+----
+Type with name NOTATYPE does not exist
+
+statement error
+SELECT mnemonicdb_decode(mnemonicdb_encode(1), '')
+----
+can not be converted to a DuckDB Type
+
+statement error
+SELECT mnemonicdb_decode(mnemonicdb_encode(1), 'INTEGER[')
+----
+
+# The type name must be a constant
+statement error
+SELECT mnemonicdb_decode(mnemonicdb_encode(1), t) FROM (VALUES ('INTEGER')) v(t)
+----
+must be a constant expression
+
+statement ok
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')
+
+#
+# Malformed input. These raise InvalidInputException at execution time, which DuckDB currently
+# converts to an INTERNAL error because the codec functions are not marked SetFallible().
+# The expected messages below are what should be reported once they are.
+#
+
+
+# Truncated fixed-width values
+statement error
+SELECT mnemonicdb_decode(''::BLOB, 'INTEGER')
+----
+malformed encoded value
+
+statement error
+SELECT mnemonicdb_decode('\x80\x00'::BLOB, 'INTEGER')
+----
+malformed encoded value
+
+statement error
+SELECT mnemonicdb_decode('\x80\x00\x00\x00\x00\x00\x00'::BLOB, 'BIGINT')
+----
+malformed encoded value
+
+# Trailing bytes after a complete value
+statement error
+SELECT mnemonicdb_decode('\x80\x00\x00\x01\x00'::BLOB, 'INTEGER')
+----
+1 trailing bytes
+
+statement error
+SELECT mnemonicdb_decode(mnemonicdb_encode('a') || mnemonicdb_encode('b'), 'VARCHAR')
+----
+2 trailing bytes
+
+statement error
+SELECT mnemonicdb_decode(mnemonicdb_encode([1, 2]) || '\x00'::BLOB, 'INTEGER[]')
+----
+1 trailing bytes
+
+# Decoding as a narrower type leaves trailing bytes
+statement error
+SELECT mnemonicdb_decode(mnemonicdb_encode(1::BIGINT), 'INTEGER')
+----
+4 trailing bytes
+
+# Decoding as a wider type runs out of bytes
+statement error
+SELECT mnemonicdb_decode(mnemonicdb_encode(1::INTEGER), 'BIGINT')
+----
+malformed encoded value
+
+# Strings and blobs without their terminator
+statement error
+SELECT mnemonicdb_decode(''::BLOB, 'VARCHAR')
+----
+malformed encoded value
+
+statement error
+SELECT mnemonicdb_decode('abc'::BLOB, 'VARCHAR')
+----
+malformed encoded value
+
+statement error
+SELECT mnemonicdb_decode('abc'::BLOB, 'BLOB')
+----
+malformed encoded value
+
+# Nested values cut short
+statement error
+SELECT mnemonicdb_decode('\x01\x01\x80\x00\x00\x01\x00'::BLOB, 'STRUCT(a INTEGER, b INTEGER)')
+----
+malformed encoded value
+
+# A list without its terminator
+statement error
+SELECT mnemonicdb_decode('\x01\x80\x00\x00\x01'::BLOB, 'INTEGER[]')
+----
+malformed encoded value
+
+statement error
+SELECT mnemonicdb_decode(mnemonicdb_encode([1, 2]::INTEGER[2]), 'INTEGER[3]')
+----
+malformed encoded value
+
+# Decoded contents are validated:
+# an ENUM index past the end of the dictionary, and a VARCHAR that is not valid UTF-8.
+statement error
+SELECT mnemonicdb_decode('\x05'::BLOB, 'mood')::VARCHAR
+----
+
+statement error
+SELECT mnemonicdb_decode('\xC4\x00'::BLOB, 'VARCHAR')
+----
+

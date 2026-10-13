@@ -37,7 +37,16 @@ set(EXTENSION_SOURCES
     src/catalog/mnemonic_schema_entry.cpp
     src/txn/mnemonic_transaction.cpp
     src/txn/mnemonic_transaction_manager.cpp
-    src/mnemonicdb_info.cpp)
+    src/mnemonicdb_info.cpp
+    src/codec_functions.cpp
+    src/codec/keys.cpp
+    src/codec/value_codec.cpp
+    src/codec/tempid.cpp
+    src/schema/schema.cpp
+    src/write/tx_writer.cpp
+    src/catalog/mnemonic_table_entry.cpp
+    src/exec/mnemonic_scan.cpp
+    src/exec/mnemonic_insert.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

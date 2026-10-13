@@ -47,8 +47,11 @@ process, single writer, any number of readers.
 
 - **Membership.** An entity is "in" a table iff it currently has at least one
   attribute of that table. There is no marker datom.
-- **Implicit `id` column.** Every table exposes `id` (type `REF`). Users do
-  not declare it.
+- **`id` column.** Every table's first column is `id` (type `REF`), added
+  automatically. It's a real column so INSERT can set it; DuckDB can't
+  insert into virtual columns. A hidden virtual `rowid` column carries the
+  same value and is the row identifier for UPDATE and DELETE. The names `id`
+  and `rowid` are reserved.
 - **NULL means absent.** A NULL column is no datom. Setting a column to NULL
   retracts it.
 - **Value types.** Nearly every DuckDB type, nested arbitrarily. A top-level
@@ -99,21 +102,61 @@ local.
 ## 3. Value encoding
 
 Values are encoded with DuckDB's memcmp-comparable sort keys
-(`create_sort_key` / `CreateSortKey`, decoded with the matching decode path).
-The attribute determines the type, so no type tag is stored.
+(`CreateSortKeyHelpers::CreateSortKey` / `DecodeSortKey` in
+`duckdb/function/create_sort_key.hpp`), wrapped by `ValueCodec`
+(`src/codec/value_codec.cpp`). The attribute determines the type, so no type
+tag is stored.
 
-Requirements:
-- **Self-delimiting**, because V is followed by more key components (T, E).
-  Verify for VARCHAR/BLOB and nested types.
-- **Decodable for every supported type**, because current indexes carry no
-  value bytes: the value is read back out of the key.
-- **Stable.** DuckDB does not promise a stable on-disk sort-key format. All
-  encoding goes through a thin `ValueCodec` wrapper, and the database records
-  a format version in `meta`. If upstream changes the encoding, we vendor the
-  old encoder behind that version.
+- **Modifiers:** ascending, NULLS LAST. Inside nested values, NULL children
+  sort last.
+- **No top-level validity byte.** A sort key starts with a validity byte,
+  but stored values are never NULL, so the codec strips it on encode and puts
+  it back on decode. That saves one byte per datom per index.
+- **Prefix-free.** Fixed-width types have a fixed length. VARCHAR and BLOB
+  escape `0x00`/`0x01` and end with a `0x00` delimiter. Lists end with a
+  delimiter, and structs are a concatenation of their fields. No encoding is
+  a proper prefix of another, so an AVET prefix scan on `A + V` matches
+  exactly V.
+- **Decodable.** `DecodeSortKey` reports how many bytes it consumed, so a
+  value can be decoded from the front of any buffer.
+- **Supported types** (allowlist in `ValueCodec::CheckSupported`): booleans,
+  every integer width including HUGEINT/UHUGEINT and BIGNUM, DECIMAL,
+  FLOAT/DOUBLE, every DATE/TIME/TIMESTAMP variant, INTERVAL, VARCHAR, BLOB,
+  BIT, UUID, ENUM, and STRUCT/UNION/LIST/MAP/ARRAY nested to any depth.
+  VARIANT, GEOMETRY and anything else not on the list is rejected until
+  tested.
+- **Known caveats:** these come from DuckDB's sort-key format, not from SQL
+  semantics. They affect AVET range scans, uniqueness and redundancy
+  elimination, all of which compare encoded bytes.
+  - VARCHAR orders by bytes; collations are ignored.
+  - INTERVAL is encoded as raw (months, days, micros). `'1 month'` and
+    `'30 days'` are distinct values, and `'40 days'` sorts before
+    `'1 month'`.
+  - TIME_TZ sorts by its packed bits, not by UTC instant.
+  - BIT sorts by its padding byte first.
+  - `-0.0` is stored as `0.0`, and all NaNs are stored as one value.
+  - ENUM encodes the dictionary index, so changing an ENUM's values is a type
+    change, which means a rewrite.
+  - The empty STRUCT is rejected: its encoding would be zero bytes.
+- **Trust boundary.** `ValueCodec::Decode` trusts its input, because store
+  bytes come from this encoder and RocksDB checksums its blocks.
+  `ValueCodec::Validate` / `EncodedLength` walk the bytes with bounds checks
+  (including ENUM range, UTF-8 and canonical booleans), and anything from
+  outside goes through them first.
+- **Stability.** DuckDB does not promise a stable sort-key format across
+  versions. The database records a format version in `meta`, and all
+  encoding goes through `ValueCodec`. If upstream changes the encoding, we
+  vendor the old encoder behind the recorded version.
 
 `REF` values are encoded as the 6-byte packed ID, not as a generic integer
 sort key, so VAET and E positions share an encoding.
+
+### Key splitting
+
+Every index key has at most one variable-length segment (V), and the other
+segments have fixed widths. So V is found by position (for example
+`key[8 : len-5]` for EAVT) and never needs to be decoded just to split a key.
+Key encode/decode lives in `src/codec/keys.cpp`.
 
 ## 4. RocksDB layout
 
@@ -209,7 +252,11 @@ database into a single merge join.
 
 ### Tempids
 
-- `tempid('label')` returns a placeholder in partition `temp`.
+- `tempid('label')` returns a placeholder in partition `temp`. Placeholders
+  are deterministic: the middle 16 bits (unused by real IDs) hold the target
+  partition, and the low 40 bits a hash of the label. So the function is
+  pure, and the transaction maps placeholders to real IDs as rows are
+  written.
   `tempid('label', p)` with `p` in 16–254 allocates the real ID in user
   partition `p`. `tempid()` is the only way to mint an ID in a chosen
   partition.
@@ -227,6 +274,9 @@ database into a single merge join.
 
 ### Statement semantics
 
+- **ON CONFLICT** is rewritten by DuckDB into MERGE INTO, which plans
+  through our INSERT/UPDATE/DELETE operators. It finds conflict targets
+  through the table's storage info (unique and identity columns).
 - **INSERT** asserts every non-NULL column for the row's entity. Inserting
   with the `id` of an existing entity is legal: that's how an entity gets
   attributes from another table. Cardinality-one columns retract any
@@ -256,9 +306,11 @@ everything else. Each attached database has a `sys` schema:
 | `sys.attributes` | `table REF`, `name`, `type` (DuckDB type string), `cardinality`, `unique` (`none`/`value`/`identity`), `indexed`, `doc` |
 | `sys.tx`         | `instant TIMESTAMPTZ`; users may `ALTER TABLE sys.tx ADD COLUMN` |
 
-- **Bootstrap.** The attributes describing the `sys` tables themselves have
-  fixed IDs in partition 0, written by the first transaction of a new
-  database.
+- **Bootstrap.** The `sys` tables and their attributes have fixed IDs.
+  Table locals 1–15 and attribute locals 1–63 are reserved for built-ins, so
+  user tables start at local 16 and user attributes at 64. Transaction 1 of
+  a new database writes the datoms describing them, so `sys.tables` and
+  `sys.attributes` describe themselves.
 - **Two front doors.** `CREATE TABLE` / `ALTER TABLE` / `CREATE INDEX`
   translate into writes against `sys.*`, and writing `sys.*` directly is
   equally valid. A transaction that touches `sys.*` invalidates the cached

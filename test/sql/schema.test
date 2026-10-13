@@ -1,0 +1,181 @@
+# name: test/sql/schema.test
+# description: Schema is data: sys tables describe themselves, and CREATE TABLE writes sys datoms
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/schema.mnemonic' AS d (TYPE mnemonicdb)
+
+# The bootstrap transaction is tx 1
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+1
+
+query II
+SELECT schema, name FROM d.sys.tables ORDER BY id
+----
+sys	tables
+sys	attributes
+sys	tx
+
+query III
+SELECT t.name, a.name, a.type FROM d.sys.attributes a JOIN d.sys.tables t ON a.table = t.id ORDER BY a.id
+----
+tables	schema	VARCHAR
+tables	name	VARCHAR
+tables	doc	VARCHAR
+attributes	table	REF
+attributes	name	VARCHAR
+attributes	type	VARCHAR
+attributes	unique	VARCHAR
+attributes	indexed	BOOLEAN
+attributes	doc	VARCHAR
+tx	instant	TIMESTAMP WITH TIME ZONE
+
+# Built-in IDs: tables in partition 1, attributes in partition 0, the bootstrap tx in partition 2
+query II
+SELECT mnemonicdb_id_partition(id), mnemonicdb_id_local(id) FROM d.sys.tables ORDER BY id
+----
+1	1
+1	2
+1	3
+
+query II
+SELECT mnemonicdb_id_partition(id), mnemonicdb_id_local(id) FROM d.sys.tx
+----
+2	1
+
+statement ok
+CREATE TABLE d.person (name VARCHAR, email VARCHAR PRIMARY KEY, nick VARCHAR UNIQUE, tags VARCHAR[], age INTEGER)
+
+statement ok
+CREATE TABLE d.account (owner REF, balance DECIMAL(18,2))
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+3
+
+query II
+SELECT schema, name FROM d.sys.tables WHERE schema = 'main' ORDER BY id
+----
+main	person
+main	account
+
+# User tables start at local 16, user attributes at local 64
+query I
+SELECT min(mnemonicdb_id_local(id)) FROM d.sys.tables WHERE schema = 'main'
+----
+16
+
+query IIII
+SELECT a.name, a.type, a.unique, mnemonicdb_id_local(a.id) FROM d.sys.attributes a JOIN d.sys.tables t ON a.table = t.id
+WHERE t.name = 'person' ORDER BY a.id
+----
+name	VARCHAR	NULL	64
+email	VARCHAR	identity	65
+nick	VARCHAR	value	66
+tags	VARCHAR[]	NULL	67
+age	INTEGER	NULL	68
+
+query II
+SELECT a.name, a.type FROM d.sys.attributes a JOIN d.sys.tables t ON a.table = t.id WHERE t.name = 'account' ORDER BY a.id
+----
+owner	REF
+balance	DECIMAL(18,2)
+
+# Every table has an `id` column first
+query II
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'd' AND table_name = 'account' ORDER BY column_index
+----
+id	REF
+owner	REF
+balance	DECIMAL(18,2)
+
+query I
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'd' AND schema_name = 'main' ORDER BY table_name
+----
+account
+person
+
+statement error
+CREATE TABLE d.person (x INTEGER)
+----
+already exists
+
+statement ok
+CREATE TABLE IF NOT EXISTS d.person (x INTEGER)
+
+statement error
+CREATE TABLE d.bad (id INTEGER)
+----
+reserved
+
+statement error
+CREATE TABLE d.bad (x INTEGER NOT NULL)
+----
+does not support NOT NULL
+
+statement error
+CREATE TABLE d.bad (x INTEGER DEFAULT 1)
+----
+does not support column defaults
+
+statement error
+CREATE TABLE d.bad (a INTEGER, b INTEGER, UNIQUE (a, b))
+----
+multi-column
+
+statement error
+CREATE TABLE d.sys.mine (x INTEGER)
+----
+can only be created in schema "main"
+
+# A rolled-back CREATE TABLE leaves nothing behind
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE d.temp_table (x INTEGER)
+
+query I
+SELECT count(*) FROM d.sys.tables WHERE name = 'temp_table'
+----
+1
+
+statement ok
+ROLLBACK
+
+query I
+SELECT count(*) FROM d.sys.tables WHERE name = 'temp_table'
+----
+0
+
+statement error
+SELECT * FROM d.temp_table
+----
+does not exist
+
+# Schema survives reattaching
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/schema.mnemonic' AS d (TYPE mnemonicdb)
+
+query II
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'd' AND table_name = 'person' ORDER BY column_index
+----
+id	REF
+name	VARCHAR
+email	VARCHAR
+nick	VARCHAR
+tags	VARCHAR[]
+age	INTEGER
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+3

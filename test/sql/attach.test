@@ -16,7 +16,7 @@ ATTACH '{TEST_DIR}/attach.mnemonic' AS d (TYPE mnemonicdb)
 query IIII
 SELECT format_version, last_tx, read_only, column_families FROM mnemonicdb_info('d')
 ----
-1	0	false	[eavt, eavt_hist, aevt, aevt_hist, avet, avet_hist, vaet, vaet_hist, txlog, meta]
+1	1	false	[eavt, eavt_hist, aevt, aevt_hist, avet, avet_hist, vaet, vaet_hist, txlog, meta]
 
 query I
 SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'd' ORDER BY schema_name
@@ -24,10 +24,12 @@ SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'd' ORDER BY sche
 main
 sys
 
-query I
-SELECT count(*) FROM duckdb_tables() WHERE database_name = 'd'
+query II
+SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'd' ORDER BY ALL
 ----
-0
+sys	attributes
+sys	tables
+sys	tx
 
 # Transactions can begin and commit against the database
 statement ok
@@ -44,11 +46,6 @@ CREATE SCHEMA d.other
 ----
 schemas are fixed
 
-statement error
-CREATE TABLE d.person (name VARCHAR)
-----
-does not support CREATE TABLE yet
-
 statement ok
 DETACH d
 
@@ -59,7 +56,7 @@ ATTACH '{TEST_DIR}/attach.mnemonic' AS d (TYPE mnemonicdb)
 query II
 SELECT format_version, last_tx FROM mnemonicdb_info('d')
 ----
-1	0
+1	1
 
 statement ok
 DETACH d

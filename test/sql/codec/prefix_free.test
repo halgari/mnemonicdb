@@ -1,0 +1,140 @@
+# name: test/sql/codec/prefix_free.test
+# description: No encoding is a proper prefix of another value's encoding (V is followed by more key bytes)
+# group: [codec]
+
+require mnemonicdb
+
+# Each section builds a table p_<name>(x) of distinct non-NULL values chosen to be prefixes of
+# each other, or to differ only in bytes that need escaping. The loop at the end self-joins each
+# table and checks that no encoding is a proper prefix of another, and that distinct values get
+# distinct encodings.
+
+statement ok
+CREATE TABLE bytes AS SELECT unhex(printf('%02X', r)) b FROM range(0, 256) t(r)
+
+statement ok
+CREATE TABLE special AS SELECT * FROM (VALUES (''::BLOB), ('\x00'::BLOB), ('\x01'::BLOB), ('\x02'::BLOB), ('\xFF'::BLOB), ('a'::BLOB)) t(b)
+
+# BLOB: every byte, then every 1-3 byte string over the special bytes
+statement ok
+CREATE TABLE p_BLOB AS SELECT DISTINCT x FROM (
+	SELECT b x FROM bytes
+	UNION ALL SELECT p.b || q.b FROM special p, special q
+	UNION ALL SELECT p.b || q.b || r.b FROM special p, special q, special r
+	UNION ALL SELECT unhex(repeat('00', n::INTEGER)) FROM range(0, 40) t(n)
+	UNION ALL SELECT unhex(repeat('01', n::INTEGER)) FROM range(0, 40) t(n)
+)
+
+# VARCHAR: all prefixes of strings containing chr(0), chr(1), multi-byte characters
+statement ok
+CREATE TABLE p_VARCHAR AS SELECT DISTINCT x FROM (
+	SELECT left(s, n::INTEGER) x
+	FROM (VALUES ('abc'), ('a' || chr(0) || chr(0) || 'b'), (chr(1) || chr(0) || chr(1)), ('é🦆ü'), (chr(127) || chr(128))) t(s),
+	     range(0, 6) r(n)
+	UNION ALL SELECT chr(r::INTEGER) FROM range(0, 512) t(r)
+	UNION ALL SELECT 'a' || chr(r::INTEGER) FROM range(0, 512) t(r)
+)
+
+# BIT and BIGNUM are variable-length too
+statement ok
+CREATE TABLE p_BIT AS SELECT DISTINCT x FROM (
+	SELECT lpad(bin(r), w::INTEGER, '0')::BIT x FROM range(0, 300) t(r), range(1, 20) w(w) WHERE length(bin(r)) <= w
+)
+
+statement ok
+CREATE TABLE p_BIGNUM AS SELECT DISTINCT x FROM (
+	SELECT r::BIGNUM x FROM range(-1000, 1000) t(r)
+	UNION ALL SELECT (s || repeat(d, n::INTEGER))::BIGNUM FROM (VALUES (''), ('-')) a(s), (VALUES ('1'), ('9'), ('0')) b(d), range(1, 60) c(n)
+	UNION ALL SELECT ('1' || repeat('0', n::INTEGER))::BIGNUM FROM range(1, 60) c(n)
+)
+
+# LISTs of strings: [], [''], ['', ''], ['a'], ['a', ''] ... including NULL elements
+statement ok
+CREATE TABLE p_LIST_VARCHAR AS SELECT DISTINCT x FROM (
+	SELECT [a, b, c][1:n] x
+	FROM (VALUES (NULL), (''), ('a'), (chr(0)), ('ab')) t1(a), (VALUES (NULL), (''), ('a'), (chr(1))) t2(b),
+	     (VALUES (NULL), (''), ('b')) t3(c), range(0, 4) t4(n)
+)
+
+statement ok
+CREATE TABLE p_LIST_BLOB AS SELECT DISTINCT x FROM (
+	SELECT [a.b, b.b][1:n] x FROM special a, special b, range(0, 3) t(n)
+	UNION ALL SELECT [NULL::BLOB]
+)
+
+statement ok
+CREATE TABLE p_LIST_INTEGER AS SELECT DISTINCT x FROM (
+	SELECT [a, b, c][1:n] x
+	FROM (VALUES (NULL), (0), (1), (-1), (256)) t1(a), (VALUES (NULL), (0), (1)) t2(b), (VALUES (NULL), (0)) t3(c), range(0, 4) t4(n)
+)
+
+statement ok
+CREATE TABLE p_LIST_LIST AS SELECT DISTINCT x FROM (
+	SELECT [a, b][1:n] x
+	FROM (VALUES (NULL), ([]::INTEGER[]), ([0]), ([NULL]::INTEGER[]), ([0, 0])) t1(a),
+	     (VALUES (NULL), ([]::INTEGER[]), ([0])) t2(b), range(0, 3) t3(n)
+)
+
+# STRUCTs whose fields are themselves prefixes of each other
+statement ok
+CREATE TABLE p_STRUCT AS SELECT DISTINCT x FROM (
+	SELECT {'s': s, 'b': b.b, 'l': l} x
+	FROM (VALUES (NULL), (''), ('a'), ('ab'), (chr(0))) t1(s), special b,
+	     (VALUES (NULL), ([]::VARCHAR[]), (['']), (['', ''])) t2(l)
+)
+
+statement ok
+CREATE TABLE p_MAP AS SELECT DISTINCT x FROM (
+	VALUES (MAP {}::MAP(VARCHAR, VARCHAR)), (MAP {'': ''}), (MAP {'': NULL}), (MAP {'a': ''}), (MAP {'': '', 'a': ''}),
+	       (MAP {'a': 'b'}), (MAP {'ab': ''}), (MAP {'a': '', 'b': ''})
+) t(x)
+
+statement ok
+CREATE TABLE p_UNION AS SELECT DISTINCT x FROM (
+	SELECT union_value(s := s)::UNION(s VARCHAR, l VARCHAR[]) x FROM (VALUES (''), ('a'), ('ab'), (NULL)) t(s)
+	UNION ALL SELECT union_value(l := l)::UNION(s VARCHAR, l VARCHAR[]) FROM (VALUES ([]::VARCHAR[]), (['']), (['a']), (['', ''])) t(l)
+)
+
+foreach tbl p_BLOB p_VARCHAR p_BIT p_BIGNUM p_LIST_VARCHAR p_LIST_BLOB p_LIST_INTEGER p_LIST_LIST p_STRUCT p_MAP p_UNION
+
+# no encoding is a proper prefix of another
+query II
+SELECT count(*) FILTER (WHERE octet_length(ea) < octet_length(eb) AND starts_with(hex(eb), hex(ea))), count(DISTINCT ea) > 5
+FROM (SELECT mnemonicdb_encode(x) ea FROM {tbl}) a, (SELECT mnemonicdb_encode(x) eb FROM {tbl}) b
+----
+0	true
+
+# distinct values have distinct encodings
+query I
+SELECT count(DISTINCT x) = count(DISTINCT mnemonicdb_encode(x)) FROM {tbl}
+----
+true
+
+endloop
+
+# Concatenating two encodings never decodes as one value: the first value ends where its encoding ends
+query I
+SELECT count(*) FROM p_VARCHAR a, p_VARCHAR b
+WHERE mnemonicdb_encode(a.x) || mnemonicdb_encode(b.x) = mnemonicdb_encode(a.x || b.x)
+----
+0
+
+# Hand-checked encodings: strings shift each byte by one and end with 0x00; blobs escape 0x00/0x01 with 0x01
+query IIIIII
+SELECT hex(mnemonicdb_encode('')), hex(mnemonicdb_encode('a')), hex(mnemonicdb_encode(chr(0))),
+       hex(mnemonicdb_encode(''::BLOB)), hex(mnemonicdb_encode('\x00\x01\x02\xFF'::BLOB)), hex(mnemonicdb_encode([]::INTEGER[]))
+----
+00	6200	0100	00	0100010102FF00	00
+
+# Fixed-width types have a constant encoding length, so they are trivially prefix-free
+query IIII
+SELECT octet_length(mnemonicdb_encode(1::TINYINT)), octet_length(mnemonicdb_encode(1::HUGEINT)),
+       octet_length(mnemonicdb_encode(1.5::DOUBLE)), octet_length(mnemonicdb_encode(INTERVAL '1 day'))
+----
+1	16	8	16
+
+# The empty struct would encode to zero bytes, a prefix of everything, so it is rejected
+statement error
+SELECT mnemonicdb_encode(empty_struct) FROM test_all_types()
+----
+empty STRUCT

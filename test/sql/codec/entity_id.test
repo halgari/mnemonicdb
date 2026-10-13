@@ -1,0 +1,93 @@
+# name: test/sql/codec/entity_id.test
+# description: Entity IDs: partition in the top byte, 40-bit local number in the low bits, 16 zero bits between
+# group: [codec]
+
+require mnemonicdb
+
+# Corners of the ID space
+query IIII
+SELECT mnemonicdb_make_id(0, 0), mnemonicdb_make_id(0, 1099511627775), mnemonicdb_make_id(255, 0), mnemonicdb_make_id(255, 1099511627775)
+----
+0	1099511627775	18374686479671623680	18374687579183251455
+
+# Layout: partition << 56 | local, so the middle 16 bits stay zero
+query III
+SELECT printf('%016X', mnemonicdb_make_id(3, 1)), printf('%016X', mnemonicdb_make_id(16, 1099511627775)), printf('%016X', mnemonicdb_make_id(2, 4294967296))
+----
+0300000000000001	100000FFFFFFFFFF	0200000100000000
+
+# Round trips at the edges: partitions 0, 1, 2, 3, 15, 16, 254, 255 x locals 0, 1, 2^16, 2^32, 2^40 - 1
+query I
+SELECT count(*) FROM
+	(VALUES (0), (1), (2), (3), (15), (16), (254), (255)) p(part),
+	(VALUES (0), (1), (65535), (65536), (4294967296), (1099511627774), (1099511627775)) l(loc)
+WHERE mnemonicdb_id_partition(mnemonicdb_make_id(part::UTINYINT, loc::UBIGINT)) <> part
+   OR mnemonicdb_id_local(mnemonicdb_make_id(part::UTINYINT, loc::UBIGINT)) <> loc
+----
+0
+
+# Every partition, with a spread of locals
+query II
+SELECT count(*) FILTER (WHERE mnemonicdb_id_partition(id) <> p OR mnemonicdb_id_local(id) <> l), count(*)
+FROM (SELECT p, l, mnemonicdb_make_id(p::UTINYINT, l::UBIGINT) id
+      FROM range(0, 256) a(p), (SELECT (r * 1099511) % 1099511627776 l FROM range(0, 100) t(r)))
+----
+0	25600
+
+# Numeric order of IDs is (partition, local) order
+query I
+SELECT count(*) FROM (
+	SELECT p, l, lag(p) OVER w lp, lag(l) OVER w ll
+	FROM (SELECT p, l, mnemonicdb_make_id(p::UTINYINT, l::UBIGINT) id
+	      FROM (VALUES (0), (1), (255)) a(p), (VALUES (0), (1), (1099511627775)) b(l))
+	WINDOW w AS (ORDER BY id)
+) WHERE lp IS NOT NULL AND (p < lp OR (p = lp AND l <= ll))
+----
+0
+
+# NULL in, NULL out
+query IIII
+SELECT mnemonicdb_make_id(NULL, 1), mnemonicdb_make_id(1, NULL), mnemonicdb_id_partition(NULL), mnemonicdb_id_local(NULL)
+----
+NULL	NULL	NULL	NULL
+
+# The partition must fit in a UTINYINT
+statement error
+SELECT mnemonicdb_make_id(256::UTINYINT, 0)
+----
+Conversion Error
+
+statement error
+SELECT mnemonicdb_make_id((-1)::UTINYINT, 0)
+----
+Conversion Error
+
+# IDs with non-zero middle bits are not valid entity IDs
+statement error
+SELECT mnemonicdb_id_partition(18446744073709551615)
+----
+not a valid entity ID
+
+statement error
+SELECT mnemonicdb_id_local(1099511627776)
+----
+not a valid entity ID
+
+# A local number of 2^40 or more does not fit. This raises InvalidInputException at execution time,
+# which currently surfaces as an INTERNAL error (mnemonicdb_make_id is not marked SetFallible()).
+
+statement error
+SELECT mnemonicdb_make_id(1, 1099511627776)
+----
+exceeds 40 bits
+
+statement error
+SELECT mnemonicdb_make_id(0, 18446744073709551615)
+----
+exceeds 40 bits
+
+statement error
+SELECT mnemonicdb_make_id(p::UTINYINT, l::UBIGINT) FROM (VALUES (1, 5), (1, 1099511627776)) t(p, l)
+----
+exceeds 40 bits
+

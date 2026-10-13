@@ -8,7 +8,7 @@ MnemonicTransactionManager::MnemonicTransactionManager(AttachedDatabase &db, Mne
 }
 
 Transaction &MnemonicTransactionManager::StartTransaction(ClientContext &context) {
-	auto transaction = make_uniq<MnemonicTransaction>(*this, context, catalog.GetStore());
+	auto transaction = make_uniq<MnemonicTransaction>(*this, context, catalog);
 	auto &result = *transaction;
 	lock_guard<mutex> guard(transaction_lock);
 	transactions[result] = std::move(transaction);
@@ -16,10 +16,15 @@ Transaction &MnemonicTransactionManager::StartTransaction(ClientContext &context
 }
 
 ErrorData MnemonicTransactionManager::CommitTransaction(ClientContext &, Transaction &transaction) {
-	// Nothing is written yet; committing just releases the snapshot
+	ErrorData error;
+	try {
+		transaction.Cast<MnemonicTransaction>().Commit();
+	} catch (std::exception &ex) {
+		error = ErrorData(ex);
+	}
 	lock_guard<mutex> guard(transaction_lock);
 	transactions.erase(transaction);
-	return ErrorData();
+	return error;
 }
 
 void MnemonicTransactionManager::RollbackTransaction(Transaction &transaction) {

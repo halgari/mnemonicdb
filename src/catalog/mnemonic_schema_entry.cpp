@@ -1,6 +1,11 @@
 #include "mnemonicdb/mnemonic_schema_entry.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "mnemonicdb/mnemonic_catalog.hpp"
+#include "mnemonicdb/mnemonic_table_entry.hpp"
+#include "mnemonicdb/mnemonic_transaction.hpp"
+
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 
 namespace duckdb {
@@ -11,11 +16,18 @@ MnemonicSchemaEntry::MnemonicSchemaEntry(Catalog &catalog, CreateSchemaInfo &inf
 
 void MnemonicSchemaEntry::Scan(ClientContext &context, CatalogType type,
                                const std::function<void(CatalogEntry &)> &callback) {
-	Scan(type, callback);
+	if (type != CatalogType::TABLE_ENTRY) {
+		return;
+	}
+	auto &mnemonic_catalog = catalog.Cast<MnemonicCatalog>();
+	MnemonicTransaction::Get(context, mnemonic_catalog).GetGeneration()->ScanTables(name.GetIdentifierName(), callback);
 }
 
 void MnemonicSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
-	// No tables yet: entries are loaded from `sys` once schema-as-data lands
+	if (type != CatalogType::TABLE_ENTRY) {
+		return;
+	}
+	catalog.Cast<MnemonicCatalog>().GetGeneration()->ScanTables(name.GetIdentifierName(), callback);
 }
 
 static NotImplementedException Unsupported(const string &what) {
@@ -31,8 +43,9 @@ optional_ptr<CatalogEntry> MnemonicSchemaEntry::CreateFunction(CatalogTransactio
 	throw Unsupported("creating functions");
 }
 
-optional_ptr<CatalogEntry> MnemonicSchemaEntry::CreateTable(CatalogTransaction, BoundCreateTableInfo &) {
-	throw Unsupported("CREATE TABLE");
+optional_ptr<CatalogEntry> MnemonicSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
+	auto &transaction_entry = MnemonicTransaction::Get(transaction.GetContext(), catalog);
+	return transaction_entry.CreateTable(*this, info);
 }
 
 optional_ptr<CatalogEntry> MnemonicSchemaEntry::CreateView(CatalogTransaction, CreateViewInfo &) {
@@ -64,8 +77,13 @@ optional_ptr<CatalogEntry> MnemonicSchemaEntry::CreateType(CatalogTransaction, C
 	throw Unsupported("CREATE TYPE");
 }
 
-optional_ptr<CatalogEntry> MnemonicSchemaEntry::LookupEntry(CatalogTransaction, const EntryLookupInfo &) {
-	return nullptr;
+optional_ptr<CatalogEntry> MnemonicSchemaEntry::LookupEntry(CatalogTransaction transaction,
+                                                            const EntryLookupInfo &lookup_info) {
+	if (lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY) {
+		return nullptr;
+	}
+	auto generation = catalog.Cast<MnemonicCatalog>().GetGeneration(transaction);
+	return generation->GetTable(name.GetIdentifierName(), lookup_info.GetEntryName()).get();
 }
 
 void MnemonicSchemaEntry::DropEntry(ClientContext &, DropInfo &) {

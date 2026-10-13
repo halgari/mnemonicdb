@@ -5,6 +5,9 @@
 
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
+#include "rocksdb/write_batch.h"
+
+#include <cstring>
 
 namespace mnemonicdb {
 
@@ -12,6 +15,27 @@ using duckdb::IOException;
 
 static constexpr const char *META_FORMAT_VERSION = "format_version";
 static constexpr const char *META_LAST_TX = "last_tx";
+static constexpr const char *META_LAST_INSTANT = "last_instant";
+//! Followed by one partition byte
+static constexpr const char *META_NEXT_LOCAL = "next_local/";
+
+//! First local number handed out per partition; lower numbers are reserved for built-in entities
+static uint64_t FirstLocal(uint8_t part) {
+	switch (part) {
+	case partition::ATTR:
+		return 64;
+	case partition::TABLE:
+		return 16;
+	default:
+		return 1;
+	}
+}
+
+static string NextLocalKey(uint8_t part) {
+	string key = META_NEXT_LOCAL;
+	key.push_back(static_cast<char>(part));
+	return key;
+}
 
 const char *ColumnFamilyName(ColumnFamily cf) {
 	switch (cf) {
@@ -100,6 +124,7 @@ unique_ptr<Store> Store::Open(const string &path, bool read_only) {
 	store->db->DestroyColumnFamilyHandle(all_handles[0]);
 	store->handles.assign(all_handles.begin() + 1, all_handles.end());
 
+	store->created = created;
 	store->LoadMeta(created);
 	return store;
 }
@@ -137,6 +162,88 @@ void Store::LoadMeta(bool created) {
 	}
 	CheckStatus(status, path);
 	last_tx = GetBigEndian(value.data(), 8);
+
+	status = db->Get(rocksdb::ReadOptions(), &meta, META_LAST_INSTANT, &value);
+	if (status.ok() && value.size() == 8) {
+		last_instant = static_cast<int64_t>(GetBigEndian(value.data(), 8));
+	}
+
+	for (idx_t part = 0; part < next_local.size(); part++) {
+		next_local[part] = FirstLocal(static_cast<uint8_t>(part));
+	}
+	std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(rocksdb::ReadOptions(), &meta));
+	for (it->Seek(META_NEXT_LOCAL); it->Valid() && it->key().starts_with(META_NEXT_LOCAL); it->Next()) {
+		auto key = it->key();
+		auto val = it->value();
+		if (key.size() != strlen(META_NEXT_LOCAL) + 1 || val.size() != 8) {
+			throw IOException("MnemonicDB: \"%s\" has a malformed ID counter", path);
+		}
+		auto part = static_cast<uint8_t>(key[key.size() - 1]);
+		next_local[part] = GetBigEndian(val.data(), 8);
+	}
+	CheckStatus(it->status(), path);
+}
+
+void Store::AcquireWriter() {
+	if (read_only) {
+		throw duckdb::InvalidInputException("MnemonicDB: database \"%s\" is attached read-only", path);
+	}
+	std::unique_lock<std::mutex> guard(writer_lock);
+	writer_released.wait(guard, [&] { return !writer_active; });
+	writer_active = true;
+}
+
+void Store::ReleaseWriter() {
+	{
+		std::lock_guard<std::mutex> guard(writer_lock);
+		D_ASSERT(writer_active);
+		writer_active = false;
+	}
+	writer_released.notify_one();
+}
+
+EntityId Store::AllocateId(uint8_t part) {
+	D_ASSERT(writer_active);
+	if (part == partition::TEMP || part == partition::TX) {
+		throw duckdb::InternalException("cannot allocate IDs in partition %d", part);
+	}
+	auto local = next_local[part];
+	auto limit = (part == partition::ATTR || part == partition::TABLE) ? uint64_t(UINT16_MAX) : LOCAL_MASK;
+	if (local > limit) {
+		throw duckdb::InvalidInputException("MnemonicDB: partition %d has no IDs left", part);
+	}
+	next_local[part] = local + 1;
+	next_local_dirty[part] = true;
+	return MakeEntityId(part, local);
+}
+
+void Store::Commit(rocksdb::WriteBatch &batch, TxId tx, int64_t instant) {
+	D_ASSERT(writer_active);
+	if (tx != last_tx + 1) {
+		throw duckdb::InternalException("MnemonicDB: committing tx %d after tx %d", tx, last_tx.load());
+	}
+	auto &meta = GetHandle(ColumnFamily::META);
+	string tx_value;
+	PutBigEndian(tx_value, tx, 8);
+	CheckStatus(batch.Put(&meta, META_LAST_TX, tx_value), path);
+	string instant_value;
+	PutBigEndian(instant_value, static_cast<uint64_t>(instant), 8);
+	CheckStatus(batch.Put(&meta, META_LAST_INSTANT, instant_value), path);
+	for (idx_t part = 0; part < next_local.size(); part++) {
+		if (!next_local_dirty[part]) {
+			continue;
+		}
+		string value;
+		PutBigEndian(value, next_local[part], 8);
+		CheckStatus(batch.Put(&meta, NextLocalKey(static_cast<uint8_t>(part)), value), path);
+	}
+
+	rocksdb::WriteOptions write_options;
+	write_options.sync = true;
+	CheckStatus(db->Write(write_options, &batch), path);
+	next_local_dirty.fill(false);
+	last_instant = instant;
+	last_tx = tx;
 }
 
 void Store::Flush() {

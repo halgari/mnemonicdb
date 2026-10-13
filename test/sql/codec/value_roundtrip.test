@@ -1,0 +1,440 @@
+# name: test/sql/codec/value_roundtrip.test
+# description: mnemonicdb_decode(mnemonicdb_encode(x), type) gives back x for every supported type
+# group: [codec]
+
+require mnemonicdb
+
+# Each section builds a table rt_<name>(x, d) where d is the decoded encoding of x.
+# The loop at the end checks d = x both by value and by text, so normalizations
+# (e.g. INTERVAL '1 month' vs '30 days', which DuckDB considers equal) are caught.
+
+# NULL in, NULL out
+query II
+SELECT mnemonicdb_encode(NULL::INTEGER), mnemonicdb_decode(NULL::BLOB, 'INTEGER')
+----
+NULL	NULL
+
+#
+# Integers: 0..±1000 and ±(2^k - 1, 2^k, 2^k + 1) for k up to 127, cast to every width
+#
+
+statement ok
+CREATE TABLE int_strs AS
+WITH RECURSIVE p(k, v) AS (SELECT 0, 1::UHUGEINT UNION ALL SELECT k + 1, v * 2 FROM p WHERE k < 127)
+SELECT DISTINCT s FROM (
+	SELECT range::VARCHAR s FROM range(-1000, 1001)
+	UNION ALL SELECT (v - 1)::VARCHAR FROM p
+	UNION ALL SELECT v::VARCHAR FROM p
+	UNION ALL SELECT (v + 1)::VARCHAR FROM p
+	UNION ALL SELECT '-' || (v - 1)::VARCHAR FROM p
+	UNION ALL SELECT '-' || v::VARCHAR FROM p
+	UNION ALL SELECT '-' || (v + 1)::VARCHAR FROM p
+	UNION ALL VALUES ('340282366920938463463374607431768211455')
+) WHERE s <> '-0'
+
+foreach type TINYINT SMALLINT INTEGER BIGINT HUGEINT UTINYINT USMALLINT UINTEGER UBIGINT UHUGEINT
+
+statement ok
+CREATE TABLE rt_{type} AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), '{type}') d
+FROM (SELECT TRY_CAST(s AS {type}) x FROM int_strs) WHERE x IS NOT NULL
+
+endloop
+
+# Every value of the 8-bit types is present, plus the extremes of the wider ones
+query IIIIII
+SELECT (SELECT count(*) FROM rt_TINYINT), (SELECT count(*) FROM rt_UTINYINT),
+       (SELECT min(x)::VARCHAR || ' ' || max(x)::VARCHAR FROM rt_BIGINT),
+       (SELECT min(x)::VARCHAR || ' ' || max(x)::VARCHAR FROM rt_HUGEINT),
+       (SELECT max(x)::VARCHAR FROM rt_UBIGINT),
+       (SELECT max(x)::VARCHAR FROM rt_UHUGEINT)
+----
+256	256	-9223372036854775808 9223372036854775807	-170141183460469231731687303715884105728 170141183460469231731687303715884105727	18446744073709551615	340282366920938463463374607431768211455
+
+# BIGNUM: same set plus values far beyond 128 bits
+statement ok
+CREATE TABLE rt_BIGNUM AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'BIGNUM') d FROM (
+	SELECT s::BIGNUM x FROM int_strs
+	UNION ALL SELECT ('1' || repeat('0', n))::BIGNUM FROM range(30, 400, 37) r(n)
+	UNION ALL SELECT ('-' || repeat('9', n))::BIGNUM FROM range(30, 400, 37) r(n)
+)
+
+#
+# BOOLEAN
+#
+
+statement ok
+CREATE TABLE rt_BOOLEAN AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'BOOLEAN') d FROM (VALUES (true), (false), (NULL)) t(x)
+
+#
+# DECIMAL: integer parts from int_strs combined with fractional parts, at several widths/scales.
+# TRY_CAST drops values that overflow the width (and rounds extra fractional digits).
+#
+
+statement ok
+CREATE TABLE dec_strs AS
+SELECT s || '.' || f AS s FROM (SELECT s FROM int_strs WHERE length(s) <= 39) i, (VALUES ('0'), ('5'), ('05'), ('123456789'), ('99999999999999999999')) t(f)
+
+foreach w,s 1,0 4,1 5,2 9,4 10,0 18,6 18,18 19,0 38,0 38,10 38,38
+
+statement ok
+CREATE TABLE rt_dec_{w}_{s} AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'DECIMAL({w},{s})') d
+FROM (
+	SELECT DISTINCT x FROM (
+		SELECT TRY_CAST(s AS DECIMAL({w},{s})) x FROM dec_strs
+		-- the largest and smallest values of the type
+		UNION ALL SELECT (sign || repeat('9', {w} - {s}) || '.' || repeat('9', {s}))::DECIMAL({w},{s}) FROM (VALUES (''), ('-')) t(sign)
+	)
+) WHERE x IS NOT NULL
+
+endloop
+
+# The widest decimals keep all 38 digits
+query III
+SELECT (SELECT max(x)::VARCHAR FROM rt_dec_38_10), (SELECT min(x)::VARCHAR FROM rt_dec_38_0), (SELECT max(x)::VARCHAR FROM rt_dec_38_38)
+----
+9999999999999999999999999999.9999999999	-99999999999999999999999999999999999999	.99999999999999999999999999999999999999
+
+#
+# FLOAT / DOUBLE: integers, exact powers of two (incl. subnormals), fractions, ±inf, NaN.
+# -0.0 is handled separately below (tiny negative doubles underflow to it as FLOAT, so it is filtered out).
+#
+
+statement ok
+CREATE TABLE dbl_vals AS SELECT DISTINCT x FROM (
+	SELECT TRY_CAST(s AS DOUBLE) x FROM int_strs
+	UNION ALL SELECT pow(2.0, k) FROM range(-1074, 1024) r(k)
+	UNION ALL SELECT -pow(2.0, k) FROM range(-1074, 1024) r(k)
+	UNION ALL SELECT 1.0 / k FROM range(1, 1000) r(k)
+	UNION ALL SELECT -1.0 / k FROM range(1, 1000) r(k)
+	UNION ALL VALUES ('inf'::DOUBLE), ('-inf'::DOUBLE), ('nan'::DOUBLE), (1.7976931348623157e308), (-1.7976931348623157e308),
+	                 (2.2250738585072014e-308), (2.225073858507201e-308), (4.9e-324), (-4.9e-324), (0.0), (NULL)
+)
+
+statement ok
+CREATE TABLE rt_DOUBLE AS SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'DOUBLE') d FROM dbl_vals
+
+statement ok
+CREATE TABLE rt_FLOAT AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'FLOAT') d FROM (
+	SELECT DISTINCT TRY_CAST(x AS FLOAT) x FROM dbl_vals
+	UNION ALL VALUES (1.4e-45::FLOAT), (-1.4e-45::FLOAT), (1.1754942e-38::FLOAT), (3.4028235e38::FLOAT), ('nan'::FLOAT)
+) WHERE NOT (x = 0 AND signbit(x)) OR x IS NULL
+
+# Subnormals, infinities and NaN survive with their exact bits
+query IIIIII
+SELECT mnemonicdb_decode(mnemonicdb_encode(4.9e-324), 'DOUBLE') = 4.9e-324,
+       mnemonicdb_decode(mnemonicdb_encode(-4.9e-324), 'DOUBLE') = -4.9e-324,
+       mnemonicdb_decode(mnemonicdb_encode(1.4e-45::FLOAT), 'FLOAT') = 1.4e-45::FLOAT,
+       mnemonicdb_decode(mnemonicdb_encode('-inf'::DOUBLE), 'DOUBLE'),
+       isnan(mnemonicdb_decode(mnemonicdb_encode('nan'::DOUBLE), 'DOUBLE')),
+       isnan(mnemonicdb_decode(mnemonicdb_encode('nan'::FLOAT), 'FLOAT'))
+----
+true	true	true	-inf	true	true
+
+# Intentional: -0.0 is normalized to 0.0 (the sort key canonicalizes it, since -0.0 = 0.0),
+# so both zeros share one encoding and the sign bit is lost.
+query IIII
+SELECT mnemonicdb_encode(-0.0::DOUBLE) = mnemonicdb_encode(0.0::DOUBLE),
+       mnemonicdb_encode(-0.0::FLOAT) = mnemonicdb_encode(0.0::FLOAT),
+       signbit(mnemonicdb_decode(mnemonicdb_encode(-0.0::DOUBLE), 'DOUBLE')),
+       mnemonicdb_decode(mnemonicdb_encode(-0.0::DOUBLE), 'DOUBLE') = -0.0::DOUBLE
+----
+true	true	false	true
+
+# Likewise every NaN payload maps to one canonical NaN encoding
+query I
+SELECT mnemonicdb_encode('nan'::DOUBLE) = mnemonicdb_encode(-('nan'::DOUBLE))
+----
+true
+
+#
+# Dates and times, including infinities
+#
+
+statement ok
+CREATE TABLE rt_DATE AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'DATE') d FROM (
+	SELECT DATE '1970-01-01' + r::INTEGER x FROM range(-800000, 800000, 997) t(r)
+	UNION ALL VALUES ('infinity'::DATE), ('-infinity'::DATE), ('0001-01-01'::DATE), ('9999-12-31'::DATE), ('1969-12-31'::DATE), (NULL)
+)
+
+statement ok
+CREATE TABLE rt_TIME AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'TIME') d FROM (
+	SELECT TIME '00:00:00' + to_microseconds(r * 7777777) x FROM range(0, 11200) t(r)
+	UNION ALL VALUES ('00:00:00'::TIME), ('23:59:59.999999'::TIME), ('24:00:00'::TIME), (NULL)
+)
+
+statement ok
+CREATE TABLE rt_TIME_NS AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'TIME_NS') d FROM (
+	SELECT (left((TIME '00:00:00' + to_microseconds(r * 7777777))::VARCHAR, 8) || '.' || lpad((r * 7919 % 1000000000)::VARCHAR, 9, '0'))::TIME_NS x
+	FROM range(0, 11000) t(r)
+	UNION ALL VALUES ('00:00:00'::TIME_NS), ('23:59:59.999999999'::TIME_NS), (NULL)
+)
+
+statement ok
+CREATE TABLE rt_TIME_TZ AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'TIMETZ') d FROM (
+	SELECT (t::VARCHAR || o)::TIMETZ x
+	FROM (SELECT TIME '00:00:00' + to_microseconds(r * 977777777) t FROM range(0, 90) t(r)),
+	     (VALUES ('+00'), ('+05:30'), ('-08'), ('+15:59'), ('-15:59'), ('+00:01')) o(o)
+	UNION ALL VALUES ('24:00:00+00'::TIMETZ), (NULL)
+)
+
+statement ok
+CREATE TABLE ts_vals AS
+SELECT x FROM generate_series(TIMESTAMP '1700-01-01', TIMESTAMP '2250-01-01', INTERVAL '977 hours 13 minutes 7.123456 seconds') t(x)
+
+foreach type TIMESTAMP TIMESTAMP_S TIMESTAMP_MS TIMESTAMP_NS TIMESTAMPTZ
+
+statement ok
+CREATE TABLE rt_{type} AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), '{type}') d FROM (
+	SELECT x::{type} x FROM ts_vals
+	UNION ALL VALUES ('infinity'::{type}), ('-infinity'::{type}), (NULL)
+)
+
+endloop
+
+# TIMESTAMPTZ_NS keeps the nanosecond digits
+statement ok
+CREATE TABLE rt_TIMESTAMPTZ_NS AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'TIMESTAMPTZ_NS') d FROM (
+	SELECT (strftime(x, '%Y-%m-%d %H:%M:%S') || '.' || lpad((abs(epoch_us(x)) % 999999937)::VARCHAR, 9, '0') || '+00')::TIMESTAMPTZ_NS x FROM ts_vals
+	UNION ALL VALUES ('infinity'::TIMESTAMPTZ_NS), ('-infinity'::TIMESTAMPTZ_NS), (NULL)
+)
+
+# INTERVAL: months, days and micros are stored separately and come back unnormalized
+statement ok
+CREATE TABLE rt_INTERVAL AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'INTERVAL') d FROM (
+	SELECT to_months(m) + to_days(dd) + to_microseconds(u) x
+	FROM (VALUES (0), (1), (-1), (12), (2147483647), (-2147483647)) a(m),
+	     (VALUES (0), (1), (-1), (30), (31), (-30), (2147483647)) b(dd),
+	     (VALUES (0), (1), (-1), (86400000000), (-86400000000), (9223372036854775807), (-9223372036854775807)) c(u)
+	UNION ALL VALUES (NULL)
+)
+
+query III
+SELECT mnemonicdb_decode(mnemonicdb_encode(INTERVAL '30 days'), 'INTERVAL')::VARCHAR,
+       mnemonicdb_decode(mnemonicdb_encode(INTERVAL '24 hours'), 'INTERVAL')::VARCHAR,
+       mnemonicdb_encode(INTERVAL '1 month') = mnemonicdb_encode(INTERVAL '30 days')
+----
+30 days	24:00:00	false
+
+#
+# Strings and blobs
+#
+
+# VARCHAR: empty, every BMP code point and a sample of astral ones (chr(0) and chr(1) included),
+# embedded control bytes, all prefixes of a string, and long strings
+statement ok
+CREATE TABLE rt_VARCHAR AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'VARCHAR') d FROM (
+	SELECT chr(r::INTEGER) x FROM range(0, 55296) t(r)
+	UNION ALL SELECT chr(r::INTEGER) FROM range(57344, 1114112, 97) t(r)
+	UNION ALL SELECT 'a' || chr(r::INTEGER) || 'b' FROM range(0, 256) t(r)
+	UNION ALL SELECT left('hello🦆wörld', n::INTEGER) FROM range(0, 13) t(n)
+	UNION ALL SELECT repeat('x', n::INTEGER) FROM range(0, 5000, 499) t(n)
+	UNION ALL VALUES (''), (chr(0)), (chr(0) || chr(0)), (chr(1) || chr(0) || chr(1)), (repeat('🦆', 100000)),
+	                 (repeat(chr(0), 1000)), (repeat(chr(127), 1000)), (NULL)
+)
+
+query I
+SELECT octet_length(mnemonicdb_decode(mnemonicdb_encode('a' || chr(0) || 'b'), 'VARCHAR')::BLOB)
+----
+3
+
+# BLOB: every single byte, every pair of the bytes that the escaping touches, long blobs
+statement ok
+CREATE TABLE bytes AS SELECT unhex(printf('%02X', r)) b FROM range(0, 256) t(r)
+
+statement ok
+CREATE TABLE rt_BLOB AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'BLOB') d FROM (
+	SELECT b x FROM bytes
+	UNION ALL SELECT p.b || q.b FROM bytes p, bytes q
+	WHERE p.b IN ('\x00'::BLOB, '\x01'::BLOB, '\x02'::BLOB, '\xFE'::BLOB, '\xFF'::BLOB, 'a'::BLOB)
+	UNION ALL SELECT unhex(repeat('00', n::INTEGER)) FROM range(0, 300, 7) t(n)
+	UNION ALL SELECT unhex(repeat('01', n::INTEGER)) FROM range(0, 300, 7) t(n)
+	UNION ALL SELECT unhex(repeat('FF', n::INTEGER)) FROM range(0, 300, 7) t(n)
+	UNION ALL SELECT unhex(repeat('0001FF02', 50000))
+	UNION ALL VALUES (''::BLOB), (NULL)
+)
+
+# BIT: binary strings of 1..80 bits, with and without leading zeros
+statement ok
+CREATE TABLE rt_BIT AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'BIT') d FROM (
+	SELECT bin(r)::BIT x FROM range(0, 1025) t(r)
+	UNION ALL SELECT lpad(bin(r), w::INTEGER, '0')::BIT FROM range(0, 64) t(r), range(7, 18) w(w)
+	UNION ALL SELECT repeat('1', n::INTEGER)::BIT FROM range(1, 81) t(n)
+	UNION ALL SELECT repeat('0', n::INTEGER)::BIT FROM range(1, 81) t(n)
+	UNION ALL VALUES (NULL)
+)
+
+# UUID
+statement ok
+CREATE TABLE rt_UUID AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'UUID') d FROM (
+	SELECT md5(r::VARCHAR)::UUID x FROM range(0, 2000) t(r)
+	UNION ALL VALUES ('00000000-0000-0000-0000-000000000000'::UUID), ('ffffffff-ffff-ffff-ffff-ffffffffffff'::UUID),
+	                 ('7fffffff-ffff-ffff-ffff-ffffffffffff'::UUID), ('80000000-0000-0000-0000-000000000000'::UUID), (NULL)
+)
+
+# ENUM: small (1-byte), and large (>255 entries, so a wider physical type); decode by name or inline
+statement ok
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')
+
+statement ok
+CREATE TYPE big_enum AS ENUM (SELECT 'e' || range FROM range(70000))
+
+statement ok
+CREATE TABLE rt_ENUM AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'mood') d FROM (
+	SELECT unnest(enum_range(NULL::mood))::mood x UNION ALL VALUES (NULL::mood)
+)
+
+statement ok
+CREATE TABLE rt_ENUM_inline AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'ENUM(''sad'', ''ok'', ''happy'')') d FROM (
+	SELECT unnest(enum_range(NULL::mood))::mood x
+)
+
+statement ok
+CREATE TABLE rt_ENUM_big AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'big_enum') d FROM (
+	SELECT unnest(enum_range(NULL::big_enum))::big_enum x
+)
+
+query I
+SELECT count(*) FROM rt_ENUM_big
+----
+70000
+
+#
+# Nested types
+#
+
+# STRUCT, with NULL fields and NULL structs
+statement ok
+CREATE TABLE rt_STRUCT AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'STRUCT(a INTEGER, b VARCHAR)') d FROM (
+	SELECT {'a': a, 'b': b} x
+	FROM (VALUES (NULL), (0), (-1), (1), (2147483647)) t(a), (VALUES (NULL), (''), ('a'), (chr(0)), ('ab')) u(b)
+	UNION ALL VALUES (NULL::STRUCT(a INTEGER, b VARCHAR))
+)
+
+# LIST: empty, NULL elements, NULL list, varying lengths
+statement ok
+CREATE TABLE rt_LIST AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'INTEGER[]') d FROM (
+	SELECT range(n)::INTEGER[] x FROM range(0, 50) t(n)
+	UNION ALL SELECT list_transform(range(n), lambda i: CASE WHEN i % 3 = 0 THEN NULL ELSE i - 5 END)::INTEGER[] FROM range(0, 50) t(n)
+	UNION ALL VALUES ([]::INTEGER[]), ([NULL]::INTEGER[]), ([NULL, NULL]::INTEGER[]), ([0]), ([-1, 0, 1]), (NULL::INTEGER[])
+)
+
+statement ok
+CREATE TABLE rt_LIST_VARCHAR AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'VARCHAR[]') d FROM (
+	VALUES ([]::VARCHAR[]), ([''] ), (['', '']), ([NULL]::VARCHAR[]), (['a', NULL, '']), ([chr(0), chr(1)]),
+	       (['a', 'ab', 'abc']), ([repeat('z', 10000)]), (NULL::VARCHAR[])
+) t(x)
+
+statement ok
+CREATE TABLE rt_LIST_BLOB AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'BLOB[]') d FROM (
+	VALUES ([]::BLOB[]), ([''::BLOB]), (['\x00'::BLOB, '\x01'::BLOB, '\xFF'::BLOB]), (['\x00\x00'::BLOB, NULL])
+) t(x)
+
+statement ok
+CREATE TABLE rt_LIST_LIST AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'INTEGER[][]') d FROM (
+	VALUES ([]::INTEGER[][]), ([[]]::INTEGER[][]), ([[], []]::INTEGER[][]), ([NULL]::INTEGER[][]), ([[NULL]]::INTEGER[][]),
+	       ([[1, 2], [], NULL, [3]]), (NULL::INTEGER[][])
+) t(x)
+
+# MAP
+statement ok
+CREATE TABLE rt_MAP AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'MAP(VARCHAR, INTEGER)') d FROM (
+	VALUES (MAP {}::MAP(VARCHAR, INTEGER)), (MAP {'a': 1}), (MAP {'a': NULL}), (MAP {'': 0, 'b': -1, 'c': NULL}),
+	       (NULL::MAP(VARCHAR, INTEGER))
+) t(x)
+
+# ARRAY (fixed size), incl. NULL elements and nesting
+statement ok
+CREATE TABLE rt_ARRAY AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'INTEGER[3]') d FROM (
+	VALUES ([1, 2, 3]::INTEGER[3]), ([NULL, NULL, NULL]::INTEGER[3]), ([0, NULL, -1]::INTEGER[3]), (NULL::INTEGER[3])
+) t(x)
+
+statement ok
+CREATE TABLE rt_ARRAY_nested AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'VARCHAR[2][2]') d FROM (
+	VALUES ([['a', ''], [NULL, chr(0)]]::VARCHAR[2][2]), ([NULL, ['x', 'y']]::VARCHAR[2][2])
+) t(x)
+
+# UNION: each member, NULL members, NULL union
+statement ok
+CREATE TABLE rt_UNION AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x), 'UNION(a INTEGER, b VARCHAR, c DOUBLE[])') d FROM (
+	SELECT union_value(a := r::INTEGER)::UNION(a INTEGER, b VARCHAR, c DOUBLE[]) x FROM range(-3, 4) t(r)
+	UNION ALL SELECT union_value(b := s)::UNION(a INTEGER, b VARCHAR, c DOUBLE[]) FROM (VALUES (''), ('x'), (NULL)) t(s)
+	UNION ALL SELECT union_value(c := l)::UNION(a INTEGER, b VARCHAR, c DOUBLE[]) FROM (VALUES ([]::DOUBLE[]), ([1.5, NULL])) t(l)
+	UNION ALL VALUES (NULL::UNION(a INTEGER, b VARCHAR, c DOUBLE[]))
+)
+
+# Deep nesting: LIST of STRUCT of LIST of STRUCT holding ARRAY, MAP and UNION
+statement ok
+CREATE TABLE rt_DEEP AS
+SELECT x, mnemonicdb_decode(mnemonicdb_encode(x),
+	'STRUCT(k VARCHAR, v STRUCT(x INTEGER[2], y MAP(VARCHAR, BLOB), z UNION(i INTEGER, s VARCHAR))[])[]') d
+FROM (
+	SELECT [
+		{'k': 'a' || r, 'v': [{'x': [r, NULL], 'y': MAP {'m': '\x00\xFF'::BLOB}, 'z': union_value(i := r::INTEGER)}, NULL]},
+		NULL,
+		{'k': NULL, 'v': []},
+		{'k': '', 'v': NULL}
+	]::STRUCT(k VARCHAR, v STRUCT(x INTEGER[2], y MAP(VARCHAR, BLOB), z UNION(i INTEGER, s VARCHAR))[])[] x
+	FROM range(0, 20) t(r)
+	UNION ALL VALUES ([]::STRUCT(k VARCHAR, v STRUCT(x INTEGER[2], y MAP(VARCHAR, BLOB), z UNION(i INTEGER, s VARCHAR))[])[])
+)
+
+#
+# Check every rt_ table: decoded = original, by value and by text
+#
+
+foreach tbl rt_TINYINT rt_SMALLINT rt_INTEGER rt_BIGINT rt_HUGEINT rt_UTINYINT rt_USMALLINT rt_UINTEGER rt_UBIGINT rt_UHUGEINT rt_BIGNUM rt_BOOLEAN rt_dec_1_0 rt_dec_4_1 rt_dec_5_2 rt_dec_9_4 rt_dec_10_0 rt_dec_18_6 rt_dec_18_18 rt_dec_19_0 rt_dec_38_0 rt_dec_38_10 rt_dec_38_38 rt_DOUBLE rt_FLOAT rt_DATE rt_TIME rt_TIME_NS rt_TIME_TZ rt_TIMESTAMP rt_TIMESTAMP_S rt_TIMESTAMP_MS rt_TIMESTAMP_NS rt_TIMESTAMPTZ rt_TIMESTAMPTZ_NS rt_INTERVAL rt_VARCHAR rt_BLOB rt_BIT rt_UUID rt_ENUM rt_ENUM_inline rt_ENUM_big rt_STRUCT rt_LIST rt_LIST_VARCHAR rt_LIST_BLOB rt_LIST_LIST rt_MAP rt_ARRAY rt_ARRAY_nested rt_UNION rt_DEEP
+
+query II
+SELECT count(*) FILTER (WHERE d IS DISTINCT FROM x OR d::VARCHAR IS DISTINCT FROM x::VARCHAR), count(*) > 1 FROM "{tbl}"
+----
+0	true
+
+endloop
+
+#
+# test_all_types(): every column on the allowlist (geometry and tuple are not; see value_errors.test)
+#
+
+foreach col bool tinyint smallint int bigint hugeint uhugeint utinyint usmallint uint ubigint bignum date time timestamp timestamp_s timestamp_ms timestamp_ns time_tz timestamp_tz timestamp_tz_ns float double dec_4_1 dec_9_4 dec_18_6 dec38_10 uuid interval varchar blob bit small_enum medium_enum large_enum int_array double_array date_array timestamp_array timestamptz_array varchar_array nested_int_array struct struct_of_arrays array_of_structs map union fixed_int_array fixed_varchar_array fixed_nested_int_array fixed_nested_varchar_array fixed_struct_array struct_of_fixed_array fixed_array_of_int_list list_of_fixed_int_array time_ns
+
+query II
+SELECT count(*) FILTER (WHERE d IS DISTINCT FROM x OR d::VARCHAR IS DISTINCT FROM x::VARCHAR), count(*)
+FROM (SELECT "{col}" x, mnemonicdb_decode(mnemonicdb_encode("{col}"), typeof("{col}")) d FROM test_all_types())
+----
+0	3
+
+endloop
+
+# The empty struct is rejected: its encoding would be zero bytes, a prefix of every other key
+statement error
+SELECT mnemonicdb_encode(empty_struct) FROM test_all_types()
+----
+empty STRUCT
