@@ -33,6 +33,7 @@ attributes	unique	VARCHAR
 attributes	indexed	BOOLEAN
 attributes	doc	VARCHAR
 tx	instant	TIMESTAMP WITH TIME ZONE
+attributes	index	VARCHAR
 
 # Built-in IDs: tables in partition 1, attributes in partition 0, the bootstrap tx in partition 2
 query II

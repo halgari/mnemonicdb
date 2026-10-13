@@ -24,10 +24,13 @@ public:
 	}
 	optional_ptr<MnemonicTableEntry> GetTable(const string &schema_name, const string &table_name) const;
 	void ScanTables(const string &schema_name, const std::function<void(CatalogEntry &)> &callback) const;
+	optional_ptr<CatalogEntry> GetIndex(const string &schema_name, const string &index_name) const;
+	void ScanIndexes(const string &schema_name, const std::function<void(CatalogEntry &)> &callback) const;
 
 private:
 	shared_ptr<const mnemonicdb::Schema> schema;
 	case_insensitive_map_t<case_insensitive_map_t<unique_ptr<MnemonicTableEntry>>> tables;
+	case_insensitive_map_t<case_insensitive_map_t<unique_ptr<CatalogEntry>>> indexes;
 };
 
 class MnemonicCatalog : public Catalog {
@@ -57,6 +60,8 @@ public:
 	                             PhysicalOperator &plan) override;
 	PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
 	                             PhysicalOperator &plan) override;
+	unique_ptr<LogicalOperator> BindCreateIndex(Binder &binder, CreateStatement &stmt, TableCatalogEntry &table,
+	                                            unique_ptr<LogicalOperator> plan) override;
 
 	DatabaseSize GetDatabaseSize(ClientContext &context) override;
 	bool SupportsTimeTravel() const override {

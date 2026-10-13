@@ -7,6 +7,8 @@
 
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/common/enum_util.hpp"
 
 namespace duckdb {
 
@@ -14,20 +16,24 @@ MnemonicSchemaEntry::MnemonicSchemaEntry(Catalog &catalog, CreateSchemaInfo &inf
     : SchemaCatalogEntry(catalog, info) {
 }
 
+static void ScanGeneration(const MnemonicCatalogGeneration &generation, const string &schema, CatalogType type,
+                           const std::function<void(CatalogEntry &)> &callback) {
+	if (type == CatalogType::TABLE_ENTRY) {
+		generation.ScanTables(schema, callback);
+	} else if (type == CatalogType::INDEX_ENTRY) {
+		generation.ScanIndexes(schema, callback);
+	}
+}
+
 void MnemonicSchemaEntry::Scan(ClientContext &context, CatalogType type,
                                const std::function<void(CatalogEntry &)> &callback) {
-	if (type != CatalogType::TABLE_ENTRY) {
-		return;
-	}
 	auto &mnemonic_catalog = catalog.Cast<MnemonicCatalog>();
-	MnemonicTransaction::Get(context, mnemonic_catalog).GetGeneration()->ScanTables(name.GetIdentifierName(), callback);
+	ScanGeneration(*MnemonicTransaction::Get(context, mnemonic_catalog).GetGeneration(), name.GetIdentifierName(), type,
+	               callback);
 }
 
 void MnemonicSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
-	if (type != CatalogType::TABLE_ENTRY) {
-		return;
-	}
-	catalog.Cast<MnemonicCatalog>().GetGeneration()->ScanTables(name.GetIdentifierName(), callback);
+	ScanGeneration(*catalog.Cast<MnemonicCatalog>().GetGeneration(), name.GetIdentifierName(), type, callback);
 }
 
 static NotImplementedException Unsupported(const string &what) {
@@ -79,15 +85,24 @@ optional_ptr<CatalogEntry> MnemonicSchemaEntry::CreateType(CatalogTransaction, C
 
 optional_ptr<CatalogEntry> MnemonicSchemaEntry::LookupEntry(CatalogTransaction transaction,
                                                             const EntryLookupInfo &lookup_info) {
-	if (lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY) {
+	auto type = lookup_info.GetCatalogType();
+	if (type != CatalogType::TABLE_ENTRY && type != CatalogType::INDEX_ENTRY) {
 		return nullptr;
 	}
 	auto generation = catalog.Cast<MnemonicCatalog>().GetGeneration(transaction);
+	if (type == CatalogType::INDEX_ENTRY) {
+		return generation->GetIndex(name.GetIdentifierName(), lookup_info.GetEntryName());
+	}
 	return generation->GetTable(name.GetIdentifierName(), lookup_info.GetEntryName()).get();
 }
 
-void MnemonicSchemaEntry::DropEntry(ClientContext &, DropInfo &) {
-	throw Unsupported("DROP");
+void MnemonicSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
+	if (info.type != CatalogType::INDEX_ENTRY) {
+		throw Unsupported("DROP " + EnumUtil::ToString(info.type));
+	}
+	auto &transaction = MnemonicTransaction::Get(context, catalog);
+	transaction.DropIndex(info.GetQualifiedName().Name().GetIdentifierName(),
+	                      info.if_not_found != OnEntryNotFound::THROW_EXCEPTION);
 }
 
 void MnemonicSchemaEntry::Alter(CatalogTransaction, AlterInfo &) {

@@ -6,6 +6,7 @@
 
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
@@ -163,10 +164,71 @@ optional_ptr<CatalogEntry> MnemonicTransaction::CreateTable(MnemonicSchemaEntry 
 	for (auto &attr : attributes) {
 		mnemonicdb::Schema::WriteAttribute(writer, schema, attr);
 	}
-	auto new_schema = schema.WithTable(table, attributes);
-	generation = make_shared_ptr<MnemonicCatalogGeneration>(catalog, std::move(new_schema));
-	schema_changed = true;
+	SetSchema(schema.WithTable(table, attributes));
 	return generation->GetTable(schema_name, table_name).get();
+}
+
+void MnemonicTransaction::SetSchema(shared_ptr<const mnemonicdb::Schema> schema) {
+	generation = make_shared_ptr<MnemonicCatalogGeneration>(catalog, std::move(schema));
+	schema_changed = true;
+}
+
+void MnemonicTransaction::CreateIndex(MnemonicTableEntry &table_entry, const string &index_name, const string &column,
+                                      bool if_not_exists) {
+	auto &schema = GetSchema();
+	auto table = schema.FindTable(table_entry.GetTableDef().id);
+	if (!table) {
+		throw CatalogException("MnemonicDB: table \"%s\" no longer exists", table_entry.name);
+	}
+	if (StringUtil::CIEquals(column, "id")) {
+		throw BinderException("MnemonicDB: the id column needs no index: it is the entity itself");
+	}
+	auto attr = schema.FindAttribute(*table, column);
+	if (!attr) {
+		throw BinderException("MnemonicDB: table \"%s\" has no column \"%s\"", table->name, column);
+	}
+	if (schema.FindIndex(index_name)) {
+		if (if_not_exists) {
+			return;
+		}
+		throw CatalogException::EntryAlreadyExists(CatalogType::INDEX_ENTRY, Identifier(index_name));
+	}
+	if (!attr->index_name.empty()) {
+		throw CatalogException("MnemonicDB: column \"%s\" is already indexed by \"%s\"", attr->name,
+		                       attr->index_name);
+	}
+	auto &writer = GetWriter();
+	auto indexed = *attr;
+	indexed.indexed = true;
+	indexed.index_name = index_name;
+	if (!attr->HasAvet()) {
+		writer.RebuildAvet(indexed, false);
+	}
+	mnemonicdb::Schema::WriteAttribute(writer, schema, indexed);
+	SetSchema(schema.WithAttribute(std::move(indexed)));
+}
+
+void MnemonicTransaction::DropIndex(const string &index_name, bool if_exists) {
+	auto &schema = GetSchema();
+	auto attr = schema.FindIndex(index_name);
+	if (!attr) {
+		if (if_exists) {
+			return;
+		}
+		throw CatalogException("MnemonicDB: index \"%s\" does not exist", index_name);
+	}
+	auto &writer = GetWriter();
+	auto &sys_indexed = schema.GetAttribute(mnemonicdb::sys::ATTRIBUTES_INDEXED);
+	auto &sys_index = schema.GetAttribute(mnemonicdb::sys::ATTRIBUTES_INDEX);
+	writer.RetractAll(sys_indexed, attr->id);
+	writer.RetractAll(sys_index, attr->id);
+	auto dropped = *attr;
+	dropped.indexed = false;
+	dropped.index_name.clear();
+	if (!dropped.HasAvet()) {
+		writer.RebuildAvet(*attr, true);
+	}
+	SetSchema(schema.WithAttribute(std::move(dropped)));
 }
 
 //===--------------------------------------------------------------------===//

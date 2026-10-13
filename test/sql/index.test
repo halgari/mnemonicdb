@@ -1,0 +1,520 @@
+# name: test/sql/index.test
+# description: CREATE INDEX builds AVET entries; filters on indexed columns and id narrow the scan but stay exact
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/index.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.person (name VARCHAR, email VARCHAR UNIQUE, age INTEGER, score DOUBLE, tags VARCHAR[])
+
+statement ok
+INSERT INTO d.person (name, email, age, score) SELECT 'p' || i, 'e' || i, i % 100, i / 7.0 FROM range(5000) t(i)
+
+# tx 4: change some ages so history exists before the index is built
+statement ok
+UPDATE d.person SET age = 1000 + age WHERE age < 3
+
+# Reference results, computed before any index exists (plain AEVT scans)
+statement ok
+CREATE TABLE ref_now AS SELECT id, name, age FROM d.person
+
+statement ok
+CREATE TABLE ref_then AS SELECT id, name, age FROM d.person AT (VERSION => 3)
+
+statement ok
+CREATE INDEX person_age ON d.person (age)
+
+query III
+SELECT index_name, table_name, sql FROM duckdb_indexes() WHERE database_name = 'd'
+----
+person_age	person	CREATE INDEX person_age ON person USING AVET (age);
+
+query TTT
+SELECT a.name, a.indexed, a.index FROM d.sys.attributes a WHERE a.index IS NOT NULL
+----
+age	true	person_age
+
+# Every filter shape gives the same answer as the unindexed reference, now and as of tx 3
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person WHERE age = 42 EXCEPT ALL SELECT * FROM ref_now WHERE age = 42)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person WHERE age = 42) = (SELECT count(*) FROM ref_now WHERE age = 42)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person AT (VERSION => 3) WHERE age = 42 EXCEPT ALL SELECT * FROM ref_then WHERE age = 42)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age = 42) = (SELECT count(*) FROM ref_then WHERE age = 42)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person WHERE age < 5 EXCEPT ALL SELECT * FROM ref_now WHERE age < 5)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person WHERE age < 5) = (SELECT count(*) FROM ref_now WHERE age < 5)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person AT (VERSION => 3) WHERE age < 5 EXCEPT ALL SELECT * FROM ref_then WHERE age < 5)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age < 5) = (SELECT count(*) FROM ref_then WHERE age < 5)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person WHERE age <= 5 EXCEPT ALL SELECT * FROM ref_now WHERE age <= 5)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person WHERE age <= 5) = (SELECT count(*) FROM ref_now WHERE age <= 5)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person AT (VERSION => 3) WHERE age <= 5 EXCEPT ALL SELECT * FROM ref_then WHERE age <= 5)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age <= 5) = (SELECT count(*) FROM ref_then WHERE age <= 5)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person WHERE age > 97 EXCEPT ALL SELECT * FROM ref_now WHERE age > 97)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person WHERE age > 97) = (SELECT count(*) FROM ref_now WHERE age > 97)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person AT (VERSION => 3) WHERE age > 97 EXCEPT ALL SELECT * FROM ref_then WHERE age > 97)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age > 97) = (SELECT count(*) FROM ref_then WHERE age > 97)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person WHERE age >= 1098 EXCEPT ALL SELECT * FROM ref_now WHERE age >= 1098)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person WHERE age >= 1098) = (SELECT count(*) FROM ref_now WHERE age >= 1098)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person AT (VERSION => 3) WHERE age >= 1098 EXCEPT ALL SELECT * FROM ref_then WHERE age >= 1098)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age >= 1098) = (SELECT count(*) FROM ref_then WHERE age >= 1098)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person WHERE age <> 42 EXCEPT ALL SELECT * FROM ref_now WHERE age <> 42)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person WHERE age <> 42) = (SELECT count(*) FROM ref_now WHERE age <> 42)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person AT (VERSION => 3) WHERE age <> 42 EXCEPT ALL SELECT * FROM ref_then WHERE age <> 42)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age <> 42) = (SELECT count(*) FROM ref_then WHERE age <> 42)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person WHERE age % 20 = 3 EXCEPT ALL SELECT * FROM ref_now WHERE age % 20 = 3)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person WHERE age % 20 = 3) = (SELECT count(*) FROM ref_now WHERE age % 20 = 3)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person AT (VERSION => 3) WHERE age % 20 = 3 EXCEPT ALL SELECT * FROM ref_then WHERE age % 20 = 3)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age % 20 = 3) = (SELECT count(*) FROM ref_then WHERE age % 20 = 3)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person WHERE age BETWEEN 10 AND 12 EXCEPT ALL SELECT * FROM ref_now WHERE age BETWEEN 10 AND 12)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person WHERE age BETWEEN 10 AND 12) = (SELECT count(*) FROM ref_now WHERE age BETWEEN 10 AND 12)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person AT (VERSION => 3) WHERE age BETWEEN 10 AND 12 EXCEPT ALL SELECT * FROM ref_then WHERE age BETWEEN 10 AND 12)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age BETWEEN 10 AND 12) = (SELECT count(*) FROM ref_then WHERE age BETWEEN 10 AND 12)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person WHERE age IN (1, 2, 1001) EXCEPT ALL SELECT * FROM ref_now WHERE age IN (1, 2, 1001))
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person WHERE age IN (1, 2, 1001)) = (SELECT count(*) FROM ref_now WHERE age IN (1, 2, 1001))
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person AT (VERSION => 3) WHERE age IN (1, 2, 1001) EXCEPT ALL SELECT * FROM ref_then WHERE age IN (1, 2, 1001))
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age IN (1, 2, 1001)) = (SELECT count(*) FROM ref_then WHERE age IN (1, 2, 1001))
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person WHERE age > 10 AND age < 12 EXCEPT ALL SELECT * FROM ref_now WHERE age > 10 AND age < 12)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person WHERE age > 10 AND age < 12) = (SELECT count(*) FROM ref_now WHERE age > 10 AND age < 12)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person AT (VERSION => 3) WHERE age > 10 AND age < 12 EXCEPT ALL SELECT * FROM ref_then WHERE age > 10 AND age < 12)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age > 10 AND age < 12) = (SELECT count(*) FROM ref_then WHERE age > 10 AND age < 12)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person WHERE age = 1 OR age = 1001 EXCEPT ALL SELECT * FROM ref_now WHERE age = 1 OR age = 1001)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person WHERE age = 1 OR age = 1001) = (SELECT count(*) FROM ref_now WHERE age = 1 OR age = 1001)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person AT (VERSION => 3) WHERE age = 1 OR age = 1001 EXCEPT ALL SELECT * FROM ref_then WHERE age = 1 OR age = 1001)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age = 1 OR age = 1001) = (SELECT count(*) FROM ref_then WHERE age = 1 OR age = 1001)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person WHERE age IS NULL EXCEPT ALL SELECT * FROM ref_now WHERE age IS NULL)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person WHERE age IS NULL) = (SELECT count(*) FROM ref_now WHERE age IS NULL)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person AT (VERSION => 3) WHERE age IS NULL EXCEPT ALL SELECT * FROM ref_then WHERE age IS NULL)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age IS NULL) = (SELECT count(*) FROM ref_then WHERE age IS NULL)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person WHERE age = NULL EXCEPT ALL SELECT * FROM ref_now WHERE age = NULL)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person WHERE age = NULL) = (SELECT count(*) FROM ref_now WHERE age = NULL)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person AT (VERSION => 3) WHERE age = NULL EXCEPT ALL SELECT * FROM ref_then WHERE age = NULL)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age = NULL) = (SELECT count(*) FROM ref_then WHERE age = NULL)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person WHERE age > 10 AND age < 10 EXCEPT ALL SELECT * FROM ref_now WHERE age > 10 AND age < 10)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person WHERE age > 10 AND age < 10) = (SELECT count(*) FROM ref_now WHERE age > 10 AND age < 10)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person AT (VERSION => 3) WHERE age > 10 AND age < 10 EXCEPT ALL SELECT * FROM ref_then WHERE age > 10 AND age < 10)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age > 10 AND age < 10) = (SELECT count(*) FROM ref_then WHERE age > 10 AND age < 10)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person WHERE 1000 < age EXCEPT ALL SELECT * FROM ref_now WHERE 1000 < age)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person WHERE 1000 < age) = (SELECT count(*) FROM ref_now WHERE 1000 < age)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person AT (VERSION => 3) WHERE 1000 < age EXCEPT ALL SELECT * FROM ref_then WHERE 1000 < age)
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person AT (VERSION => 3) WHERE 1000 < age) = (SELECT count(*) FROM ref_then WHERE 1000 < age)
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person WHERE age >= 2 AND age <= 1001 AND name LIKE 'p1%' EXCEPT ALL SELECT * FROM ref_now WHERE age >= 2 AND age <= 1001 AND name LIKE 'p1%')
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person WHERE age >= 2 AND age <= 1001 AND name LIKE 'p1%') = (SELECT count(*) FROM ref_now WHERE age >= 2 AND age <= 1001 AND name LIKE 'p1%')
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id, name, age FROM d.person AT (VERSION => 3) WHERE age >= 2 AND age <= 1001 AND name LIKE 'p1%' EXCEPT ALL SELECT * FROM ref_then WHERE age >= 2 AND age <= 1001 AND name LIKE 'p1%')
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age >= 2 AND age <= 1001 AND name LIKE 'p1%') = (SELECT count(*) FROM ref_then WHERE age >= 2 AND age <= 1001 AND name LIKE 'p1%')
+----
+true
+
+# Unique columns are always indexed
+query II
+SELECT name, age FROM d.person WHERE email = 'e1234'
+----
+p1234	34
+
+# id lookups
+query I
+SELECT name FROM d.person WHERE id = (SELECT id FROM ref_now WHERE name = 'p77')
+----
+p77
+
+query I
+SELECT count(*) FROM d.person WHERE id IN (SELECT id FROM ref_now WHERE age = 42)
+----
+50
+
+# An id that is not in the table, or not a valid entity id, finds nothing
+query I
+SELECT count(*) FROM d.person WHERE id = 12345
+----
+0
+
+query I
+SELECT count(*) FROM d.person WHERE id = 18446744073709551615
+----
+0
+
+# Writes after the index exists maintain it, including history
+statement ok
+UPDATE d.person SET age = 77777 WHERE name = 'p5'
+
+query II
+SELECT name, age FROM d.person WHERE age = 77777
+----
+p5	77777
+
+query I
+SELECT count(*) FROM d.person WHERE age = 5
+----
+49
+
+query I
+SELECT count(*) FROM d.person AT (VERSION => 5) WHERE age = 5
+----
+50
+
+statement ok
+DELETE FROM d.person WHERE age = 77777
+
+query I
+SELECT count(*) FROM d.person WHERE age = 77777
+----
+0
+
+# Index state is visible inside the creating transaction and gone after rollback
+statement ok
+BEGIN
+
+statement ok
+CREATE INDEX person_score ON d.person (score)
+
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE database_name = 'd'
+----
+2
+
+statement ok
+ROLLBACK
+
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE database_name = 'd'
+----
+1
+
+statement error
+CREATE INDEX person_age ON d.person (score)
+----
+already exists
+
+statement ok
+CREATE INDEX IF NOT EXISTS person_age ON d.person (score)
+
+statement error
+CREATE INDEX person_age2 ON d.person (age)
+----
+already indexed
+
+statement error
+CREATE INDEX bad ON d.person (age, score)
+----
+exactly one column
+
+statement error
+CREATE INDEX bad ON d.person ((age + 1))
+----
+exactly one column
+
+statement error
+CREATE UNIQUE INDEX bad ON d.person (score)
+----
+UNIQUE or PRIMARY KEY column constraint
+
+statement error
+CREATE INDEX bad ON d.person (id)
+----
+needs no index
+
+# Indexes persist
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/index.mnemonic' AS d (TYPE mnemonicdb)
+
+query I
+SELECT index_name FROM duckdb_indexes() WHERE database_name = 'd'
+----
+person_age
+
+query I
+SELECT count(*) FROM d.person WHERE age BETWEEN 10 AND 12
+----
+150
+
+statement ok
+DROP INDEX d.person_age
+
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE database_name = 'd'
+----
+0
+
+statement error
+DROP INDEX d.person_age
+----
+does not exist
+
+statement ok
+DROP INDEX IF EXISTS d.person_age
+
+# Filters still work without the index
+query I
+SELECT count(*) FROM d.person WHERE age BETWEEN 10 AND 12
+----
+150
+
+statement ok
+CREATE INDEX person_age ON d.person (age)
+
+query I
+SELECT count(*) FROM d.person WHERE age BETWEEN 10 AND 12
+----
+150
+
+query I
+SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age = 5
+----
+50

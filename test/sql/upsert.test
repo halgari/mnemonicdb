@@ -1,0 +1,100 @@
+# name: test/sql/upsert.test
+# description: ON CONFLICT and INSERT OR REPLACE resolve against UNIQUE / PRIMARY KEY attributes
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/upsert.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.person (name VARCHAR, email VARCHAR PRIMARY KEY, nick VARCHAR UNIQUE, age INTEGER)
+
+statement ok
+INSERT INTO d.person (name, email, nick, age) VALUES ('Alice', 'a@x', 'al', 30), ('Bob', 'b@x', 'bo', 40)
+
+statement ok
+CREATE TABLE ids AS SELECT name, id FROM d.person
+
+statement ok
+INSERT INTO d.person (name, email, age) VALUES ('Alice2', 'a@x', 31) ON CONFLICT (email) DO UPDATE SET age = excluded.age
+
+query IIII
+SELECT name, email, nick, age FROM d.person ORDER BY email
+----
+Alice	a@x	al	31
+Bob	b@x	bo	40
+
+# The conflicting row keeps its entity
+query I
+SELECT count(*) FROM d.person p JOIN ids USING (id) WHERE p.email = 'a@x' AND ids.name = 'Alice'
+----
+1
+
+statement ok
+INSERT INTO d.person (name, email, age) VALUES ('Zed', 'a@x', 99) ON CONFLICT DO NOTHING
+
+query II
+SELECT name, age FROM d.person WHERE email = 'a@x'
+----
+Alice	31
+
+# With several unique columns DuckDB needs an explicit conflict target
+statement error
+INSERT OR REPLACE INTO d.person (name, email, nick, age) VALUES ('Alicia', 'a@x', 'al', 32)
+----
+Conflict target has to be provided
+
+statement ok
+INSERT INTO d.person (name, email, nick, age) VALUES ('Alicia', 'a@x', 'al', 32), ('Carol', 'c@x', 'ca', 50)
+ON CONFLICT (email) DO UPDATE SET name = excluded.name, age = excluded.age
+
+query IIII
+SELECT name, email, nick, age FROM d.person ORDER BY email
+----
+Alicia	a@x	al	32
+Bob	b@x	bo	40
+Carol	c@x	ca	50
+
+# INSERT OR REPLACE on a table with a single key
+statement ok
+CREATE TABLE d.setting (k VARCHAR PRIMARY KEY, v INTEGER)
+
+statement ok
+INSERT INTO d.setting VALUES (NULL, 'a', 1), (NULL, 'b', 2)
+
+statement ok
+INSERT OR REPLACE INTO d.setting (k, v) VALUES ('a', 10), ('c', 3)
+
+query II
+SELECT k, v FROM d.setting ORDER BY k
+----
+a	10
+b	2
+c	3
+
+# Conflict on the UNIQUE (value) column
+statement ok
+INSERT INTO d.person (name, email, nick) VALUES ('Bobby', 'b2@x', 'bo') ON CONFLICT (nick) DO UPDATE SET name = excluded.name
+
+query II
+SELECT name, email FROM d.person WHERE nick = 'bo'
+----
+Bobby	b@x
+
+statement ok
+INSERT INTO d.person (email, age) VALUES ('d@x', 1), ('a@x', 33) ON CONFLICT (email) DO UPDATE SET age = excluded.age
+
+query II
+SELECT email, age FROM d.person ORDER BY email
+----
+a@x	33
+b@x	40
+c@x	50
+d@x	1
+
+# History records the upserts
+query I
+SELECT age FROM d.person AT (VERSION => 3) WHERE email = 'a@x'
+----
+30

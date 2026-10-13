@@ -224,9 +224,18 @@ attributes of `t`, keyed on E (all of them, because membership is "any
 attribute"). Only projected columns are decoded. Cardinality-many columns
 collect consecutive V's for the same E into a LIST. Output is sorted by E.
 
-Filter pushdown: an equality or range predicate on an AVET-indexed column
-seeds the scan from AVET and fills in the other columns by EAVT point
-lookups.
+Filter pushdown: the scan accepts every filter DuckDB pushes and applies it
+exactly to each row, in batches. Two kinds of filter also choose the
+driving mode:
+- equality or IN on `id`, which becomes a set of candidate entities;
+- comparisons, BETWEEN, IN, AND (ranges intersected) or OR on an
+  AVET-indexed cardinality-one column, which becomes encoded value ranges,
+  then candidate entities from AVET (plus `avet_hist` under `AT`).
+
+Candidates are filled in by EAVT point lookups. Every other query merges the
+AEVT ranges. (Declining filters through `supports_pushdown_type` breaks
+DuckDB's plan when the filtered column isn't projected, so the scan accepts
+them all.)
 
 Joins between tables are ordinary DuckDB joins for now. Because every scan
 comes out sorted by E, a later optimizer pass can fuse scans of the same
@@ -299,9 +308,9 @@ commits nothing and gets no `sys.tx` row. "Changed" means at least one
   entities. They leave this table but remain in any others.
 - **Single-datom add / retract.** Blind assertion or retraction of one
   datom, mainly for cardinality-many elements, without reading the current
-  set. Tentative shape: `CALL mnemonic_add('d.person', id, 'tags', 'x')` and
-  `CALL mnemonic_retract('d.person', id, 'tags', 'x')`. Same redundancy and
-  uniqueness rules as INSERT/UPDATE.
+  set: `CALL mnemonicdb_add('d.person', id, 'tags', 'x')` and
+  `CALL mnemonicdb_retract('d.person', id, 'tags', 'x')`. Same redundancy and
+  uniqueness rules as INSERT/UPDATE. They return whether anything changed.
 
 ## 7. Schema: the `sys` schema
 
@@ -329,9 +338,11 @@ everything else. Each attached database has a `sys` schema:
 - **`ALTER COLUMN ... TYPE`** is a bulk rewrite: every datom of the
   attribute is re-encoded in all indexes, history and `txlog` included.
   Only lossless conversions are allowed, and any failing cast aborts it.
-- **`CREATE INDEX` / `DROP INDEX`** build or drop AVET and `avet_hist`
-  entries for the attribute, history included. Unique attributes are always
-  indexed.
+- **`CREATE INDEX name ON t (col)` / `DROP INDEX name`** build or drop AVET
+  and `avet_hist` entries for the attribute, history included. The index
+  name is stored on the attribute entity (`sys.attributes.index`), and
+  `duckdb_indexes()` lists them. Unique attributes always have AVET, with or
+  without an index. Indexes cover exactly one column and take no options.
 
 ## 8. Code layout (planned)
 

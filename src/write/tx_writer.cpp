@@ -193,4 +193,26 @@ bool TxWriter::UndoRetraction(const AttributeDef &attr, EntityId e, const string
 	return false;
 }
 
+void TxWriter::RebuildAvet(const AttributeDef &attr, bool remove) {
+	auto prefix = AevtPrefix(attr.Local());
+	for (auto history : {false, true}) {
+		auto source = history ? ColumnFamily::AEVT_HIST : ColumnFamily::AEVT;
+		auto target = history ? ColumnFamily::AVET_HIST : ColumnFamily::AVET;
+		vector<std::pair<string, string>> entries;
+		auto it = view.NewIterator(source);
+		for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
+			auto datom = DecodeKey(IndexKind::AEVT, std::string_view(it->key().data(), it->key().size()));
+			entries.emplace_back(EncodeKey(IndexKind::AVET, datom), it->value().ToString());
+		}
+		CheckStatus(it->status());
+		for (auto &entry : entries) {
+			if (remove) {
+				Delete(target, entry.first);
+			} else {
+				Put(target, entry.first, entry.second);
+			}
+		}
+	}
+}
+
 } // namespace mnemonicdb

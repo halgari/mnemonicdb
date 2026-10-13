@@ -46,9 +46,9 @@ static LogicalType ValueTypeOf(const LogicalType &type) {
 }
 
 AttributeDef::AttributeDef(EntityId id_p, EntityId table_p, string name_p, LogicalType type_p, Uniqueness unique_p,
-                           bool indexed_p)
+                           bool indexed_p, string index_name_p)
     : id(id_p), table(table_p), name(std::move(name_p)), type(std::move(type_p)), unique(unique_p),
-      indexed(indexed_p), many(type.id() == LogicalTypeId::LIST), value_type(ValueTypeOf(type)),
+      indexed(indexed_p), index_name(std::move(index_name_p)), many(type.id() == LogicalTypeId::LIST), value_type(ValueTypeOf(type)),
       is_ref(IsRefType(value_type)), codec(is_ref ? LogicalType(LogicalTypeId::UBIGINT) : value_type, is_ref) {
 	if (PartitionOf(id) != partition::ATTR || LocalOf(id) > MAX_ATTR_LOCAL) {
 		throw duckdb::InternalException("attribute ID %d is not in the attribute partition", id);
@@ -84,6 +84,7 @@ static vector<BuiltinAttribute> BuiltinAttributes() {
 	     false},
 	    {sys::ATTRIBUTES_DOC, sys::ATTRIBUTES, "doc", varchar, Uniqueness::NONE, false},
 	    {sys::TX_INSTANT, sys::TX, "instant", LogicalType(LogicalTypeId::TIMESTAMP_TZ), Uniqueness::NONE, true},
+	    {sys::ATTRIBUTES_INDEX, sys::ATTRIBUTES, "index", varchar, Uniqueness::NONE, false},
 	};
 }
 
@@ -187,6 +188,36 @@ shared_ptr<Schema> Schema::WithTable(TableDef table, vector<AttributeDef> new_at
 	return result;
 }
 
+shared_ptr<Schema> Schema::WithAttribute(AttributeDef attribute) const {
+	auto result = duckdb::make_shared_ptr<Schema>(*this);
+	auto local = attribute.Local();
+	auto entry = result->attributes.find(local);
+	if (entry == result->attributes.end()) {
+		throw duckdb::InternalException("MnemonicDB: replacing unknown attribute %d", local);
+	}
+	entry->second = std::move(attribute);
+	return result;
+}
+
+const AttributeDef *Schema::FindIndex(const string &name) const {
+	for (auto &entry : attributes) {
+		if (!entry.second.index_name.empty() && duckdb::StringUtil::CIEquals(entry.second.index_name, name)) {
+			return &entry.second;
+		}
+	}
+	return nullptr;
+}
+
+vector<const AttributeDef *> Schema::IndexedAttributes() const {
+	vector<const AttributeDef *> result;
+	for (auto &entry : attributes) {
+		if (!entry.second.index_name.empty()) {
+			result.push_back(&entry.second);
+		}
+	}
+	return result;
+}
+
 //===--------------------------------------------------------------------===//
 // Loading and bootstrap
 //===--------------------------------------------------------------------===//
@@ -238,9 +269,10 @@ shared_ptr<Schema> Schema::Load(ReadView &view, duckdb::ClientContext &context) 
 		auto type_name = RequiredString(view, *schema, datom.e, sys::ATTRIBUTES_TYPE, "attribute type");
 		auto unique = CurrentValue(view, *schema, datom.e, sys::ATTRIBUTES_UNIQUE);
 		auto indexed = CurrentValue(view, *schema, datom.e, sys::ATTRIBUTES_INDEXED);
+		auto index_name = CurrentValue(view, *schema, datom.e, sys::ATTRIBUTES_INDEX);
 		user_attributes.emplace_back(datom.e, table, name, duckdb::TransformStringToLogicalType(type_name, context),
 		                             unique ? ParseUniqueness(unique->ToString()) : Uniqueness::NONE,
-		                             indexed && indexed->GetValue<bool>());
+		                             indexed && indexed->GetValue<bool>(), index_name ? index_name->ToString() : string());
 	}
 	std::sort(user_attributes.begin(), user_attributes.end(),
 	          [](const AttributeDef &a, const AttributeDef &b) { return a.id < b.id; });
@@ -285,6 +317,9 @@ void Schema::WriteAttribute(TxWriter &writer, const Schema &schema, const Attrib
 	}
 	if (attr.indexed) {
 		AssertValue(writer, schema, attr.id, sys::ATTRIBUTES_INDEXED, Value::BOOLEAN(true));
+	}
+	if (!attr.index_name.empty()) {
+		AssertValue(writer, schema, attr.id, sys::ATTRIBUTES_INDEX, Value(attr.index_name));
 	}
 }
 

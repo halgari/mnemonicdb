@@ -29,7 +29,8 @@ bool IsRefType(const LogicalType &type);
 
 //! One attribute: a column of a table
 struct AttributeDef {
-	AttributeDef(EntityId id, EntityId table, string name, LogicalType type, Uniqueness unique, bool indexed);
+	AttributeDef(EntityId id, EntityId table, string name, LogicalType type, Uniqueness unique, bool indexed,
+	             string index_name = string());
 
 	EntityId id;
 	EntityId table;
@@ -37,7 +38,9 @@ struct AttributeDef {
 	//! The declared column type; a top-level LIST means cardinality-many
 	LogicalType type;
 	Uniqueness unique;
+	//! Whether CREATE INDEX added AVET entries, and the index's name
 	bool indexed;
+	string index_name;
 
 	bool many;
 	//! The type of one stored value: the list element type when `many`, else `type`
@@ -87,6 +90,11 @@ public:
 
 	//! A copy of this schema with one more table; used for DDL inside a transaction
 	shared_ptr<Schema> WithTable(TableDef table, vector<AttributeDef> attributes) const;
+	//! A copy of this schema with one attribute definition replaced
+	shared_ptr<Schema> WithAttribute(AttributeDef attribute) const;
+	//! The attribute carrying the index named `name`, if any
+	const AttributeDef *FindIndex(const string &name) const;
+	vector<const AttributeDef *> IndexedAttributes() const;
 
 private:
 	void AddTable(TableDef table);
@@ -114,6 +122,7 @@ static constexpr AttrId ATTRIBUTES_UNIQUE = 7;
 static constexpr AttrId ATTRIBUTES_INDEXED = 8;
 static constexpr AttrId ATTRIBUTES_DOC = 9;
 static constexpr AttrId TX_INSTANT = 10;
+static constexpr AttrId ATTRIBUTES_INDEX = 11;
 } // namespace sys
 
 } // namespace mnemonicdb

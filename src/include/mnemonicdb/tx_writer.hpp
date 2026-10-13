@@ -60,13 +60,18 @@ public:
 	//! Retract every current value of (e, attr)
 	void RetractAll(const AttributeDef &attr, EntityId e);
 
+	//! Build (or, with `remove`, delete) the AVET and AVET history entries of an attribute from its AEVT entries
+	void RebuildAvet(const AttributeDef &attr, bool remove);
+
+	//! Raw index writes, for maintenance that bypasses datom semantics
+	void Put(ColumnFamily cf, const string &key, const string &value);
+	void Delete(ColumnFamily cf, const string &key);
+
 private:
 	void PutIndexes(const AttributeDef &attr, const Datom &datom);
 	void RetractDatom(const AttributeDef &attr, const Datom &datom);
 	bool UndoRetraction(const AttributeDef &attr, EntityId e, const string &v);
 	void CheckUnique(const AttributeDef &attr, EntityId e, const string &v);
-	void Put(ColumnFamily cf, const string &key, const string &value);
-	void Delete(ColumnFamily cf, const string &key);
 
 private:
 	Store &store;

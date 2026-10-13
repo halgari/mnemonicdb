@@ -13,6 +13,7 @@ namespace duckdb {
 class MnemonicCatalog;
 class MnemonicCatalogGeneration;
 class MnemonicSchemaEntry;
+class MnemonicTableEntry;
 class MnemonicTransactionManager;
 struct BoundCreateTableInfo;
 
@@ -51,6 +52,9 @@ public:
 
 	//! CREATE TABLE inside this transaction
 	optional_ptr<CatalogEntry> CreateTable(MnemonicSchemaEntry &schema, BoundCreateTableInfo &info);
+	//! CREATE INDEX / DROP INDEX inside this transaction
+	void CreateIndex(MnemonicTableEntry &table, const string &index_name, const string &column, bool if_not_exists);
+	void DropIndex(const string &index_name, bool if_exists);
 
 	//! The real entity ID a tempid placeholder resolved to in this transaction, if any
 	optional_ptr<const mnemonicdb::EntityId> FindTempid(mnemonicdb::EntityId placeholder) const;
@@ -61,6 +65,7 @@ public:
 
 private:
 	void ReleaseWriter();
+	void SetSchema(shared_ptr<const mnemonicdb::Schema> schema);
 
 private:
 	MnemonicCatalog &catalog;

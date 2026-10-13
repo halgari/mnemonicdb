@@ -1,4 +1,5 @@
 #include "mnemonicdb/mnemonic_catalog.hpp"
+#include "mnemonicdb/mnemonic_index.hpp"
 #include "mnemonicdb/mnemonic_insert.hpp"
 #include "mnemonicdb/mnemonic_modify.hpp"
 #include "mnemonicdb/mnemonic_schema_entry.hpp"
@@ -7,7 +8,9 @@
 
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/parser/parsed_data/create_index_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/storage/database_size.hpp"
 
@@ -23,9 +26,39 @@ MnemonicCatalogGeneration::MnemonicCatalogGeneration(MnemonicCatalog &catalog,
 		auto &schema_entry = catalog.GetSchemaEntry(schema_name);
 		for (auto table : schema->TablesInSchema(schema_name)) {
 			auto info = MnemonicTableEntry::MakeCreateInfo(schema_entry, *schema, *table);
-			tables[schema_name][table->name] =
-			    make_uniq<MnemonicTableEntry>(catalog, schema_entry, *info, schema, *table);
+			auto &table_entry = *(tables[schema_name][table->name] =
+			                          make_uniq<MnemonicTableEntry>(catalog, schema_entry, *info, schema, *table));
+			for (auto local : table->attributes) {
+				auto &attr = schema->GetAttribute(local);
+				if (attr.index_name.empty()) {
+					continue;
+				}
+				auto index_info = MakeIndexInfo(table_entry, attr.index_name, attr.name);
+				indexes[schema_name][attr.index_name] =
+				    make_uniq<MnemonicIndexEntry>(catalog, schema_entry, *index_info, table_entry.name);
+			}
 		}
+	}
+}
+
+optional_ptr<CatalogEntry> MnemonicCatalogGeneration::GetIndex(const string &schema_name,
+                                                                const string &index_name) const {
+	auto schema_indexes = indexes.find(schema_name);
+	if (schema_indexes == indexes.end()) {
+		return nullptr;
+	}
+	auto entry = schema_indexes->second.find(index_name);
+	return entry == schema_indexes->second.end() ? nullptr : entry->second.get();
+}
+
+void MnemonicCatalogGeneration::ScanIndexes(const string &schema_name,
+                                            const std::function<void(CatalogEntry &)> &callback) const {
+	auto schema_indexes = indexes.find(schema_name);
+	if (schema_indexes == indexes.end()) {
+		return;
+	}
+	for (auto &entry : schema_indexes->second) {
+		callback(*entry.second);
 	}
 }
 
@@ -145,6 +178,12 @@ PhysicalOperator &MnemonicCatalog::PlanDelete(ClientContext &context, PhysicalPl
 PhysicalOperator &MnemonicCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalUpdate &op, PhysicalOperator &plan) {
 	return PlanMnemonicUpdate(context, planner, op, plan);
+}
+
+unique_ptr<LogicalOperator> MnemonicCatalog::BindCreateIndex(Binder &, CreateStatement &stmt, TableCatalogEntry &table,
+                                                             unique_ptr<LogicalOperator>) {
+	auto info = unique_ptr_cast<CreateInfo, CreateIndexInfo>(std::move(stmt.info));
+	return BindMnemonicCreateIndex(table.Cast<MnemonicTableEntry>(), std::move(info));
 }
 
 DatabaseSize MnemonicCatalog::GetDatabaseSize(ClientContext &) {

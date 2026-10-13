@@ -1,0 +1,115 @@
+# name: test/sql/datom_functions.test
+# description: mnemonicdb_add / mnemonicdb_retract assert or retract a single datom
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/datoms.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.person (name VARCHAR, tags VARCHAR[], friends REF[], email VARCHAR UNIQUE)
+
+statement ok
+INSERT INTO d.person (id, name, tags, email) VALUES (tempid('a'), 'Alice', ['a'], 'a@x'), (tempid('b'), 'Bob', NULL, 'b@x')
+
+statement ok
+SET VARIABLE alice = (SELECT id FROM d.person WHERE name = 'Alice')
+
+statement ok
+SET VARIABLE bob = (SELECT id FROM d.person WHERE name = 'Bob')
+
+query I
+CALL mnemonicdb_add('d.person', getvariable('alice'), 'tags', 'b')
+----
+true
+
+# Adding a value already present changes nothing and commits nothing
+query I
+CALL mnemonicdb_add('d.person', getvariable('alice'), 'tags', 'b')
+----
+false
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+4
+
+query I
+CALL mnemonicdb_retract('d.person', getvariable('alice'), 'tags', 'a')
+----
+true
+
+query I
+CALL mnemonicdb_retract('d.person', getvariable('alice'), 'tags', 'zzz')
+----
+false
+
+query I
+SELECT tags FROM d.person WHERE name = 'Alice'
+----
+[b]
+
+# Cardinality-one: add replaces the value
+query I
+CALL mnemonicdb_add('d.main.person', getvariable('alice'), 'name', 'Alicia')
+----
+true
+
+query I
+SELECT name FROM d.person WHERE id = getvariable('alice')
+----
+Alicia
+
+# REF values
+statement ok
+CALL mnemonicdb_add('d.person', getvariable('alice'), 'friends', getvariable('bob'))
+
+query I
+SELECT b.name FROM d.person a, unnest(a.friends) f(friend) JOIN d.person b ON b.id = f.friend WHERE a.id = getvariable('alice')
+----
+Bob
+
+# Several calls in one transaction are one tx
+statement ok
+BEGIN
+
+statement ok
+CALL mnemonicdb_add('d.person', getvariable('bob'), 'tags', 'x')
+
+statement ok
+CALL mnemonicdb_add('d.person', getvariable('bob'), 'tags', 'y')
+
+statement ok
+COMMIT
+
+query II
+SELECT tags, (SELECT last_tx FROM mnemonicdb_info('d')) FROM d.person WHERE name = 'Bob'
+----
+[x, y]	8
+
+# Uniqueness still applies
+statement error
+CALL mnemonicdb_add('d.person', getvariable('bob'), 'email', 'a@x')
+----
+Duplicate key
+
+statement error
+CALL mnemonicdb_add('d.person', getvariable('bob'), 'nope', 'x')
+----
+has no column
+
+statement error
+CALL mnemonicdb_add('d.person', 12::UBIGINT, 'tags', 'x')
+----
+not a valid entity ID
+
+statement error
+CALL mnemonicdb_add('d.sys.tables', getvariable('bob'), 'name', 'x')
+----
+cannot write to sys tables
+
+statement error
+CALL mnemonicdb_add('d.person', getvariable('bob'), 'tags', NULL)
+----
+cannot be NULL

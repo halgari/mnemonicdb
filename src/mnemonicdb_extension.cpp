@@ -2,6 +2,7 @@
 
 #include "mnemonicdb_extension.hpp"
 #include "mnemonicdb/codec_functions.hpp"
+#include "mnemonicdb/mnemonic_datom_functions.hpp"
 #include "mnemonicdb/mnemonic_catalog.hpp"
 #include "mnemonicdb/mnemonic_transaction_manager.hpp"
 #include "mnemonicdb/mnemonicdb_info.hpp"
@@ -64,6 +65,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	StorageExtension::Register(config, "mnemonicdb", make_shared_ptr<MnemonicStorageExtension>());
 	loader.RegisterFunction(MnemonicInfoTableFunction());
 	RegisterCodecFunctions(loader);
+	RegisterDatomFunctions(loader);
 }
 
 void MnemonicdbExtension::Load(ExtensionLoader &loader) {

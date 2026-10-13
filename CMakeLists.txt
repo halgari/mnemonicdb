@@ -45,9 +45,11 @@ set(EXTENSION_SOURCES
     src/schema/schema.cpp
     src/write/tx_writer.cpp
     src/catalog/mnemonic_table_entry.cpp
+    src/catalog/mnemonic_index.cpp
     src/exec/mnemonic_scan.cpp
     src/exec/mnemonic_insert.cpp
-    src/exec/mnemonic_modify.cpp)
+    src/exec/mnemonic_modify.cpp
+    src/exec/mnemonic_datom_functions.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
