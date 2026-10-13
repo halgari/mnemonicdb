@@ -38,7 +38,7 @@ file(GLOB MNEMONICDB_ZSTD_SOURCES ${MNEMONICDB_ZSTD_DIR}/common/*.c ${MNEMONICDB
      ${MNEMONICDB_ZSTD_DIR}/decompress/*.c ${MNEMONICDB_ZSTD_DIR}/dictBuilder/*.c)
 add_library(mnemonicdb_zstd STATIC ${MNEMONICDB_ZSTD_SOURCES})
 target_include_directories(mnemonicdb_zstd PUBLIC $<BUILD_INTERFACE:${MNEMONICDB_ZSTD_DIR}>)
-target_compile_definitions(mnemonicdb_zstd PRIVATE ZSTD_DISABLE_ASM ZSTD_MULTITHREAD=0)
+target_compile_definitions(mnemonicdb_zstd PRIVATE ZSTD_DISABLE_ASM)
 set_target_properties(mnemonicdb_lz4 mnemonicdb_zstd PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET
                                                                 hidden)
 set(lz4_INCLUDE_DIRS ${MNEMONICDB_LZ4_DIR} CACHE PATH "" FORCE)
