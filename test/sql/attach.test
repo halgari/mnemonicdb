@@ -1,0 +1,86 @@
+# name: test/sql/attach.test
+# description: ATTACH opens or creates a MnemonicDB database backed by RocksDB
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+# Read-only attach of a database that does not exist fails
+statement error
+ATTACH '{TEST_DIR}/missing.mnemonic' AS missing (TYPE mnemonicdb, READ_ONLY)
+----
+does not exist
+
+statement ok
+ATTACH '{TEST_DIR}/attach.mnemonic' AS d (TYPE mnemonicdb)
+
+query IIII
+SELECT format_version, last_tx, read_only, column_families FROM mnemonicdb_info('d')
+----
+1	0	false	[eavt, eavt_hist, aevt, aevt_hist, avet, avet_hist, vaet, vaet_hist, txlog, meta]
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'd' ORDER BY schema_name
+----
+main
+sys
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'd'
+----
+0
+
+# Transactions can begin and commit against the database
+statement ok
+BEGIN
+
+statement ok
+SELECT * FROM mnemonicdb_info('d')
+
+statement ok
+COMMIT
+
+statement error
+CREATE SCHEMA d.other
+----
+schemas are fixed
+
+statement error
+CREATE TABLE d.person (name VARCHAR)
+----
+does not support CREATE TABLE yet
+
+statement ok
+DETACH d
+
+# Reopening an existing database reads its metadata back
+statement ok
+ATTACH '{TEST_DIR}/attach.mnemonic' AS d (TYPE mnemonicdb)
+
+query II
+SELECT format_version, last_tx FROM mnemonicdb_info('d')
+----
+1	0
+
+statement ok
+DETACH d
+
+# Read-only attach of an existing database works
+statement ok
+ATTACH '{TEST_DIR}/attach.mnemonic' AS d (TYPE mnemonicdb, READ_ONLY)
+
+query I
+SELECT read_only FROM mnemonicdb_info('d')
+----
+true
+
+statement ok
+DETACH d
+
+# mnemonicdb_info rejects databases of other types
+statement ok
+ATTACH '{TEST_DIR}/plain.duckdb' AS plain
+
+statement error
+SELECT * FROM mnemonicdb_info('plain')
+----
+is not a MnemonicDB database
