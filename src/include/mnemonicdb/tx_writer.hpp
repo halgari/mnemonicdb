@@ -25,7 +25,9 @@ public:
 	Store &GetStore() {
 		return *store;
 	}
-	std::unique_ptr<rocksdb::Iterator> NewIterator(ColumnFamily cf);
+	//! An iterator over `cf`. With a prefix, iteration stops at the end of the prefix (iterate_upper_bound) and
+	//! RocksDB may use prefix Bloom filters when the prefix covers the column family's prefix extractor.
+	std::unique_ptr<rocksdb::Iterator> NewIterator(ColumnFamily cf, const string &prefix = string());
 	//! All entries of `cf` whose key starts with `prefix`, decoded; history values are returned in `retracted_by`
 	vector<Datom> ScanPrefix(ColumnFamily cf, const string &prefix, vector<TxId> *retracted_by = nullptr);
 

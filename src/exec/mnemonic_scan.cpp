@@ -63,10 +63,10 @@ column_t FusedRowIdColumn(idx_t index) {
 struct AttributeCursor {
 	AttributeCursor(mnemonicdb::ReadView &view, const AttributeDef &attr, optional_idx as_of)
 	    : attr(attr), prefix(mnemonicdb::AevtPrefix(attr.Local())), as_of(as_of),
-	      current(view.NewIterator(ColumnFamily::AEVT)) {
+	      current(view.NewIterator(ColumnFamily::AEVT, prefix)) {
 		current->Seek(prefix);
 		if (as_of.IsValid()) {
-			history = view.NewIterator(ColumnFamily::AEVT_HIST);
+			history = view.NewIterator(ColumnFamily::AEVT_HIST, prefix);
 			history->Seek(prefix);
 		}
 		Settle();
@@ -172,7 +172,7 @@ template <class CALLBACK>
 static void ForEachVisible(mnemonicdb::ReadView &view, ColumnFamily cf, ColumnFamily history_cf, const string &prefix,
                            optional_idx as_of, CALLBACK &&callback) {
 	auto scan = [&](ColumnFamily family, bool is_history) {
-		auto it = view.NewIterator(family);
+		auto it = view.NewIterator(family, prefix);
 		for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
 			auto value = it->value();
 			std::string_view key(it->key().data(), it->key().size());
@@ -431,7 +431,7 @@ static vector<EntityId> EntitiesInRanges(mnemonicdb::ReadView &view, const Attri
 	auto prefix = mnemonicdb::AvetPrefix(attr.Local());
 	for (auto &range : ranges) {
 		auto scan = [&](ColumnFamily family, bool is_history) {
-			auto it = view.NewIterator(family);
+			auto it = view.NewIterator(family, prefix);
 			it->Seek(range.has_lower ? prefix + range.lower : prefix);
 			for (; it->Valid() && it->key().starts_with(prefix); it->Next()) {
 				std::string_view key(it->key().data(), it->key().size());

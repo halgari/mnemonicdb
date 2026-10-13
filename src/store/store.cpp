@@ -5,6 +5,9 @@
 
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
+#include "rocksdb/filter_policy.h"
+#include "rocksdb/slice_transform.h"
+#include "rocksdb/table.h"
 #include "rocksdb/write_batch.h"
 
 #include <cstring>
@@ -64,6 +67,42 @@ const char *ColumnFamilyName(ColumnFamily cf) {
 	}
 }
 
+//! Indexes whose keys start with two fixed-width components (E6 A2, A2 E6, V6 A2) get an 8-byte prefix extractor
+//! with prefix Bloom filters in SST files and memtables. A seek within one (e, a) / (a, e) / (v, a) prefix, which
+//! is what every per-datom lookup is, then skips files that cannot contain the prefix. Iterators opt in through
+//! iterate_upper_bound + auto_prefix_mode (see ReadView::NewIterator), so seeks spanning several prefixes still
+//! use total order. Every key is at least 13 bytes, so no key is shorter than the prefix.
+static constexpr size_t BLOOM_PREFIX_LENGTH = 8;
+
+static bool HasPrefixBloom(ColumnFamily cf) {
+	switch (cf) {
+	case ColumnFamily::EAVT:
+	case ColumnFamily::EAVT_HIST:
+	case ColumnFamily::AEVT:
+	case ColumnFamily::AEVT_HIST:
+	case ColumnFamily::VAET:
+	case ColumnFamily::VAET_HIST:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static rocksdb::ColumnFamilyOptions ColumnFamilyOptionsFor(ColumnFamily cf) {
+	rocksdb::ColumnFamilyOptions options;
+	if (!HasPrefixBloom(cf)) {
+		return options;
+	}
+	rocksdb::BlockBasedTableOptions table_options;
+	table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10));
+	// Lookups are always prefix seeks, never Get of a whole key
+	table_options.whole_key_filtering = false;
+	options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
+	options.prefix_extractor.reset(rocksdb::NewFixedPrefixTransform(BLOOM_PREFIX_LENGTH));
+	options.memtable_prefix_bloom_size_ratio = 0.1;
+	return options;
+}
+
 static void CheckStatus(const rocksdb::Status &status, const string &path) {
 	if (!status.ok()) {
 		throw IOException("MnemonicDB: RocksDB error on \"%s\": %s", path, status.ToString());
@@ -106,7 +145,8 @@ unique_ptr<Store> Store::Open(const string &path, bool read_only) {
 	vector<rocksdb::ColumnFamilyDescriptor> descriptors;
 	descriptors.emplace_back(rocksdb::kDefaultColumnFamilyName, rocksdb::ColumnFamilyOptions());
 	for (idx_t i = 0; i < static_cast<idx_t>(ColumnFamily::COUNT); i++) {
-		descriptors.emplace_back(ColumnFamilyName(static_cast<ColumnFamily>(i)), rocksdb::ColumnFamilyOptions());
+		auto cf = static_cast<ColumnFamily>(i);
+		descriptors.emplace_back(ColumnFamilyName(cf), ColumnFamilyOptionsFor(cf));
 	}
 
 	vector<rocksdb::ColumnFamilyHandle *> all_handles;

@@ -24,21 +24,93 @@ ReadView::ReadView(Store &store_p, const rocksdb::Snapshot *snapshot_p, rocksdb:
     : store(&store_p), snapshot(snapshot_p), batch(batch_p) {
 }
 
-std::unique_ptr<rocksdb::Iterator> ReadView::NewIterator(ColumnFamily cf) {
+//! The smallest key greater than every key starting with `prefix`, or empty if there is none (all 0xFF)
+static string PrefixSuccessor(const string &prefix) {
+	string result = prefix;
+	while (!result.empty()) {
+		auto &last = reinterpret_cast<unsigned char &>(result.back());
+		if (last != 0xFF) {
+			last++;
+			return result;
+		}
+		result.pop_back();
+	}
+	return result;
+}
+
+//! A RocksDB iterator that owns the upper bound its read options point to
+class BoundedIterator : public rocksdb::Iterator {
+public:
+	BoundedIterator(string upper_bound_p) : upper_bound(std::move(upper_bound_p)), upper_slice(upper_bound) {
+	}
+	const rocksdb::Slice *Bound() const {
+		return &upper_slice;
+	}
+	void SetIterator(rocksdb::Iterator *it) {
+		inner.reset(it);
+	}
+
+	bool Valid() const override {
+		return inner->Valid();
+	}
+	void SeekToFirst() override {
+		inner->SeekToFirst();
+	}
+	void SeekToLast() override {
+		inner->SeekToLast();
+	}
+	void Seek(const rocksdb::Slice &target) override {
+		inner->Seek(target);
+	}
+	void SeekForPrev(const rocksdb::Slice &target) override {
+		inner->SeekForPrev(target);
+	}
+	void Next() override {
+		inner->Next();
+	}
+	void Prev() override {
+		inner->Prev();
+	}
+	rocksdb::Slice key() const override {
+		return inner->key();
+	}
+	rocksdb::Slice value() const override {
+		return inner->value();
+	}
+	rocksdb::Status status() const override {
+		return inner->status();
+	}
+
+private:
+	string upper_bound;
+	rocksdb::Slice upper_slice;
+	std::unique_ptr<rocksdb::Iterator> inner;
+};
+
+std::unique_ptr<rocksdb::Iterator> ReadView::NewIterator(ColumnFamily cf, const string &prefix) {
 	rocksdb::ReadOptions options;
 	options.snapshot = snapshot;
 	auto &handle = store->GetHandle(cf);
-	auto base = store->GetDB().NewIterator(options, &handle);
-	if (!batch) {
-		return std::unique_ptr<rocksdb::Iterator>(base);
+	auto upper_bound = prefix.empty() ? string() : PrefixSuccessor(prefix);
+	if (upper_bound.empty()) {
+		auto base = store->GetDB().NewIterator(options, &handle);
+		if (!batch) {
+			return std::unique_ptr<rocksdb::Iterator>(base);
+		}
+		return std::unique_ptr<rocksdb::Iterator>(batch->NewIteratorWithBase(&handle, base, &options));
 	}
-	return std::unique_ptr<rocksdb::Iterator>(batch->NewIteratorWithBase(&handle, base));
+	auto result = std::make_unique<BoundedIterator>(std::move(upper_bound));
+	options.iterate_upper_bound = result->Bound();
+	options.auto_prefix_mode = true;
+	auto base = store->GetDB().NewIterator(options, &handle);
+	result->SetIterator(batch ? batch->NewIteratorWithBase(&handle, base, &options) : base);
+	return std::move(result);
 }
 
 vector<Datom> ReadView::ScanPrefix(ColumnFamily cf, const string &prefix, vector<TxId> *retracted_by) {
 	vector<Datom> result;
 	auto kind = IndexKindOf(cf);
-	auto it = NewIterator(cf);
+	auto it = NewIterator(cf, prefix);
 	for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
 		result.push_back(DecodeKey(kind, std::string_view(it->key().data(), it->key().size())));
 		if (retracted_by) {
@@ -63,7 +135,7 @@ TxWriter::~TxWriter() = default;
 bool TxWriter::HasChanges() {
 	// Writes that cancel out leave deletes in the batch but no txlog entry for this transaction
 	auto prefix = TxlogPrefix(tx);
-	auto it = view.NewIterator(ColumnFamily::TXLOG);
+	auto it = view.NewIterator(ColumnFamily::TXLOG, prefix);
 	it->Seek(prefix);
 	return it->Valid() && it->key().starts_with(prefix);
 }
@@ -237,7 +309,7 @@ void TxWriter::RewriteAttribute(const AttributeDef &old_attr, const AttributeDef
 	vector<Entry> entries;
 	auto prefix = AevtPrefix(old_attr.Local());
 	for (auto history : {false, true}) {
-		auto it = view.NewIterator(history ? ColumnFamily::AEVT_HIST : ColumnFamily::AEVT);
+		auto it = view.NewIterator(history ? ColumnFamily::AEVT_HIST : ColumnFamily::AEVT, prefix);
 		for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
 			Entry entry;
 			entry.datom = DecodeKey(IndexKind::AEVT, std::string_view(it->key().data(), it->key().size()));
@@ -304,7 +376,7 @@ void TxWriter::RebuildAvet(const AttributeDef &attr, bool remove) {
 		auto source = history ? ColumnFamily::AEVT_HIST : ColumnFamily::AEVT;
 		auto target = history ? ColumnFamily::AVET_HIST : ColumnFamily::AVET;
 		vector<std::pair<string, string>> entries;
-		auto it = view.NewIterator(source);
+		auto it = view.NewIterator(source, prefix);
 		for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
 			auto datom = DecodeKey(IndexKind::AEVT, std::string_view(it->key().data(), it->key().size()));
 			entries.emplace_back(EncodeKey(IndexKind::AVET, datom), it->value().ToString());

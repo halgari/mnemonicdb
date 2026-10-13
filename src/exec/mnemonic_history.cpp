@@ -146,7 +146,7 @@ static void CollectEvents(mnemonicdb::ReadView &view, ColumnFamily cf, ColumnFam
                           vector<HistoryEvent> &events) {
 	auto kind = mnemonicdb::IndexKindOf(cf);
 	for (auto history : {false, true}) {
-		auto it = view.NewIterator(history ? history_cf : cf);
+		auto it = view.NewIterator(history ? history_cf : cf, prefix);
 		for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
 			auto datom = mnemonicdb::DecodeKey(kind, std::string_view(it->key().data(), it->key().size()));
 			events.push_back(HistoryEvent {datom.t, datom, true});

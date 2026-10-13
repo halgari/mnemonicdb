@@ -1,0 +1,142 @@
+# name: test/sql/prefix_bloom.test
+# description: Lookups through prefix Bloom filters stay correct when data is spread over many SST files
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/bloom.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.person (name VARCHAR, age INTEGER, tags VARCHAR[], email VARCHAR UNIQUE, friend REF)
+
+# Each CHECKPOINT flushes the memtables into new SST files, so later lookups must consult several files
+statement ok
+INSERT INTO d.person (name, age, tags, email) SELECT 'p' || i, i % 10, ['t' || (i % 3)], 'e' || i FROM range(5000) t(i)
+
+statement ok
+CHECKPOINT d
+
+statement ok
+UPDATE d.person SET age = age + 100 WHERE age = 3
+
+statement ok
+CHECKPOINT d
+
+statement ok
+UPDATE d.person SET tags = list_append(tags, 'x') WHERE age = 4
+
+statement ok
+CHECKPOINT d
+
+statement ok
+UPDATE d.person SET friend = (SELECT id FROM d.person WHERE email = 'e0') WHERE age = 5
+
+statement ok
+CHECKPOINT d
+
+# Redundant writes are still detected against flushed data (no new transaction)
+statement ok
+SET VARIABLE before = (SELECT last_tx FROM mnemonicdb_info('d'))
+
+statement ok
+UPDATE d.person SET age = 1 WHERE age = 1
+
+query I
+SELECT (SELECT last_tx FROM mnemonicdb_info('d')) = getvariable('before')
+----
+true
+
+# Retract in one file, re-assert later: the value comes back and history is consistent
+statement ok
+UPDATE d.person SET age = 2000 WHERE email = 'e7'
+
+statement ok
+CHECKPOINT d
+
+statement ok
+UPDATE d.person SET age = 7 WHERE email = 'e7'
+
+query I
+SELECT age FROM d.person WHERE email = 'e7'
+----
+7
+
+query I
+SELECT count(*) FROM mnemonicdb_history('d', table_name := 'person', column_name := 'age', since := 7)
+----
+4
+
+# Every lookup path agrees with a plain scan
+query III
+SELECT count(*), sum(age), count(friend) FROM d.person
+----
+5000	72500	500
+
+query I
+SELECT count(*) FROM d.person WHERE age = 103
+----
+500
+
+query I
+SELECT count(*) FROM d.person WHERE id IN (SELECT id FROM d.person WHERE age = 4) AND list_contains(tags, 'x')
+----
+500
+
+query I
+SELECT count(*) FROM d.person p JOIN d.person f ON p.friend = f.id WHERE f.email = 'e0'
+----
+500
+
+query II
+SELECT name, age FROM d.person WHERE email = 'e4321'
+----
+p4321	1
+
+query I
+SELECT count(*) FROM d.person AT (VERSION => 3) WHERE age = 3
+----
+500
+
+query I
+SELECT count(*) FROM mnemonicdb_history('d', entity := 12345::UBIGINT)
+----
+0
+
+statement ok
+SET VARIABLE e5 = (SELECT id FROM d.person WHERE email = 'e5')
+
+query II
+SELECT column_name, count(*) FROM mnemonicdb_history('d', entity := getvariable('e5')) GROUP BY ALL ORDER BY ALL
+----
+age	1
+email	1
+friend	1
+name	1
+tags	1
+
+# Uniqueness is enforced against flushed data
+statement error
+INSERT INTO d.person (email) VALUES ('e123')
+----
+Duplicate key
+
+# Reattach and repeat a few lookups
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/bloom.mnemonic' AS d (TYPE mnemonicdb)
+
+query III
+SELECT count(*), sum(age), count(friend) FROM d.person
+----
+5000	72500	500
+
+statement ok
+UPDATE d.person SET age = age WHERE email = 'e9'
+
+query I
+SELECT age FROM d.person WHERE email = 'e9'
+----
+9
