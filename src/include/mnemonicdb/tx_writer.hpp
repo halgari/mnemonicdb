@@ -4,6 +4,7 @@
 #include "mnemonicdb/schema.hpp"
 #include "mnemonicdb/store.hpp"
 
+#include <functional>
 #include <memory>
 
 namespace rocksdb {
@@ -62,6 +63,11 @@ public:
 
 	//! Build (or, with `remove`, delete) the AVET and AVET history entries of an attribute from its AEVT entries
 	void RebuildAvet(const AttributeDef &attr, bool remove);
+
+	//! Re-encode every datom of an attribute, current and history, in every index and the txlog.
+	//! `reencode` maps an old encoded value to the new encoding.
+	void RewriteAttribute(const AttributeDef &old_attr, const AttributeDef &new_attr,
+	                      const std::function<string(std::string_view)> &reencode);
 
 	//! Raw index writes, for maintenance that bypasses datom semantics
 	void Put(ColumnFamily cf, const string &key, const string &value);

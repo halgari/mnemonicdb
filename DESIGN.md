@@ -319,9 +319,12 @@ everything else. Each attached database has a `sys` schema:
 
 | Table            | Columns (besides `id`)                                         |
 |------------------|----------------------------------------------------------------|
-| `sys.tables`     | `name`, `doc`                                                  |
-| `sys.attributes` | `table REF`, `name`, `type` (DuckDB type string), `cardinality`, `unique` (`none`/`value`/`identity`), `indexed`, `doc` |
+| `sys.tables`     | `schema`, `name`, `doc`                                        |
+| `sys.attributes` | `table_id REF`, `name`, `type` (DuckDB type string; a top-level LIST means cardinality-many), `uniqueness` (`value`/`identity`, NULL for none), `indexed`, `index` (index name), `doc` |
 | `sys.tx`         | `instant TIMESTAMPTZ`; users may `ALTER TABLE sys.tx ADD COLUMN` |
+
+(`table` and `unique` are reserved words in DuckDB, hence `table_id` and
+`uniqueness`.)
 
 - **Bootstrap.** The `sys` tables and their attributes have fixed IDs.
   Table locals 1–15 and attribute locals 1–63 are reserved for built-ins, so
@@ -329,15 +332,38 @@ everything else. Each attached database has a `sys` schema:
   a new database writes the datoms describing them, so `sys.tables` and
   `sys.attributes` describe themselves.
 - **Two front doors.** `CREATE TABLE` / `ALTER TABLE` / `CREATE INDEX`
-  translate into writes against `sys.*`, and writing `sys.*` directly is
-  equally valid. A transaction that touches `sys.*` invalidates the cached
-  DuckDB catalog on commit.
+  translate into writes against `sys.*`, and INSERT/UPDATE on `sys.tables`
+  and `sys.attributes` is equally valid. After each such statement the
+  transaction re-reads the schema from its own view and reconciles it with
+  the previous one:
+  - AVET entries are built or dropped when an index or uniqueness changes;
+  - making a column unique checks the existing values;
+  - type changes, attribute removal and DELETE are refused, and must go
+    through ALTER TABLE / DROP.
+
+  The new catalog generation is visible to the transaction immediately and
+  to everyone else on commit. Built-in entities can't be changed.
+- **Transaction metadata.** `ALTER TABLE sys.tx ADD COLUMN note VARCHAR`,
+  then `INSERT INTO sys.tx (id, note) VALUES (current_tx('db'), '...')`
+  inside the writing transaction. `current_tx('db')` is volatile and only
+  valid once the transaction has written. Rows for other transactions can't
+  be written.
 - **History.** Schema changes can be queried historically, but data is
   always read through the **current** schema. An `AT` query before a type
   change sees old data in the new type.
-- **`ALTER COLUMN ... TYPE`** is a bulk rewrite: every datom of the
-  attribute is re-encoded in all indexes, history and `txlog` included.
-  Only lossless conversions are allowed, and any failing cast aborts it.
+- **ALTER TABLE**
+  - `ADD COLUMN` adds an attribute.
+  - `RENAME COLUMN` and `RENAME TABLE` change only the name datom, so the
+    data and history keep their entity IDs.
+  - `DROP COLUMN` retracts the column's values (they stay in history) and
+    detaches the attribute. Adding a column with the same name later creates
+    a new, empty attribute.
+  - `ALTER COLUMN ... TYPE` is a bulk rewrite: every datom of the attribute
+    is re-encoded in all indexes, history and `txlog` included. Allowed:
+    DuckDB implicit (widening) casts, any type to VARCHAR, and the same rules
+    applied to list elements. Not allowed: cardinality changes, REF changes
+    and `USING`. The rewrite also checks that no two current values merge and
+    that unique values stay unique.
 - **`CREATE INDEX name ON t (col)` / `DROP INDEX name`** build or drop AVET
   and `avet_hist` entries for the attribute, history included. The index
   name is stored on the attribute entity (`sys.attributes.index`), and
@@ -383,6 +409,8 @@ Milestones 1–6 together show the riskiest parts working end to end.
 
 ## 10. Open questions
 
-1. **Single-datom add/retract syntax.** `CALL mnemonic_add/retract(...)` is a
-   placeholder; the final form (table functions vs. custom statement syntax)
-   is decided when milestone 7 starts.
+None outstanding. Settled along the way:
+- The add/retract syntax is the `mnemonicdb_add` / `mnemonicdb_retract`
+  table functions.
+- Net-empty transactions commit nothing.
+- `[]` is the empty set.

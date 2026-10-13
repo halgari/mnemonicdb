@@ -59,7 +59,8 @@ unique_ptr<GlobalSinkState> MnemonicInsert::GetGlobalSinkState(ClientContext &) 
 //! Resolves entity IDs for inserted rows and REF values
 class EntityResolver {
 public:
-	EntityResolver(MnemonicTransaction &transaction) : transaction(transaction) {
+	EntityResolver(MnemonicTransaction &transaction, uint8_t default_partition)
+	    : transaction(transaction), default_partition(default_partition) {
 	}
 
 	//! A REF value: tempids resolve to their bound entity, or to a fresh one
@@ -80,7 +81,7 @@ public:
 	EntityId ResolveRow(optional_ptr<const EntityId> value, optional_ptr<const EntityId> identity_match) {
 		if (!value) {
 			// A NULL id is a new entity; an identity match then fails the uniqueness check
-			return Allocate(mnemonicdb::partition::DB);
+			return Allocate(default_partition);
 		}
 		auto id = *value;
 		if (!mnemonicdb::IsTempid(id)) {
@@ -103,6 +104,12 @@ public:
 
 private:
 	EntityId Allocate(uint8_t partition) {
+		if (partition == mnemonicdb::partition::DB) {
+			partition = default_partition;
+		}
+		if (partition == mnemonicdb::partition::ATTR || partition == mnemonicdb::partition::TABLE) {
+			return transaction.GetWriter().GetView().GetStore().AllocateId(partition);
+		}
 		if (partition < mnemonicdb::partition::DB ||
 		    (partition >= mnemonicdb::partition::FIRST_RESERVED && partition < mnemonicdb::partition::FIRST_USER)) {
 			throw InvalidInputException("MnemonicDB: cannot allocate entity IDs in reserved partition %d", partition);
@@ -117,7 +124,43 @@ private:
 	}
 
 	MnemonicTransaction &transaction;
+	uint8_t default_partition;
 };
+
+//! The partition new rows of a table are allocated in
+static uint8_t DefaultPartition(const MnemonicTableEntry &table) {
+	auto id = table.GetTableDef().id;
+	if (id == mnemonicdb::sys::TABLES) {
+		return mnemonicdb::partition::TABLE;
+	}
+	if (id == mnemonicdb::sys::ATTRIBUTES) {
+		return mnemonicdb::partition::ATTR;
+	}
+	return mnemonicdb::partition::DB;
+}
+
+//! Rows of sys tables may only describe user entities (and, for sys.tx, the current transaction)
+static void CheckSysEntity(MnemonicTransaction &transaction, const MnemonicTableEntry &table, EntityId entity) {
+	auto id = table.GetTableDef().id;
+	if (table.GetTableDef().schema != "sys") {
+		if (mnemonicdb::PartitionOf(entity) < mnemonicdb::partition::DB) {
+			throw InvalidInputException("MnemonicDB: entity %d is in a system partition", entity);
+		}
+		return;
+	}
+	if (id == mnemonicdb::sys::TX) {
+		if (entity != transaction.CurrentTxEntity()) {
+			throw InvalidInputException("MnemonicDB: rows of sys.tx can only describe the current transaction; use "
+			                            "current_tx() as the id");
+		}
+		return;
+	}
+	auto expected = DefaultPartition(table);
+	auto first_user = expected == mnemonicdb::partition::TABLE ? 16 : 64;
+	if (mnemonicdb::PartitionOf(entity) != expected || mnemonicdb::LocalOf(entity) < uint64_t(first_user)) {
+		throw InvalidInputException("MnemonicDB: entity %d cannot be described in %s", entity, table.name);
+	}
+}
 
 SinkResultType MnemonicInsert::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &state = input.global_state.Cast<MnemonicInsertState>();
@@ -144,7 +187,7 @@ SinkResultType MnemonicInsert::Sink(ExecutionContext &context, DataChunk &chunk,
 		}
 	}
 
-	EntityResolver resolver(transaction);
+	EntityResolver resolver(transaction, DefaultPartition(table));
 	auto ids = chunk.data[MNEMONIC_ID_COLUMN_INDEX].Values<uint64_t>();
 	for (idx_t row = 0; row < count; row++) {
 		// A unique-identity value already present on an entity identifies the row's entity
@@ -172,9 +215,7 @@ SinkResultType MnemonicInsert::Sink(ExecutionContext &context, DataChunk &chunk,
 			row_id = &row_id_value;
 		}
 		auto entity = resolver.ResolveRow(row_id, identity_match);
-		if (mnemonicdb::PartitionOf(entity) < mnemonicdb::partition::DB) {
-			throw InvalidInputException("MnemonicDB: entity %d is in a system partition", entity);
-		}
+		CheckSysEntity(transaction, table, entity);
 
 		for (idx_t a = 0; a < attr_count; a++) {
 			auto &attr = table.GetAttribute(a + 1);
@@ -213,8 +254,12 @@ SinkResultType MnemonicInsert::Sink(ExecutionContext &context, DataChunk &chunk,
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
-SourceResultType MnemonicInsert::GetDataInternal(ExecutionContext &, DataChunk &chunk, OperatorSourceInput &) const {
+SourceResultType MnemonicInsert::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                                 OperatorSourceInput &) const {
 	auto &state = sink_state->Cast<MnemonicInsertState>();
+	if (table.GetTableDef().schema == "sys" && table.GetTableDef().id != mnemonicdb::sys::TX) {
+		MnemonicTransaction::Get(context.client, table.catalog).ReloadSchema(context.client);
+	}
 	chunk.data[0].Append(Value::BIGINT(NumericCast<int64_t>(state.count)));
 	return SourceResultType::FINISHED;
 }
@@ -228,9 +273,6 @@ PhysicalOperator &PlanMnemonicInsert(ClientContext &, PhysicalPlanGenerator &pla
 		throw NotImplementedException("MnemonicDB does not support INSERT without a source");
 	}
 	auto &table = op.table.Cast<MnemonicTableEntry>();
-	if (table.GetTableDef().schema != "main") {
-		throw NotImplementedException("MnemonicDB does not support writing to sys tables yet");
-	}
 	auto &insert = planner.Make<MnemonicInsert>(op.types, table, op.estimated_cardinality);
 	insert.children.push_back(*plan);
 	return insert;

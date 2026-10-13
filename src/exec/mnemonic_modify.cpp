@@ -56,6 +56,7 @@ public:
 				// The first match wins for UPDATE ... FROM; a repeated DELETE of the same row is a no-op
 				continue;
 			}
+			CheckEntity(transaction, entity);
 			ModifyRow(writer, chunk, row, entity);
 			state.count++;
 		}
@@ -72,9 +73,30 @@ public:
 	}
 
 protected:
+	void CheckEntity(MnemonicTransaction &transaction, EntityId entity) const {
+		auto &def = table.GetTableDef();
+		if (def.schema != "sys") {
+			return;
+		}
+		if (def.id == mnemonicdb::sys::TX) {
+			if (entity != transaction.CurrentTxEntity()) {
+				throw InvalidInputException("MnemonicDB: only the current transaction's sys.tx row can be changed");
+			}
+			return;
+		}
+		auto first_user = def.id == mnemonicdb::sys::TABLES ? 16 : 64;
+		if (mnemonicdb::LocalOf(entity) < uint64_t(first_user)) {
+			throw InvalidInputException("MnemonicDB: built-in schema entities cannot be changed");
+		}
+	}
+
 	virtual void ModifyRow(mnemonicdb::TxWriter &writer, DataChunk &chunk, idx_t row, EntityId entity) const = 0;
 
-	SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk, OperatorSourceInput &) const override {
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &) const override {
+		auto &def = table.GetTableDef();
+		if (def.schema == "sys" && def.id != mnemonicdb::sys::TX) {
+			MnemonicTransaction::Get(context.client, table.catalog).ReloadSchema(context.client);
+		}
 		chunk.data[0].Append(Value::BIGINT(NumericCast<int64_t>(sink_state->Cast<State>().count)));
 		return SourceResultType::FINISHED;
 	}
@@ -106,7 +128,7 @@ PhysicalOperator &PlanMnemonicDelete(ClientContext &, PhysicalPlanGenerator &pla
 	}
 	auto &table = op.table.Cast<MnemonicTableEntry>();
 	if (table.GetTableDef().schema != "main") {
-		throw NotImplementedException("MnemonicDB does not support writing to sys tables yet");
+		throw NotImplementedException("MnemonicDB: rows cannot be deleted from sys tables; use DROP / ALTER TABLE");
 	}
 	auto row_id_index = op.expressions.back()->Cast<BoundReferenceExpression>().Index();
 	auto &result = planner.Make<MnemonicDelete>(op.types, table, row_id_index, RowIdHandling::KEEP_FIRST,
@@ -193,9 +215,6 @@ PhysicalOperator &PlanMnemonicUpdate(ClientContext &, PhysicalPlanGenerator &pla
 		throw NotImplementedException("MnemonicDB does not support UPDATE ... RETURNING yet");
 	}
 	auto &table = op.table.Cast<MnemonicTableEntry>();
-	if (table.GetTableDef().schema != "main") {
-		throw NotImplementedException("MnemonicDB does not support writing to sys tables yet");
-	}
 	vector<PhysicalIndex> columns;
 	vector<idx_t> value_indexes;
 	for (idx_t i = 0; i < op.columns.size(); i++) {

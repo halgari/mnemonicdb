@@ -21,15 +21,15 @@ sys	attributes
 sys	tx
 
 query III
-SELECT t.name, a.name, a.type FROM d.sys.attributes a JOIN d.sys.tables t ON a.table = t.id ORDER BY a.id
+SELECT t.name, a.name, a.type FROM d.sys.attributes a JOIN d.sys.tables t ON a.table_id = t.id ORDER BY a.id
 ----
 tables	schema	VARCHAR
 tables	name	VARCHAR
 tables	doc	VARCHAR
-attributes	table	REF
+attributes	table_id	REF
 attributes	name	VARCHAR
 attributes	type	VARCHAR
-attributes	unique	VARCHAR
+attributes	uniqueness	VARCHAR
 attributes	indexed	BOOLEAN
 attributes	doc	VARCHAR
 tx	instant	TIMESTAMP WITH TIME ZONE
@@ -72,7 +72,7 @@ SELECT min(mnemonicdb_id_local(id)) FROM d.sys.tables WHERE schema = 'main'
 16
 
 query IIII
-SELECT a.name, a.type, a.unique, mnemonicdb_id_local(a.id) FROM d.sys.attributes a JOIN d.sys.tables t ON a.table = t.id
+SELECT a.name, a.type, a.uniqueness, mnemonicdb_id_local(a.id) FROM d.sys.attributes a JOIN d.sys.tables t ON a.table_id = t.id
 WHERE t.name = 'person' ORDER BY a.id
 ----
 name	VARCHAR	NULL	64
@@ -82,7 +82,7 @@ tags	VARCHAR[]	NULL	67
 age	INTEGER	NULL	68
 
 query II
-SELECT a.name, a.type FROM d.sys.attributes a JOIN d.sys.tables t ON a.table = t.id WHERE t.name = 'account' ORDER BY a.id
+SELECT a.name, a.type FROM d.sys.attributes a JOIN d.sys.tables t ON a.table_id = t.id WHERE t.name = 'account' ORDER BY a.id
 ----
 owner	REF
 balance	DECIMAL(18,2)

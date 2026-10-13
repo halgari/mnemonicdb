@@ -7,6 +7,7 @@
 
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/common/enum_util.hpp"
 
@@ -105,8 +106,12 @@ void MnemonicSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	                      info.if_not_found != OnEntryNotFound::THROW_EXCEPTION);
 }
 
-void MnemonicSchemaEntry::Alter(CatalogTransaction, AlterInfo &) {
-	throw Unsupported("ALTER");
+void MnemonicSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
+	if (info.type != AlterType::ALTER_TABLE) {
+		throw Unsupported("ALTER " + EnumUtil::ToString(info.type));
+	}
+	auto &transaction_entry = MnemonicTransaction::Get(transaction.GetContext(), catalog);
+	transaction_entry.AlterTable(name.GetIdentifierName(), info.Cast<AlterTableInfo>());
 }
 
 } // namespace duckdb

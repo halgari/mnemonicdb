@@ -1,0 +1,230 @@
+# name: test/sql/alter.test
+# description: ALTER TABLE: add, rename and drop columns, rename tables, change column types (rewriting history)
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/alter.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.person (name VARCHAR, age INTEGER, tags SMALLINT[], email VARCHAR UNIQUE)
+
+# tx 3
+statement ok
+INSERT INTO d.person (name, age, tags, email) VALUES ('Alice', 30, [1, 2], 'a@x'), ('Bob', 40, NULL, 'b@x')
+
+# tx 4
+statement ok
+UPDATE d.person SET age = 31 WHERE name = 'Alice'
+
+statement ok
+CREATE INDEX person_age ON d.person (age)
+
+# ADD COLUMN: a new attribute, NULL for existing entities
+statement ok
+ALTER TABLE d.person ADD COLUMN nick VARCHAR
+
+statement ok
+ALTER TABLE d.person ADD COLUMN IF NOT EXISTS nick VARCHAR
+
+statement error
+ALTER TABLE d.person ADD COLUMN nick VARCHAR
+----
+already has a column
+
+statement error
+ALTER TABLE d.person ADD COLUMN rowid INTEGER
+----
+reserved
+
+statement error
+ALTER TABLE d.person ADD COLUMN x INTEGER DEFAULT 3
+----
+column defaults
+
+statement ok
+UPDATE d.person SET nick = 'al' WHERE name = 'Alice'
+
+query II
+SELECT name, nick FROM d.person ORDER BY name
+----
+Alice	al
+Bob	NULL
+
+# RENAME COLUMN keeps the attribute (and its data and history)
+statement ok
+ALTER TABLE d.person RENAME COLUMN name TO full_name
+
+query I
+SELECT full_name FROM d.person AT (VERSION => 3) ORDER BY 1
+----
+Alice
+Bob
+
+statement error
+ALTER TABLE d.person RENAME COLUMN age TO email
+----
+already has a column
+
+# ALTER COLUMN TYPE re-encodes every datom: current, history, indexes
+statement ok
+ALTER TABLE d.person ALTER COLUMN age TYPE BIGINT
+
+statement ok
+ALTER TABLE d.person ALTER COLUMN tags TYPE INTEGER[]
+
+query TTT
+SELECT column_name, data_type, (SELECT type FROM d.sys.attributes WHERE name = column_name) FROM duckdb_columns()
+WHERE database_name = 'd' AND table_name = 'person' AND column_name IN ('age', 'tags') ORDER BY column_name
+----
+age	BIGINT	BIGINT
+tags	INTEGER[]	INTEGER[]
+
+query III
+SELECT full_name, age, tags FROM d.person ORDER BY full_name
+----
+Alice	31	[1, 2]
+Bob	40	NULL
+
+query II
+SELECT full_name, age FROM d.person AT (VERSION => 3) ORDER BY full_name
+----
+Alice	30
+Bob	40
+
+# The index was rewritten too
+query I
+SELECT full_name FROM d.person WHERE age = 31
+----
+Alice
+
+query I
+SELECT full_name FROM d.person AT (VERSION => 3) WHERE age = 30
+----
+Alice
+
+# Anything converts to VARCHAR
+statement ok
+ALTER TABLE d.person ALTER COLUMN age TYPE VARCHAR
+
+query IT
+SELECT full_name, typeof(age) FROM d.person WHERE age = '40'
+----
+Bob	VARCHAR
+
+# Conversions that could merge or lose values are refused
+statement error
+ALTER TABLE d.person ALTER COLUMN age TYPE INTEGER
+----
+only conversions that keep distinct values distinct
+
+statement error
+ALTER TABLE d.person ALTER COLUMN tags TYPE INTEGER
+----
+only conversions that keep distinct values distinct
+
+statement error
+ALTER TABLE d.person ALTER COLUMN tags TYPE SMALLINT[]
+----
+only conversions that keep distinct values distinct
+
+statement error
+ALTER TABLE d.person ALTER COLUMN age TYPE INTEGER USING age::INTEGER + 1
+----
+USING
+
+# DROP COLUMN retracts the values; the column disappears, history stays in the log
+statement ok
+ALTER TABLE d.person DROP COLUMN nick
+
+statement ok
+ALTER TABLE d.person DROP COLUMN IF EXISTS nick
+
+statement error
+ALTER TABLE d.person DROP COLUMN nick
+----
+has no column
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'd' AND table_name = 'person' AND column_name = 'nick'
+----
+0
+
+# A new column with the old name is a different attribute and starts empty
+statement ok
+ALTER TABLE d.person ADD COLUMN nick VARCHAR
+
+query I
+SELECT count(nick) FROM d.person
+----
+0
+
+# RENAME TABLE
+statement ok
+ALTER TABLE d.person RENAME TO human
+
+query I
+SELECT count(*) FROM d.human
+----
+2
+
+statement error
+SELECT * FROM d.person
+----
+does not exist
+
+statement ok
+CREATE TABLE d.other (x INTEGER)
+
+statement error
+ALTER TABLE d.human RENAME TO other
+----
+already exists
+
+# Schema changes roll back
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE d.human ADD COLUMN temp INTEGER
+
+statement ok
+ALTER TABLE d.human ALTER COLUMN tags TYPE BIGINT[]
+
+statement ok
+ROLLBACK
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'd' AND table_name = 'human' ORDER BY column_index
+----
+id	REF
+full_name	VARCHAR
+age	VARCHAR
+tags	INTEGER[]
+email	VARCHAR
+nick	VARCHAR
+
+# Everything persists
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/alter.mnemonic' AS d (TYPE mnemonicdb)
+
+query TTT
+SELECT full_name, age, tags FROM d.human ORDER BY full_name
+----
+Alice	31	[1, 2]
+Bob	40	NULL
+
+query TT
+SELECT full_name, age FROM d.human AT (VERSION => 3) ORDER BY full_name
+----
+Alice	30
+Bob	40
+
+statement error
+ALTER TABLE d.sys.tables ADD COLUMN x INTEGER
+----
+sys tables cannot be altered

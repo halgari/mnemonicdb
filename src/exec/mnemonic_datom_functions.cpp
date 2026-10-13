@@ -7,6 +7,9 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/function/scalar_function.hpp"
+#include "duckdb/common/vector_operations/unary_executor.hpp"
+#include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 
 namespace duckdb {
@@ -108,7 +111,30 @@ static void DatomFunction(ClientContext &context, TableFunctionInput &input, Dat
 	output.data[0].Append(Value::BOOLEAN(before != after));
 }
 
+//! current_tx('db'): the sys.tx entity of the current, writing transaction
+static void CurrentTxFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	UnaryExecutor::Execute<string_t, uint64_t>(args.data[0], result, args.size(), [&](string_t name) {
+		auto &catalog = Catalog::GetCatalog(context, Identifier(name.GetString()));
+		if (catalog.GetCatalogType() != "mnemonicdb") {
+			throw InvalidInputException("current_tx: \"%s\" is not a MnemonicDB database", name.GetString());
+		}
+		auto &transaction = MnemonicTransaction::Get(context, catalog);
+		if (transaction.IsReadOnly()) {
+			throw InvalidInputException("current_tx: the transaction has not written to \"%s\"; use current_tx() "
+			                            "in a statement that writes, or after one in the same transaction",
+			                            name.GetString());
+		}
+		return transaction.CurrentTxEntity();
+	});
+}
+
 void RegisterDatomFunctions(ExtensionLoader &loader) {
+	ScalarFunction current_tx("current_tx", {LogicalType::VARCHAR}, mnemonicdb::RefType(), CurrentTxFunction);
+	current_tx.SetStability(FunctionStability::VOLATILE);
+	current_tx.SetFallible();
+	loader.RegisterFunction(current_tx);
+
 	for (auto assert_value : {true, false}) {
 		TableFunction function(assert_value ? "mnemonicdb_add" : "mnemonicdb_retract",
 		                       {LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::VARCHAR, LogicalType::ANY},

@@ -1,0 +1,197 @@
+# name: test/sql/sys_writes.test
+# description: Schema can be defined by writing to sys.tables / sys.attributes; transactions can carry metadata
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/sys_writes.mnemonic' AS d (TYPE mnemonicdb)
+
+# Define a table purely with data, and use it in the same transaction
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.sys.tables (id, schema, name, doc) VALUES (tempid('thing'), 'main', 'thing', 'Things')
+
+statement ok
+INSERT INTO d.sys.attributes (table_id, name, type, uniqueness) VALUES
+    (tempid('thing'), 'label', 'VARCHAR', 'identity'),
+    (tempid('thing'), 'size', 'INTEGER', NULL),
+    (tempid('thing'), 'parts', 'REF[]', NULL)
+
+statement ok
+INSERT INTO d.thing (id, label, size) VALUES (tempid('box'), 'box', 3)
+
+statement ok
+COMMIT
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'd' AND table_name = 'thing' ORDER BY column_index
+----
+id	REF
+label	VARCHAR
+size	INTEGER
+parts	REF[]
+
+# IDs come from the schema partitions
+query II
+SELECT mnemonicdb_id_partition(id), mnemonicdb_id_local(id) >= 16 FROM d.sys.tables WHERE name = 'thing'
+----
+1	true
+
+query I
+SELECT count(*) FROM d.sys.attributes WHERE mnemonicdb_id_partition(table_id) = 1 AND name IN ('label', 'size', 'parts') AND mnemonicdb_id_local(id) >= 64
+----
+3
+
+# The identity column works
+statement ok
+INSERT INTO d.thing (id, label, size) VALUES (tempid('again'), 'box', 4)
+
+query II
+SELECT label, size FROM d.thing
+----
+box	4
+
+# Updating sys rows: rename a table, add an index, make a column unique
+statement ok
+UPDATE d.sys.tables SET name = 'stuff' WHERE name = 'thing'
+
+query I
+SELECT count(*) FROM d.stuff
+----
+1
+
+statement ok
+UPDATE d.sys.attributes SET index = 'stuff_size' WHERE name = 'size'
+
+query I
+SELECT index_name FROM duckdb_indexes() WHERE database_name = 'd'
+----
+stuff_size
+
+query I
+SELECT label FROM d.stuff WHERE size = 4
+----
+box
+
+statement ok
+INSERT INTO d.stuff (label, size) VALUES ('bag', 4)
+
+statement error
+UPDATE d.sys.attributes SET uniqueness = 'value' WHERE name = 'size'
+----
+cannot become unique
+
+statement ok
+UPDATE d.sys.attributes SET uniqueness = 'value' WHERE name = 'label'
+
+query I
+SELECT uniqueness FROM d.sys.attributes WHERE name = 'label'
+----
+value
+
+# Things that must go through ALTER / DROP, or that would corrupt the schema
+statement error
+UPDATE d.sys.attributes SET type = 'BIGINT' WHERE name = 'size'
+----
+use ALTER TABLE ... TYPE
+
+statement error
+DELETE FROM d.sys.attributes WHERE name = 'size'
+----
+rows cannot be deleted from sys tables
+
+statement error
+UPDATE d.sys.tables SET name = 'x' WHERE name = 'tables'
+----
+built-in schema entities cannot be changed
+
+statement error
+INSERT INTO d.sys.attributes (table_id, name, type) SELECT id, 'bad', 'NOT_A_TYPE' FROM d.sys.tables WHERE name = 'stuff'
+----
+NOT_A_TYPE
+
+statement error
+INSERT INTO d.sys.attributes (table_id, name, type) SELECT id, 'label', 'VARCHAR' FROM d.sys.tables WHERE name = 'stuff'
+----
+two attributes named
+
+statement error
+INSERT INTO d.sys.tables (schema, name) VALUES ('main', 'stuff')
+----
+defined twice
+
+statement error
+INSERT INTO d.sys.attributes (table_id, name, type, uniqueness) SELECT id, 'x', 'VARCHAR', 'sometimes' FROM d.sys.tables WHERE name = 'stuff'
+----
+unknown uniqueness
+
+# Failed schema writes leave the schema unchanged
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'd' AND table_name = 'stuff'
+----
+4
+
+# Transaction metadata: add columns to sys.tx and describe the current transaction
+statement ok
+ALTER TABLE d.sys.tx ADD COLUMN note VARCHAR
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.stuff (label, size) VALUES ('crate', 9)
+
+statement ok
+INSERT INTO d.sys.tx (id, note) VALUES (current_tx('d'), 'added a crate')
+
+statement ok
+COMMIT
+
+statement ok
+SET VARIABLE noted_tx = (SELECT mnemonicdb_id_local(id) FROM d.sys.tx WHERE note IS NOT NULL)
+
+query I
+SELECT getvariable('noted_tx') = (SELECT last_tx FROM mnemonicdb_info('d'))
+----
+true
+
+query I
+SELECT label FROM d.stuff AT (VERSION => getvariable('noted_tx') - 1) WHERE size = 9
+----
+
+query I
+SELECT label FROM d.stuff AT (VERSION => getvariable('noted_tx')) WHERE size = 9
+----
+crate
+
+statement error
+SELECT current_tx('d')
+----
+has not written
+
+statement error
+INSERT INTO d.sys.tx (id, note) SELECT id, 'rewrite history' FROM d.sys.tx WHERE mnemonicdb_id_local(id) = 1
+----
+can only describe the current transaction
+
+# All of it survives reattach
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/sys_writes.mnemonic' AS d (TYPE mnemonicdb)
+
+query TI
+SELECT label, size FROM d.stuff ORDER BY label
+----
+bag	4
+box	4
+crate	9
+
+query I
+SELECT note FROM d.sys.tx WHERE note IS NOT NULL
+----
+added a crate

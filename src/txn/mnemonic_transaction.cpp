@@ -10,10 +10,15 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
+#include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/function/cast_rules.hpp"
+#include "duckdb/common/enum_util.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 
 #include "rocksdb/db.h"
+
+#include <set>
 
 namespace duckdb {
 
@@ -145,19 +150,9 @@ optional_ptr<CatalogEntry> MnemonicTransaction::CreateTable(MnemonicSchemaEntry 
 	table.name = table_name;
 	vector<mnemonicdb::AttributeDef> attributes;
 	for (auto &column : info.columns.Logical()) {
-		auto &name = column.Name().GetIdentifierName();
-		if (StringUtil::CIEquals(name, "id") || StringUtil::CIEquals(name, "rowid")) {
-			throw BinderException("MnemonicDB: column name \"%s\" is reserved", name);
-		}
-		if (column.Generated()) {
-			throw NotImplementedException("MnemonicDB does not support generated columns");
-		}
-		if (column.HasDefaultValue()) {
-			throw NotImplementedException("MnemonicDB does not support column defaults");
-		}
 		auto unique = uniqueness.find(column.Logical().index);
-		attributes.emplace_back(store.AllocateId(mnemonicdb::partition::ATTR), table.id, name, column.Type(),
-		                        unique == uniqueness.end() ? mnemonicdb::Uniqueness::NONE : unique->second, false);
+		attributes.push_back(
+		    NewAttribute(table.id, column, unique == uniqueness.end() ? mnemonicdb::Uniqueness::NONE : unique->second));
 	}
 
 	mnemonicdb::Schema::WriteTable(writer, schema, table);
@@ -166,6 +161,216 @@ optional_ptr<CatalogEntry> MnemonicTransaction::CreateTable(MnemonicSchemaEntry 
 	}
 	SetSchema(schema.WithTable(table, attributes));
 	return generation->GetTable(schema_name, table_name).get();
+}
+
+static void CheckColumnName(const string &name) {
+	if (StringUtil::CIEquals(name, "id") || StringUtil::CIEquals(name, "rowid")) {
+		throw BinderException("MnemonicDB: column name \"%s\" is reserved", name);
+	}
+}
+
+mnemonicdb::AttributeDef MnemonicTransaction::NewAttribute(EntityId table, const ColumnDefinition &column,
+                                                         mnemonicdb::Uniqueness unique) {
+	auto &name = column.Name().GetIdentifierName();
+	CheckColumnName(name);
+	if (column.Generated()) {
+		throw NotImplementedException("MnemonicDB does not support generated columns");
+	}
+	if (column.HasDefaultValue()) {
+		throw NotImplementedException("MnemonicDB does not support column defaults");
+	}
+	return mnemonicdb::AttributeDef(store.AllocateId(mnemonicdb::partition::ATTR), table, name, column.Type(), unique,
+	                                false);
+}
+
+//! Whether values of `from` can be converted to `to` without merging distinct values
+static bool IsSafeTypeChange(const LogicalType &from, const LogicalType &to) {
+	if (from == to) {
+		return true;
+	}
+	bool from_list = from.id() == LogicalTypeId::LIST;
+	if (from_list != (to.id() == LogicalTypeId::LIST)) {
+		return false;
+	}
+	if (from_list) {
+		return IsSafeTypeChange(ListType::GetChildType(from), ListType::GetChildType(to));
+	}
+	if (mnemonicdb::IsRefType(from) || mnemonicdb::IsRefType(to)) {
+		return false;
+	}
+	if (to.id() == LogicalTypeId::VARCHAR) {
+		return true;
+	}
+	return CastRules::ImplicitCast(from, to) >= 0;
+}
+
+void MnemonicTransaction::AlterTable(const string &schema_name, AlterTableInfo &info) {
+	auto &schema = GetSchema();
+	auto table_name = info.GetQualifiedName().Name().GetIdentifierName();
+	auto table = schema.FindTable(schema_name, table_name);
+	if (!table) {
+		if (info.if_not_found != OnEntryNotFound::THROW_EXCEPTION) {
+			return;
+		}
+		throw CatalogException("MnemonicDB: table \"%s\" does not exist", table_name);
+	}
+	bool tx_add_column = table->id == mnemonicdb::sys::TX && info.alter_table_type == AlterTableType::ADD_COLUMN;
+	if (table->schema != "main" && !tx_add_column) {
+		throw NotImplementedException("MnemonicDB: sys tables cannot be altered, except ADD COLUMN on sys.tx");
+	}
+	auto &writer = GetWriter();
+	auto find_column = [&](const string &name) -> const mnemonicdb::AttributeDef & {
+		auto attr = schema.FindAttribute(*table, name);
+		if (!attr) {
+			throw BinderException("MnemonicDB: table \"%s\" has no column \"%s\"", table->name, name);
+		}
+		return *attr;
+	};
+
+	switch (info.alter_table_type) {
+	case AlterTableType::RENAME_TABLE: {
+		auto &rename = info.Cast<RenameTableInfo>();
+		auto new_name = rename.new_table_name.GetIdentifierName();
+		if (schema.FindTable(schema_name, new_name)) {
+			throw CatalogException::EntryAlreadyExists(CatalogType::TABLE_ENTRY, rename.new_table_name);
+		}
+		writer.Assert(schema.GetAttribute(mnemonicdb::sys::TABLES_NAME), table->id,
+		              schema.GetAttribute(mnemonicdb::sys::TABLES_NAME).codec.EncodeValue(Value(new_name)));
+		SetSchema(schema.WithTableName(table->id, new_name));
+		break;
+	}
+	case AlterTableType::RENAME_COLUMN: {
+		auto &rename = info.Cast<RenameColumnInfo>();
+		auto &attr = find_column(rename.old_name.GetIdentifierName());
+		auto new_name = rename.new_name.GetIdentifierName();
+		CheckColumnName(new_name);
+		if (schema.FindAttribute(*table, new_name) && !StringUtil::CIEquals(new_name, attr.name)) {
+			throw CatalogException("MnemonicDB: table \"%s\" already has a column \"%s\"", table->name, new_name);
+		}
+		auto &sys_name = schema.GetAttribute(mnemonicdb::sys::ATTRIBUTES_NAME);
+		writer.Assert(sys_name, attr.id, sys_name.codec.EncodeValue(Value(new_name)));
+		auto renamed = attr;
+		renamed.name = new_name;
+		SetSchema(schema.WithAttribute(std::move(renamed)));
+		break;
+	}
+	case AlterTableType::ADD_COLUMN: {
+		auto &add = info.Cast<AddColumnInfo>();
+		if (add.add_not_null) {
+			throw NotImplementedException("MnemonicDB does not support NOT NULL: a NULL column is an absent attribute");
+		}
+		auto &name = add.new_column.Name().GetIdentifierName();
+		if (schema.FindAttribute(*table, name) || StringUtil::CIEquals(name, "id")) {
+			if (add.if_column_not_exists) {
+				return;
+			}
+			throw CatalogException("MnemonicDB: table \"%s\" already has a column \"%s\"", table->name, name);
+		}
+		auto attr = NewAttribute(table->id, add.new_column, mnemonicdb::Uniqueness::NONE);
+		mnemonicdb::Schema::WriteAttribute(writer, schema, attr);
+		SetSchema(schema.WithNewAttribute(std::move(attr)));
+		break;
+	}
+	case AlterTableType::REMOVE_COLUMN: {
+		auto &remove = info.Cast<RemoveColumnInfo>();
+		auto name = remove.removed_column.GetIdentifierName();
+		auto attr_ptr = schema.FindAttribute(*table, name);
+		if (!attr_ptr) {
+			if (remove.if_column_exists) {
+				return;
+			}
+			find_column(name);
+		}
+		auto &attr = *attr_ptr;
+		// Retract the column's values (they stay in history), then detach the attribute from the table
+		vector<EntityId> entities;
+		for (auto &datom : writer.GetView().ScanPrefix(mnemonicdb::ColumnFamily::AEVT, mnemonicdb::AevtPrefix(attr.Local()))) {
+			if (entities.empty() || entities.back() != datom.e) {
+				entities.push_back(datom.e);
+			}
+		}
+		for (auto entity : entities) {
+			writer.RetractAll(attr, entity);
+		}
+		for (auto sys_attr : {mnemonicdb::sys::ATTRIBUTES_TABLE, mnemonicdb::sys::ATTRIBUTES_INDEX,
+		                      mnemonicdb::sys::ATTRIBUTES_INDEXED}) {
+			writer.RetractAll(schema.GetAttribute(sys_attr), attr.id);
+		}
+		SetSchema(schema.WithoutAttribute(attr.Local()));
+		break;
+	}
+	case AlterTableType::ALTER_COLUMN_TYPE: {
+		auto &change = info.Cast<ChangeColumnTypeInfo>();
+		auto &attr = find_column(change.column_name.GetIdentifierName());
+		if (change.expression && change.expression->GetExpressionClass() != ExpressionClass::CAST) {
+			throw NotImplementedException("MnemonicDB does not support ALTER COLUMN TYPE ... USING");
+		}
+		if (!IsSafeTypeChange(attr.type, change.target_type)) {
+			throw NotImplementedException("MnemonicDB cannot change column \"%s\" from %s to %s: only conversions "
+			                              "that keep distinct values distinct are allowed",
+			                              attr.name, attr.type.ToString(), change.target_type.ToString());
+		}
+		mnemonicdb::AttributeDef changed(attr.id, attr.table, attr.name, change.target_type, attr.unique,
+		                                 attr.indexed, attr.index_name);
+		auto &old_codec = attr.codec;
+		auto &new_codec = changed.codec;
+		auto &target = changed.value_type;
+		writer.RewriteAttribute(attr, changed, [&](std::string_view v) {
+			return new_codec.EncodeValue(old_codec.DecodeValue(v).DefaultCastAs(target, true));
+		});
+		auto &sys_type = schema.GetAttribute(mnemonicdb::sys::ATTRIBUTES_TYPE);
+		writer.Assert(sys_type, attr.id, sys_type.codec.EncodeValue(Value(changed.type.ToString())));
+		SetSchema(schema.WithAttribute(std::move(changed)));
+		break;
+	}
+	default:
+		throw NotImplementedException("MnemonicDB does not support ALTER TABLE %s",
+		                              EnumUtil::ToString(info.alter_table_type));
+	}
+}
+
+mnemonicdb::EntityId MnemonicTransaction::CurrentTxEntity() {
+	return mnemonicdb::TxEntity(GetWriter().GetTx());
+}
+
+void MnemonicTransaction::ReloadSchema(ClientContext &context) {
+	auto &writer = GetWriter();
+	auto &old_schema = GetSchema();
+	auto new_schema = mnemonicdb::Schema::Load(writer.GetView(), context);
+	for (auto old_attr : old_schema.AllAttributes()) {
+		auto new_table = new_schema->FindTable(old_attr->table);
+		bool still_there = false;
+		if (new_table) {
+			for (auto local : new_table->attributes) {
+				still_there = still_there || local == old_attr->Local();
+			}
+		}
+		if (!still_there) {
+			throw NotImplementedException("MnemonicDB: attribute \"%s\" cannot be removed through sys.attributes; "
+			                              "use ALTER TABLE ... DROP COLUMN",
+			                              old_attr->name);
+		}
+		auto &new_attr = new_schema->GetAttribute(old_attr->Local());
+		if (new_attr.type != old_attr->type) {
+			throw NotImplementedException(
+			    "MnemonicDB: the type of \"%s\" cannot be changed through sys.attributes; use ALTER TABLE ... TYPE",
+			    old_attr->name);
+		}
+		if (new_attr.unique != mnemonicdb::Uniqueness::NONE && old_attr->unique == mnemonicdb::Uniqueness::NONE) {
+			std::set<string> seen;
+			for (auto &datom : writer.GetView().ScanPrefix(mnemonicdb::ColumnFamily::AEVT,
+			                                               mnemonicdb::AevtPrefix(new_attr.Local()))) {
+				if (!seen.insert(datom.v).second) {
+					throw ConstraintException("MnemonicDB: \"%s\" cannot become unique: two entities share a value",
+					                          new_attr.name);
+				}
+			}
+		}
+		if (new_attr.HasAvet() != old_attr->HasAvet()) {
+			writer.RebuildAvet(new_attr, !new_attr.HasAvet());
+		}
+	}
+	SetSchema(std::move(new_schema));
 }
 
 void MnemonicTransaction::SetSchema(shared_ptr<const mnemonicdb::Schema> schema) {

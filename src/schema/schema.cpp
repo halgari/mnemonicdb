@@ -76,10 +76,10 @@ static vector<BuiltinAttribute> BuiltinAttributes() {
 	    {sys::TABLES_SCHEMA, sys::TABLES, "schema", varchar, Uniqueness::NONE, false},
 	    {sys::TABLES_NAME, sys::TABLES, "name", varchar, Uniqueness::NONE, true},
 	    {sys::TABLES_DOC, sys::TABLES, "doc", varchar, Uniqueness::NONE, false},
-	    {sys::ATTRIBUTES_TABLE, sys::ATTRIBUTES, "table", RefType(), Uniqueness::NONE, false},
+	    {sys::ATTRIBUTES_TABLE, sys::ATTRIBUTES, "table_id", RefType(), Uniqueness::NONE, false},
 	    {sys::ATTRIBUTES_NAME, sys::ATTRIBUTES, "name", varchar, Uniqueness::NONE, false},
 	    {sys::ATTRIBUTES_TYPE, sys::ATTRIBUTES, "type", varchar, Uniqueness::NONE, false},
-	    {sys::ATTRIBUTES_UNIQUE, sys::ATTRIBUTES, "unique", varchar, Uniqueness::NONE, false},
+	    {sys::ATTRIBUTES_UNIQUE, sys::ATTRIBUTES, "uniqueness", varchar, Uniqueness::NONE, false},
 	    {sys::ATTRIBUTES_INDEXED, sys::ATTRIBUTES, "indexed", LogicalType(LogicalTypeId::BOOLEAN), Uniqueness::NONE,
 	     false},
 	    {sys::ATTRIBUTES_DOC, sys::ATTRIBUTES, "doc", varchar, Uniqueness::NONE, false},
@@ -199,6 +199,37 @@ shared_ptr<Schema> Schema::WithAttribute(AttributeDef attribute) const {
 	return result;
 }
 
+shared_ptr<Schema> Schema::WithNewAttribute(AttributeDef attribute) const {
+	auto result = duckdb::make_shared_ptr<Schema>(*this);
+	result->AddAttribute(std::move(attribute));
+	return result;
+}
+
+shared_ptr<Schema> Schema::WithoutAttribute(AttrId local) const {
+	auto result = duckdb::make_shared_ptr<Schema>(*this);
+	auto entry = result->attributes.find(local);
+	if (entry == result->attributes.end()) {
+		throw duckdb::InternalException("MnemonicDB: removing unknown attribute %d", local);
+	}
+	auto &table = result->tables.at(entry->second.table);
+	table.attributes.erase(std::remove(table.attributes.begin(), table.attributes.end(), local), table.attributes.end());
+	result->attributes.erase(entry);
+	return result;
+}
+
+shared_ptr<Schema> Schema::WithTableName(EntityId table_id, const string &name) const {
+	auto result = duckdb::make_shared_ptr<Schema>(*this);
+	auto &table = result->tables.at(table_id);
+	auto &by_name = result->tables_by_name[table.schema];
+	if (by_name.find(name) != by_name.end()) {
+		throw InvalidInputException("MnemonicDB: table \"%s\" already exists", name);
+	}
+	by_name.erase(table.name);
+	by_name[name] = table_id;
+	table.name = name;
+	return result;
+}
+
 const AttributeDef *Schema::FindIndex(const string &name) const {
 	for (auto &entry : attributes) {
 		if (!entry.second.index_name.empty() && duckdb::StringUtil::CIEquals(entry.second.index_name, name)) {
@@ -206,6 +237,14 @@ const AttributeDef *Schema::FindIndex(const string &name) const {
 		}
 	}
 	return nullptr;
+}
+
+vector<const AttributeDef *> Schema::AllAttributes() const {
+	vector<const AttributeDef *> result;
+	for (auto &entry : attributes) {
+		result.push_back(&entry.second);
+	}
+	return result;
 }
 
 vector<const AttributeDef *> Schema::IndexedAttributes() const {

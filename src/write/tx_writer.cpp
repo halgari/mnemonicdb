@@ -2,6 +2,8 @@
 
 #include "duckdb/common/exception.hpp"
 
+#include <set>
+
 #include "rocksdb/db.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
 
@@ -191,6 +193,78 @@ bool TxWriter::UndoRetraction(const AttributeDef &attr, EntityId e, const string
 		return true;
 	}
 	return false;
+}
+
+void TxWriter::RewriteAttribute(const AttributeDef &old_attr, const AttributeDef &new_attr,
+                                const std::function<string(std::string_view)> &reencode) {
+	struct Entry {
+		Datom datom;
+		bool history;
+		TxId retracted_by;
+		string new_v;
+	};
+	vector<Entry> entries;
+	auto prefix = AevtPrefix(old_attr.Local());
+	for (auto history : {false, true}) {
+		auto it = view.NewIterator(history ? ColumnFamily::AEVT_HIST : ColumnFamily::AEVT);
+		for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
+			Entry entry;
+			entry.datom = DecodeKey(IndexKind::AEVT, std::string_view(it->key().data(), it->key().size()));
+			entry.history = history;
+			entry.retracted_by =
+			    history ? DecodeHistoryValue(std::string_view(it->value().data(), it->value().size())) : 0;
+			entry.new_v = reencode(entry.datom.v);
+			entries.push_back(std::move(entry));
+		}
+		CheckStatus(it->status());
+	}
+
+	// The conversion must keep distinct current values distinct, per entity and, for unique attributes, overall
+	std::set<std::pair<EntityId, string>> per_entity;
+	std::set<string> overall;
+	for (auto &entry : entries) {
+		if (entry.history) {
+			continue;
+		}
+		if (!per_entity.insert({entry.datom.e, entry.new_v}).second) {
+			throw duckdb::InvalidInputException(
+			    "MnemonicDB: changing the type of \"%s\" would merge two values of entity %d", old_attr.name,
+			    entry.datom.e);
+		}
+		if (new_attr.unique != Uniqueness::NONE && !overall.insert(entry.new_v).second) {
+			throw duckdb::ConstraintException(
+			    "MnemonicDB: changing the type of \"%s\" would make two entities share a unique value",
+			    old_attr.name);
+		}
+	}
+
+	auto history_cfs = [](bool history, ColumnFamily current, ColumnFamily hist) { return history ? hist : current; };
+	for (auto &entry : entries) {
+		auto old_datom = entry.datom;
+		auto new_datom = entry.datom;
+		new_datom.v = entry.new_v;
+		auto value = entry.history ? EncodeHistoryValue(entry.retracted_by) : string();
+		for (auto &index : IndexesOf(old_attr)) {
+			Delete(history_cfs(entry.history, index.first, index.second), EncodeKey(IndexKindOf(index.first), old_datom));
+		}
+		for (auto &index : IndexesOf(new_attr)) {
+			Put(history_cfs(entry.history, index.first, index.second), EncodeKey(IndexKindOf(index.first), new_datom),
+			    value);
+		}
+		// The txlog records the assertion, and for history entries the retraction
+		vector<std::pair<TxId, TxOp>> log_entries {{old_datom.t, TxOp::ASSERT}};
+		if (entry.history) {
+			log_entries.emplace_back(entry.retracted_by, TxOp::RETRACT);
+		}
+		for (auto &log : log_entries) {
+			auto old_log = old_datom;
+			old_log.t = log.first;
+			auto new_log = new_datom;
+			new_log.t = log.first;
+			Delete(ColumnFamily::TXLOG, EncodeKey(IndexKind::TXLOG, old_log));
+			Put(ColumnFamily::TXLOG, EncodeKey(IndexKind::TXLOG, new_log), EncodeTxOp(log.second));
+		}
+	}
 }
 
 void TxWriter::RebuildAvet(const AttributeDef &attr, bool remove) {

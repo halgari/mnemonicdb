@@ -92,9 +92,16 @@ public:
 	shared_ptr<Schema> WithTable(TableDef table, vector<AttributeDef> attributes) const;
 	//! A copy of this schema with one attribute definition replaced
 	shared_ptr<Schema> WithAttribute(AttributeDef attribute) const;
+	//! A copy of this schema with an attribute appended to its table
+	shared_ptr<Schema> WithNewAttribute(AttributeDef attribute) const;
+	//! A copy of this schema without an attribute
+	shared_ptr<Schema> WithoutAttribute(AttrId local) const;
+	//! A copy of this schema with a table renamed
+	shared_ptr<Schema> WithTableName(EntityId table, const string &name) const;
 	//! The attribute carrying the index named `name`, if any
 	const AttributeDef *FindIndex(const string &name) const;
 	vector<const AttributeDef *> IndexedAttributes() const;
+	vector<const AttributeDef *> AllAttributes() const;
 
 private:
 	void AddTable(TableDef table);

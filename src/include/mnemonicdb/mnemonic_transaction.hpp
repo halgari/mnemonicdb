@@ -16,6 +16,8 @@ class MnemonicSchemaEntry;
 class MnemonicTableEntry;
 class MnemonicTransactionManager;
 struct BoundCreateTableInfo;
+struct AlterTableInfo;
+class ColumnDefinition;
 
 class MnemonicTransaction : public Transaction {
 public:
@@ -55,6 +57,12 @@ public:
 	//! CREATE INDEX / DROP INDEX inside this transaction
 	void CreateIndex(MnemonicTableEntry &table, const string &index_name, const string &column, bool if_not_exists);
 	void DropIndex(const string &index_name, bool if_exists);
+	//! ALTER TABLE inside this transaction
+	void AlterTable(const string &schema_name, AlterTableInfo &info);
+	//! Re-read the schema after a statement wrote to sys tables, and bring the indexes in line with it
+	void ReloadSchema(ClientContext &context);
+	//! The entity of this (writing) transaction
+	mnemonicdb::EntityId CurrentTxEntity();
 
 	//! The real entity ID a tempid placeholder resolved to in this transaction, if any
 	optional_ptr<const mnemonicdb::EntityId> FindTempid(mnemonicdb::EntityId placeholder) const;
@@ -66,6 +74,9 @@ public:
 private:
 	void ReleaseWriter();
 	void SetSchema(shared_ptr<const mnemonicdb::Schema> schema);
+	//! A new attribute definition for a column of a new or altered table
+	mnemonicdb::AttributeDef NewAttribute(mnemonicdb::EntityId table, const ColumnDefinition &column,
+	                                      mnemonicdb::Uniqueness unique);
 
 private:
 	MnemonicCatalog &catalog;
