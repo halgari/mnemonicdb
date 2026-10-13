@@ -25,6 +25,8 @@ set(WITH_ZSTD ON CACHE BOOL "" FORCE)
 set(FAIL_ON_WARNINGS OFF CACHE BOOL "" FORCE)
 set(USE_RTTI ON CACHE STRING "" FORCE)
 set(PORTABLE 1 CACHE STRING "" FORCE)
+# On MSVC RocksDB would take compression libraries from hardcoded NuGet paths; they are wired in below instead
+set(ROCKSDB_SKIP_THIRDPARTY ON CACHE BOOL "" FORCE)
 # Compression libraries, vendored and built static so the extension is self-contained. RocksDB's find modules
 # are pointed at them through their cache variables and the imported target names they would create.
 set(MNEMONICDB_LZ4_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lib)
@@ -52,6 +54,10 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/third_party/rocksdb ${CMAKE_CURRENT
                  EXCLUDE_FROM_ALL)
 # DuckDB's own (namespaced) zstd headers are on the global include path; RocksDB must see the real ones first
 target_include_directories(rocksdb BEFORE PRIVATE ${MNEMONICDB_ZSTD_DIR} ${MNEMONICDB_LZ4_DIR})
+if(MSVC)
+  target_compile_definitions(rocksdb PRIVATE LZ4 ZSTD)
+  target_link_libraries(rocksdb PRIVATE mnemonicdb_lz4 mnemonicdb_zstd)
+endif()
 
 include_directories(src/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party/rocksdb/include)
 
