@@ -233,7 +233,22 @@ driving mode:
   then candidate entities from AVET (plus `avet_hist` under `AT`).
 
 Candidates are filled in by EAVT point lookups. Every other query merges the
-AEVT ranges. (Declining filters through `supports_pushdown_type` breaks
+AEVT ranges.
+
+**Reading fewer attributes.** Membership normally needs every attribute of a
+table. But when a pushed filter on an attribute is NULL-rejecting
+(comparisons, BETWEEN, IN, IS NOT NULL, AND with any such child, OR of only
+such children), rows without that attribute can't pass. That attribute then
+decides membership, and the scan reads only the filtered and projected
+attributes. Values are decoded straight from the iterator's key into the
+output vectors, including list children.
+
+**Parallelism.** A scan splits into tasks:
+- merge mode: even slices of the entity id range, which is found from the
+  attributes' first and last AEVT keys;
+- lookup mode: slices of the sorted candidates.
+
+Scans whose largest table is under about 100k rows stay single-threaded. (Declining filters through `supports_pushdown_type` breaks
 DuckDB's plan when the filtered column isn't projected, so the scan accepts
 them all.)
 

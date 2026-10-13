@@ -32,6 +32,7 @@ def workload(engine, path):
         steps.append(("load_person", f"INSERT INTO d.person (name, age, email, score) SELECT 'p' || i, i % 100, 'e' || i, i / 7.0 FROM range({N}) t(i);", True))
         steps.append(("load_account", f"INSERT INTO d.account (id, balance) SELECT id, age * 10 FROM d.person WHERE age < 50;", True))
         steps.append(("load_vip", "CREATE TABLE d.vip (level INTEGER); INSERT INTO d.vip (id, level) SELECT id, 1 FROM d.person WHERE age = 0;", False))
+        steps.append(("load_tagged", f"CREATE TABLE d.tagged (tags VARCHAR[]); INSERT INTO d.tagged (tags) SELECT ['t' || (i % 7), 'u' || (i % 11), 'v' || (i % 13)] FROM range({N // 3}) t(i);", False))
         idq = "(SELECT id FROM d.person WHERE email = 'e123456')"
     else:
         steps.append(("attach", f"ATTACH '{path}' AS d;", False))
@@ -40,13 +41,16 @@ def workload(engine, path):
         steps.append(("load_person", f"INSERT INTO d.person SELECT i + 1, 'p' || i, i % 100, 'e' || i, i / 7.0 FROM range({N}) t(i);", True))
         steps.append(("load_account", f"INSERT INTO d.account SELECT id, age * 10 FROM d.person WHERE age < 50;", True))
         steps.append(("load_vip", "CREATE TABLE d.vip (id BIGINT PRIMARY KEY, level INTEGER); INSERT INTO d.vip SELECT id, 1 FROM d.person WHERE age = 0;", False))
+        steps.append(("load_tagged", f"CREATE TABLE d.tagged (id BIGINT, tags VARCHAR[]); INSERT INTO d.tagged SELECT i, ['t' || (i % 7), 'u' || (i % 11), 'v' || (i % 13)] FROM range({N // 3}) t(i);", False))
         idq = "(SELECT id FROM d.person WHERE email = 'e123456')"
     steps += [
         ("checkpoint", "CHECKPOINT d;", True),
         ("scan_count", "SELECT count(*) FROM d.person;", True),
         ("scan_one_col", "SELECT sum(age) FROM d.person;", True),
         ("scan_all_cols", "SELECT sum(length(name)), sum(age), sum(length(email)), sum(score) FROM d.person;", True),
+        ("scan_lists", "SELECT sum(len(tags)), count(DISTINCT tags[1]) FROM d.tagged;", True),
         ("filter_unindexed", "SELECT count(*) FROM d.person WHERE age = 42;", True),
+        ("filter_projected", "SELECT sum(score) FROM d.person WHERE age > 90;", True),
         ("point_unique", "SELECT name FROM d.person WHERE email = 'e123456';", True),
         ("point_id", f"SET VARIABLE pid = {idq}; SELECT name FROM d.person WHERE id = getvariable('pid');", True),
     ]

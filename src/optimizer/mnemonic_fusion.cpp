@@ -109,9 +109,11 @@ static bool TryFuse(Binder &binder, unique_ptr<LogicalOperator> &op, vector<Repl
 	    left_data->as_of != right_data->as_of) {
 		return false;
 	}
-	// An outer join keeps rows whose other side is missing: only a single table can then be optional
-	if ((join_type == JoinType::LEFT && right_data->tables.size() != 1) ||
-	    (join_type == JoinType::RIGHT && left_data->tables.size() != 1)) {
+	// An outer join keeps rows whose other side is missing: only a single table can then be optional, and filters
+	// pushed into the optional side restrict which of its rows match, not which output rows exist, so they cannot
+	// become filters of the fused scan
+	if ((join_type == JoinType::LEFT && (right_data->tables.size() != 1 || right.table_filters.HasFilters())) ||
+	    (join_type == JoinType::RIGHT && (left_data->tables.size() != 1 || left.table_filters.HasFilters()))) {
 		return false;
 	}
 	auto &condition = join.conditions[0];

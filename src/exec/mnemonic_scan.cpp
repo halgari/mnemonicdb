@@ -7,6 +7,7 @@
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
@@ -266,6 +267,10 @@ struct MnemonicScanState : public GlobalTableFunctionState {
 	//! Per table, its attributes' range in `attributes`, whether it is required, and its id columns
 	vector<std::pair<idx_t, idx_t>> table_attributes;
 	vector<bool> table_required;
+	//! Attributes the scan reads. A table whose rows must have some attribute (a NULL-rejecting filter on it) needs
+	//! only that "driving" attribute for membership, plus its projected and filtered ones.
+	vector<bool> attribute_active;
+	vector<optional_idx> table_driver;
 	vector<vector<idx_t>> id_columns;
 
 	//! Lookup mode: the candidate entities, sorted; otherwise AEVT cursors merge each task's entity range
@@ -295,7 +300,8 @@ struct MnemonicScanLocalState : public LocalTableFunctionState {
 	DataChunk scan_chunk;
 	vector<unique_ptr<ExpressionExecutor>> executors;
 	unique_ptr<mnemonicdb::PrefixReader> reader;
-	vector<AttributeCursor> cursors;
+	//! Per attribute; null for attributes the scan does not read
+	vector<unique_ptr<AttributeCursor>> cursors;
 	bool active = false;
 	ScanTask task;
 	idx_t next_candidate = 0;
@@ -557,6 +563,55 @@ static ScanColumn ResolveColumn(const MnemonicScanBindData &bind_data, const Mne
 
 static idx_t EstimateTableRows(MnemonicTableEntry &table);
 
+//! Whether the filter is false or NULL for a NULL column value, so rows without the attribute never pass it
+static bool IsNullRejecting(const Expression &expr) {
+	auto is_column = [](const Expression &child) {
+		return child.GetExpressionType() == ExpressionType::BOUND_REF;
+	};
+	switch (expr.GetExpressionType()) {
+	case ExpressionType::CONJUNCTION_AND:
+		for (auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
+			if (IsNullRejecting(*child)) {
+				return true;
+			}
+		}
+		return false;
+	case ExpressionType::CONJUNCTION_OR:
+		for (auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
+			if (!IsNullRejecting(*child)) {
+				return false;
+			}
+		}
+		return true;
+	case ExpressionType::OPERATOR_IS_NOT_NULL:
+	case ExpressionType::COMPARE_IN: {
+		auto &children = expr.Cast<BoundOperatorExpression>().GetChildren();
+		return !children.empty() && is_column(*children[0]);
+	}
+	case ExpressionType::COMPARE_BETWEEN:
+		if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+			return false;
+		}
+		return BoundBetweenExpression::HasValidBindData(expr.Cast<BoundFunctionExpression>()) &&
+		       is_column(BoundBetweenExpression::Input(expr.Cast<BoundFunctionExpression>()));
+	case ExpressionType::COMPARE_EQUAL:
+	case ExpressionType::COMPARE_NOTEQUAL:
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO: {
+		if (!BoundComparisonExpression::IsComparison(expr)) {
+			return false;
+		}
+		auto &function = expr.Cast<BoundFunctionExpression>();
+		return is_column(BoundComparisonExpression::Left(function)) ||
+		       is_column(BoundComparisonExpression::Right(function));
+	}
+	default:
+		return false;
+	}
+}
+
 //! Below this many estimated rows a scan runs as a single task
 static constexpr idx_t PARALLEL_SCAN_THRESHOLD = 100000;
 //! Rough number of rows per task in a parallel scan
@@ -723,6 +778,27 @@ static unique_ptr<GlobalTableFunctionState> MnemonicScanInit(ClientContext &cont
 		auto &attr = state->attributes[state->columns[range_filter.GetIndex()].attribute].attr.get();
 		state->candidates = EntitiesInRanges(view, attr, ranges, bind_data.as_of);
 	}
+	// Choose which attributes to read
+	auto table_count = bind_data.tables.size();
+	state->table_driver.resize(table_count);
+	vector<bool> filtered(state->attributes.size());
+	for (auto &filter : state->filters) {
+		auto &column = state->columns[filter.column];
+		if (column.kind != ScanColumn::Kind::ATTRIBUTE) {
+			continue;
+		}
+		filtered[column.attribute] = true;
+		auto t = state->attributes[column.attribute].table;
+		if (!state->table_driver[t].IsValid() && IsNullRejecting(*filter.filter.expr)) {
+			state->table_driver[t] = column.attribute;
+		}
+	}
+	state->attribute_active.resize(state->attributes.size());
+	for (idx_t a = 0; a < state->attributes.size(); a++) {
+		auto t = state->attributes[a].table;
+		state->attribute_active[a] = !state->table_driver[t].IsValid() || !state->attribute_columns[a].empty() ||
+		                             filtered[a] || state->table_driver[t].GetIndex() == a;
+	}
 	PlanTasks(context, bind_data, *state, view);
 	return std::move(state);
 }
@@ -740,7 +816,11 @@ static unique_ptr<LocalTableFunctionState> MnemonicScanInitLocal(ExecutionContex
 }
 
 //! Whether the entity is a member of table `t`, given the values read for every attribute
+//! Lookup mode: whether the entity is a member of table `t`, given the values read for its attributes
 static bool IsMember(const MnemonicScanState &state, const vector<vector<string>> &values, idx_t t) {
+	if (state.table_driver[t].IsValid()) {
+		return !values[state.table_driver[t].GetIndex()].empty();
+	}
 	for (idx_t a = state.table_attributes[t].first; a < state.table_attributes[t].second; a++) {
 		if (!values[a].empty()) {
 			return true;
@@ -749,8 +829,42 @@ static bool IsMember(const MnemonicScanState &state, const vector<vector<string>
 	return false;
 }
 
-//! Write one entity's values into row `row` of the scan chunk, or return false if it is not a member of every
-//! required table. `values[a]` holds the encoded values of attribute a.
+//! Appends decoded list elements to row `row` of a LIST vector, writing straight into its child vector
+struct ListAppender {
+	ListAppender(Vector &vector, idx_t row) : vector(vector), row(row), start(ListVector::GetListSize(vector)) {
+	}
+	void Append(const mnemonicdb::ValueCodec &codec, std::string_view encoded) {
+		auto size = start + length;
+		ListVector::Reserve(vector, size + 1);
+		codec.Decode(encoded, ListVector::GetChildMutable(vector), size);
+		length++;
+		ListVector::SetListSize(vector, size + 1);
+	}
+	void Finish() {
+		FlatVector::GetDataMutable<list_entry_t>(vector)[row] = list_entry_t(start, length);
+	}
+
+	Vector &vector;
+	idx_t row;
+	idx_t start;
+	idx_t length = 0;
+};
+
+static void WriteIds(MnemonicScanState &state, DataChunk &chunk, EntityId entity, const vector<bool> &member,
+                     idx_t row) {
+	for (idx_t t = 0; t < member.size(); t++) {
+		for (auto column : state.id_columns[t]) {
+			if (member[t]) {
+				FlatVector::GetDataMutable<uint64_t>(chunk.data[column])[row] = entity;
+			} else {
+				FlatVector::SetNull(chunk.data[column], row, true);
+			}
+		}
+	}
+}
+
+//! Lookup mode: write one entity's values into row `row`, or return false if it is not a member of every required
+//! table. `values[a]` holds the encoded values of attribute a.
 static bool WriteRow(MnemonicScanState &state, DataChunk &chunk, EntityId entity, const vector<vector<string>> &values,
                      idx_t row) {
 	auto table_count = state.table_required.size();
@@ -773,38 +887,43 @@ static bool WriteRow(MnemonicScanState &state, DataChunk &chunk, EntityId entity
 			continue;
 		}
 		auto &attr = state.attributes[a].attr.get();
-		if (!attr.many) {
-			for (auto column : columns) {
-				attr.codec.Decode(values[a][0], chunk.data[column], row);
-			}
-			continue;
-		}
-		vector<Value> elements;
-		for (auto &v : values[a]) {
-			elements.push_back(attr.codec.DecodeValue(v));
-		}
-		auto list = Value::LIST(attr.value_type, std::move(elements));
 		for (auto column : columns) {
-			chunk.data[column].SetValue(row, list);
-		}
-	}
-	for (idx_t t = 0; t < table_count; t++) {
-		for (auto column : state.id_columns[t]) {
-			if (member[t]) {
-				FlatVector::GetDataMutable<uint64_t>(chunk.data[column])[row] = entity;
-			} else {
-				FlatVector::SetNull(chunk.data[column], row, true);
+			if (!attr.many) {
+				attr.codec.Decode(values[a][0], chunk.data[column], row);
+				continue;
 			}
+			ListAppender list(chunk.data[column], row);
+			for (auto &v : values[a]) {
+				list.Append(attr.codec, v);
+			}
+			list.Finish();
 		}
 	}
+	WriteIds(state, chunk, entity, member, row);
 	return true;
 }
 
-//! Produce the next entity from the AEVT cursors; false when exhausted
 //! The next entity that is a member of every required table, skipping ahead (leapfrog) past entities missing from
-//! any of them; false when no such entity remains
+//! any of them; false when no such entity remains. A table with a driving attribute is a member exactly where that
+//! attribute has a value; otherwise where any of its attributes does.
 static bool NextRequiredEntity(MnemonicScanState &state, MnemonicScanLocalState &local, EntityId &entity) {
 	auto table_count = state.table_required.size();
+	auto next_member = [&](idx_t t, EntityId &next) {
+		if (state.table_driver[t].IsValid()) {
+			auto &cursor = *local.cursors[state.table_driver[t].GetIndex()];
+			next = cursor.entity;
+			return cursor.valid;
+		}
+		bool any = false;
+		for (idx_t a = state.table_attributes[t].first; a < state.table_attributes[t].second; a++) {
+			auto &cursor = *local.cursors[a];
+			if (cursor.valid && (!any || cursor.entity < next)) {
+				next = cursor.entity;
+				any = true;
+			}
+		}
+		return any;
+	};
 	while (true) {
 		bool agreed = true;
 		bool first = true;
@@ -813,17 +932,8 @@ static bool NextRequiredEntity(MnemonicScanState &state, MnemonicScanLocalState 
 			if (!state.table_required[t]) {
 				continue;
 			}
-			// The table's next member is the smallest entity any of its attribute cursors is on
-			bool any = false;
 			EntityId next = 0;
-			for (idx_t a = state.table_attributes[t].first; a < state.table_attributes[t].second; a++) {
-				auto &cursor = local.cursors[a];
-				if (cursor.valid && (!any || cursor.entity < next)) {
-					next = cursor.entity;
-					any = true;
-				}
-			}
-			if (!any) {
+			if (!next_member(t, next)) {
 				return false;
 			}
 			if (!first && next != candidate) {
@@ -840,59 +950,90 @@ static bool NextRequiredEntity(MnemonicScanState &state, MnemonicScanLocalState 
 			if (!state.table_required[t]) {
 				continue;
 			}
-			for (idx_t a = state.table_attributes[t].first; a < state.table_attributes[t].second; a++) {
-				local.cursors[a].SeekTo(candidate);
-			}
-		}
-	}
-}
-
-static bool NextMerged(MnemonicScanState &state, MnemonicScanLocalState &local, EntityId &entity,
-                       vector<vector<string>> &values) {
-	bool has_required = false;
-	for (auto required : state.table_required) {
-		has_required = has_required || required;
-	}
-	if (has_required) {
-		if (!NextRequiredEntity(state, local, entity)) {
-			return false;
-		}
-		// Optional tables only need their cursors brought up to the entity
-		for (idx_t t = 0; t < state.table_required.size(); t++) {
-			if (state.table_required[t]) {
+			if (state.table_driver[t].IsValid()) {
+				local.cursors[state.table_driver[t].GetIndex()]->SeekTo(candidate);
 				continue;
 			}
 			for (idx_t a = state.table_attributes[t].first; a < state.table_attributes[t].second; a++) {
-				local.cursors[a].SeekTo(entity);
+				local.cursors[a]->SeekTo(candidate);
 			}
 		}
-	} else {
-		bool any = false;
-		for (auto &cursor : local.cursors) {
-			if (cursor.valid && (!any || cursor.entity < entity)) {
-				entity = cursor.entity;
-				any = true;
-			}
+	}
+}
+
+//! Merge mode: produce the next row straight from the cursors, decoding values from the keys they are on.
+//! Returns false when the task's range is exhausted.
+static bool NextMergedRow(MnemonicScanState &state, MnemonicScanLocalState &local, DataChunk &chunk, idx_t row) {
+	EntityId entity = 0;
+	if (!NextRequiredEntity(state, local, entity)) {
+		return false;
+	}
+	auto table_count = state.table_required.size();
+	// Bring every other cursor (projected, filtered, optional tables) up to the entity
+	for (auto &cursor : local.cursors) {
+		if (cursor) {
+			cursor->SeekTo(entity);
 		}
-		if (!any) {
-			return false;
+	}
+	vector<bool> member(table_count);
+	for (idx_t t = 0; t < table_count; t++) {
+		auto at_entity = [&](idx_t a) {
+			auto &cursor = local.cursors[a];
+			return cursor && cursor->valid && cursor->entity == entity;
+		};
+		if (state.table_driver[t].IsValid()) {
+			member[t] = at_entity(state.table_driver[t].GetIndex());
+			continue;
+		}
+		for (idx_t a = state.table_attributes[t].first; a < state.table_attributes[t].second && !member[t]; a++) {
+			member[t] = at_entity(a);
 		}
 	}
 	for (idx_t a = 0; a < local.cursors.size(); a++) {
-		auto &cursor = local.cursors[a];
-		// Membership needs every attribute's presence, but values are only kept for projected ones
-		bool wanted = !state.attribute_columns[a].empty();
-		while (cursor.valid && cursor.entity == entity) {
-			if (wanted || values[a].empty()) {
-				values[a].emplace_back(cursor.Value());
+		if (!local.cursors[a]) {
+			continue;
+		}
+		auto &cursor = *local.cursors[a];
+		auto &columns = state.attribute_columns[a];
+		bool present = cursor.valid && cursor.entity == entity;
+		if (!present) {
+			for (auto column : columns) {
+				FlatVector::SetNull(chunk.data[column], row, true);
 			}
+			continue;
+		}
+		auto &attr = cursor.attr;
+		if (columns.empty()) {
+			// Read only for membership or a filter on another attribute; skip its values
+		} else if (!attr.many) {
+			for (auto column : columns) {
+				attr.codec.Decode(cursor.Value(), chunk.data[column], row);
+			}
+		} else {
+			vector<ListAppender> lists;
+			for (auto column : columns) {
+				lists.emplace_back(chunk.data[column], row);
+			}
+			while (cursor.valid && cursor.entity == entity) {
+				for (auto &list : lists) {
+					list.Append(attr.codec, cursor.Value());
+				}
+				cursor.Next();
+			}
+			for (auto &list : lists) {
+				list.Finish();
+			}
+			continue;
+		}
+		while (cursor.valid && cursor.entity == entity) {
 			cursor.Next();
 		}
 	}
+	WriteIds(state, chunk, entity, member, row);
 	return true;
 }
 
-//! Produce the next candidate entity's values; false when exhausted
+//! Lookup mode: produce the next candidate entity's values; false when exhausted
 static bool NextCandidate(MnemonicScanState &state, MnemonicScanLocalState &local, optional_idx as_of,
                           EntityId &entity, vector<vector<string>> &values) {
 	constexpr size_t head = mnemonicdb::PACKED_ID_SIZE + mnemonicdb::PACKED_ATTR_SIZE;
@@ -903,12 +1044,16 @@ static bool NextCandidate(MnemonicScanState &state, MnemonicScanLocalState &loca
 		}
 		bool any = false;
 		for (idx_t a = 0; a < state.attributes.size(); a++) {
+			if (!state.attribute_active[a]) {
+				continue;
+			}
 			auto &attr = state.attributes[a].attr.get();
 			auto prefix = mnemonicdb::EavtPrefix(entity, attr.Local());
-			ForEachVisible(*local.reader, ColumnFamily::EAVT, ColumnFamily::EAVT_HIST, prefix, as_of, [&](std::string_view key) {
-				any = true;
-				values[a].emplace_back(key.substr(head, key.size() - head - mnemonicdb::PACKED_TX_SIZE));
-			});
+			ForEachVisible(*local.reader, ColumnFamily::EAVT, ColumnFamily::EAVT_HIST, prefix, as_of,
+			               [&](std::string_view key) {
+				               any = true;
+				               values[a].emplace_back(key.substr(head, key.size() - head - mnemonicdb::PACKED_TX_SIZE));
+			               });
 			// Values from the history index arrive after the current ones; keep them in value order
 			std::sort(values[a].begin(), values[a].end());
 		}
@@ -934,8 +1079,12 @@ static bool StartTask(MnemonicScanState &state, MnemonicScanLocalState &local, m
 		return true;
 	}
 	local.cursors.clear();
-	for (auto &attribute : state.attributes) {
-		local.cursors.emplace_back(view, attribute.attr.get(), as_of, local.task.start, local.task.end);
+	local.cursors.resize(state.attributes.size());
+	for (idx_t a = 0; a < state.attributes.size(); a++) {
+		if (state.attribute_active[a]) {
+			local.cursors[a] = make_uniq<AttributeCursor>(view, state.attributes[a].attr.get(), as_of,
+			                                              local.task.start, local.task.end);
+		}
 	}
 	return true;
 }
@@ -957,13 +1106,19 @@ static void MnemonicScan(ClientContext &context, TableFunctionInput &input, Data
 				exhausted = true;
 				break;
 			}
+			if (!state.lookup_mode) {
+				if (NextMergedRow(state, local, chunk, count)) {
+					count++;
+				} else {
+					local.active = false;
+				}
+				continue;
+			}
 			for (auto &v : values) {
 				v.clear();
 			}
 			EntityId entity = 0;
-			bool found = state.lookup_mode ? NextCandidate(state, local, bind_data.as_of, entity, values)
-			                               : NextMerged(state, local, entity, values);
-			if (!found) {
+			if (!NextCandidate(state, local, bind_data.as_of, entity, values)) {
 				local.active = false;
 				continue;
 			}

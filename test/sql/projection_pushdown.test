@@ -1,0 +1,1106 @@
+# name: test/sql/projection_pushdown.test
+# description: A NULL-rejecting filter lets a scan read only the filtered and projected columns; results match a full scan
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/projection.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.person (name VARCHAR, age INTEGER, tags VARCHAR[], score DOUBLE)
+
+statement ok
+CREATE TABLE d.account (balance INTEGER)
+
+# Entities with every combination of present and absent columns
+# tx 4
+statement ok
+INSERT INTO d.person (name, age, tags, score)
+SELECT CASE WHEN i % 3 <> 0 THEN 'n' || i END, CASE WHEN i % 4 <> 0 THEN i % 50 END,
+       CASE WHEN i % 5 = 0 THEN ['a', 'b'] WHEN i % 5 = 1 THEN ['c'] END, CASE WHEN i % 2 = 0 THEN i / 2.0 END
+FROM range(3000) t(i)
+
+statement ok
+INSERT INTO d.account (id, balance) SELECT id, 7 FROM d.person WHERE name LIKE 'n1%'
+
+statement ok
+UPDATE d.person SET age = NULL WHERE age = 30
+
+statement ok
+UPDATE d.person SET tags = list_append(tags, 'z') WHERE age = 31
+
+statement ok
+CREATE INDEX person_age ON d.person (age)
+
+# Reference copies, read without any filter (full membership)
+statement ok
+CREATE TABLE ref AS SELECT * FROM d.person
+
+statement ok
+CREATE TABLE ref_then AS SELECT * FROM d.person AT (VERSION => 4)
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person WHERE age > 10 EXCEPT ALL SELECT count(*) FROM ref WHERE age > 10)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref WHERE age > 10 EXCEPT ALL SELECT count(*) FROM d.person WHERE age > 10)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age > 10 EXCEPT ALL SELECT count(*) FROM ref_then WHERE age > 10)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref_then WHERE age > 10 EXCEPT ALL SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age > 10)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person WHERE age > 10 EXCEPT ALL SELECT name FROM ref WHERE age > 10)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref WHERE age > 10 EXCEPT ALL SELECT name FROM d.person WHERE age > 10)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person AT (VERSION => 4) WHERE age > 10 EXCEPT ALL SELECT name FROM ref_then WHERE age > 10)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref_then WHERE age > 10 EXCEPT ALL SELECT name FROM d.person AT (VERSION => 4) WHERE age > 10)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person WHERE age > 10 EXCEPT ALL SELECT tags FROM ref WHERE age > 10)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref WHERE age > 10 EXCEPT ALL SELECT tags FROM d.person WHERE age > 10)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person AT (VERSION => 4) WHERE age > 10 EXCEPT ALL SELECT tags FROM ref_then WHERE age > 10)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref_then WHERE age > 10 EXCEPT ALL SELECT tags FROM d.person AT (VERSION => 4) WHERE age > 10)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person WHERE age > 10 EXCEPT ALL SELECT name, tags FROM ref WHERE age > 10)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref WHERE age > 10 EXCEPT ALL SELECT name, tags FROM d.person WHERE age > 10)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age > 10 EXCEPT ALL SELECT name, tags FROM ref_then WHERE age > 10)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref_then WHERE age > 10 EXCEPT ALL SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age > 10)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person WHERE age > 10 EXCEPT ALL SELECT id FROM ref WHERE age > 10)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref WHERE age > 10 EXCEPT ALL SELECT id FROM d.person WHERE age > 10)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person AT (VERSION => 4) WHERE age > 10 EXCEPT ALL SELECT id FROM ref_then WHERE age > 10)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref_then WHERE age > 10 EXCEPT ALL SELECT id FROM d.person AT (VERSION => 4) WHERE age > 10)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person WHERE age = 5 EXCEPT ALL SELECT count(*) FROM ref WHERE age = 5)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref WHERE age = 5 EXCEPT ALL SELECT count(*) FROM d.person WHERE age = 5)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age = 5 EXCEPT ALL SELECT count(*) FROM ref_then WHERE age = 5)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref_then WHERE age = 5 EXCEPT ALL SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age = 5)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person WHERE age = 5 EXCEPT ALL SELECT name FROM ref WHERE age = 5)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref WHERE age = 5 EXCEPT ALL SELECT name FROM d.person WHERE age = 5)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person AT (VERSION => 4) WHERE age = 5 EXCEPT ALL SELECT name FROM ref_then WHERE age = 5)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref_then WHERE age = 5 EXCEPT ALL SELECT name FROM d.person AT (VERSION => 4) WHERE age = 5)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person WHERE age = 5 EXCEPT ALL SELECT tags FROM ref WHERE age = 5)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref WHERE age = 5 EXCEPT ALL SELECT tags FROM d.person WHERE age = 5)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person AT (VERSION => 4) WHERE age = 5 EXCEPT ALL SELECT tags FROM ref_then WHERE age = 5)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref_then WHERE age = 5 EXCEPT ALL SELECT tags FROM d.person AT (VERSION => 4) WHERE age = 5)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person WHERE age = 5 EXCEPT ALL SELECT name, tags FROM ref WHERE age = 5)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref WHERE age = 5 EXCEPT ALL SELECT name, tags FROM d.person WHERE age = 5)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age = 5 EXCEPT ALL SELECT name, tags FROM ref_then WHERE age = 5)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref_then WHERE age = 5 EXCEPT ALL SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age = 5)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person WHERE age = 5 EXCEPT ALL SELECT id FROM ref WHERE age = 5)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref WHERE age = 5 EXCEPT ALL SELECT id FROM d.person WHERE age = 5)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person AT (VERSION => 4) WHERE age = 5 EXCEPT ALL SELECT id FROM ref_then WHERE age = 5)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref_then WHERE age = 5 EXCEPT ALL SELECT id FROM d.person AT (VERSION => 4) WHERE age = 5)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT count(*) FROM ref WHERE age BETWEEN 3 AND 7)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT count(*) FROM d.person WHERE age BETWEEN 3 AND 7)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT count(*) FROM ref_then WHERE age BETWEEN 3 AND 7)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref_then WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age BETWEEN 3 AND 7)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT name FROM ref WHERE age BETWEEN 3 AND 7)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT name FROM d.person WHERE age BETWEEN 3 AND 7)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person AT (VERSION => 4) WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT name FROM ref_then WHERE age BETWEEN 3 AND 7)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref_then WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT name FROM d.person AT (VERSION => 4) WHERE age BETWEEN 3 AND 7)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT tags FROM ref WHERE age BETWEEN 3 AND 7)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT tags FROM d.person WHERE age BETWEEN 3 AND 7)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person AT (VERSION => 4) WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT tags FROM ref_then WHERE age BETWEEN 3 AND 7)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref_then WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT tags FROM d.person AT (VERSION => 4) WHERE age BETWEEN 3 AND 7)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT name, tags FROM ref WHERE age BETWEEN 3 AND 7)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT name, tags FROM d.person WHERE age BETWEEN 3 AND 7)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT name, tags FROM ref_then WHERE age BETWEEN 3 AND 7)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref_then WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age BETWEEN 3 AND 7)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT id FROM ref WHERE age BETWEEN 3 AND 7)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT id FROM d.person WHERE age BETWEEN 3 AND 7)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person AT (VERSION => 4) WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT id FROM ref_then WHERE age BETWEEN 3 AND 7)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref_then WHERE age BETWEEN 3 AND 7 EXCEPT ALL SELECT id FROM d.person AT (VERSION => 4) WHERE age BETWEEN 3 AND 7)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person WHERE age IN (1, 2, 3) EXCEPT ALL SELECT count(*) FROM ref WHERE age IN (1, 2, 3))) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref WHERE age IN (1, 2, 3) EXCEPT ALL SELECT count(*) FROM d.person WHERE age IN (1, 2, 3))) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age IN (1, 2, 3) EXCEPT ALL SELECT count(*) FROM ref_then WHERE age IN (1, 2, 3))) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref_then WHERE age IN (1, 2, 3) EXCEPT ALL SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age IN (1, 2, 3))) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person WHERE age IN (1, 2, 3) EXCEPT ALL SELECT name FROM ref WHERE age IN (1, 2, 3))) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref WHERE age IN (1, 2, 3) EXCEPT ALL SELECT name FROM d.person WHERE age IN (1, 2, 3))) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person AT (VERSION => 4) WHERE age IN (1, 2, 3) EXCEPT ALL SELECT name FROM ref_then WHERE age IN (1, 2, 3))) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref_then WHERE age IN (1, 2, 3) EXCEPT ALL SELECT name FROM d.person AT (VERSION => 4) WHERE age IN (1, 2, 3))) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person WHERE age IN (1, 2, 3) EXCEPT ALL SELECT tags FROM ref WHERE age IN (1, 2, 3))) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref WHERE age IN (1, 2, 3) EXCEPT ALL SELECT tags FROM d.person WHERE age IN (1, 2, 3))) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person AT (VERSION => 4) WHERE age IN (1, 2, 3) EXCEPT ALL SELECT tags FROM ref_then WHERE age IN (1, 2, 3))) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref_then WHERE age IN (1, 2, 3) EXCEPT ALL SELECT tags FROM d.person AT (VERSION => 4) WHERE age IN (1, 2, 3))) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person WHERE age IN (1, 2, 3) EXCEPT ALL SELECT name, tags FROM ref WHERE age IN (1, 2, 3))) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref WHERE age IN (1, 2, 3) EXCEPT ALL SELECT name, tags FROM d.person WHERE age IN (1, 2, 3))) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age IN (1, 2, 3) EXCEPT ALL SELECT name, tags FROM ref_then WHERE age IN (1, 2, 3))) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref_then WHERE age IN (1, 2, 3) EXCEPT ALL SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age IN (1, 2, 3))) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person WHERE age IN (1, 2, 3) EXCEPT ALL SELECT id FROM ref WHERE age IN (1, 2, 3))) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref WHERE age IN (1, 2, 3) EXCEPT ALL SELECT id FROM d.person WHERE age IN (1, 2, 3))) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person AT (VERSION => 4) WHERE age IN (1, 2, 3) EXCEPT ALL SELECT id FROM ref_then WHERE age IN (1, 2, 3))) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref_then WHERE age IN (1, 2, 3) EXCEPT ALL SELECT id FROM d.person AT (VERSION => 4) WHERE age IN (1, 2, 3))) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person WHERE age IS NOT NULL EXCEPT ALL SELECT count(*) FROM ref WHERE age IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref WHERE age IS NOT NULL EXCEPT ALL SELECT count(*) FROM d.person WHERE age IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age IS NOT NULL EXCEPT ALL SELECT count(*) FROM ref_then WHERE age IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref_then WHERE age IS NOT NULL EXCEPT ALL SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person WHERE age IS NOT NULL EXCEPT ALL SELECT name FROM ref WHERE age IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref WHERE age IS NOT NULL EXCEPT ALL SELECT name FROM d.person WHERE age IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person AT (VERSION => 4) WHERE age IS NOT NULL EXCEPT ALL SELECT name FROM ref_then WHERE age IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref_then WHERE age IS NOT NULL EXCEPT ALL SELECT name FROM d.person AT (VERSION => 4) WHERE age IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person WHERE age IS NOT NULL EXCEPT ALL SELECT tags FROM ref WHERE age IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref WHERE age IS NOT NULL EXCEPT ALL SELECT tags FROM d.person WHERE age IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person AT (VERSION => 4) WHERE age IS NOT NULL EXCEPT ALL SELECT tags FROM ref_then WHERE age IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref_then WHERE age IS NOT NULL EXCEPT ALL SELECT tags FROM d.person AT (VERSION => 4) WHERE age IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person WHERE age IS NOT NULL EXCEPT ALL SELECT name, tags FROM ref WHERE age IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref WHERE age IS NOT NULL EXCEPT ALL SELECT name, tags FROM d.person WHERE age IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age IS NOT NULL EXCEPT ALL SELECT name, tags FROM ref_then WHERE age IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref_then WHERE age IS NOT NULL EXCEPT ALL SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person WHERE age IS NOT NULL EXCEPT ALL SELECT id FROM ref WHERE age IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref WHERE age IS NOT NULL EXCEPT ALL SELECT id FROM d.person WHERE age IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person AT (VERSION => 4) WHERE age IS NOT NULL EXCEPT ALL SELECT id FROM ref_then WHERE age IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref_then WHERE age IS NOT NULL EXCEPT ALL SELECT id FROM d.person AT (VERSION => 4) WHERE age IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person WHERE age IS NULL EXCEPT ALL SELECT count(*) FROM ref WHERE age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref WHERE age IS NULL EXCEPT ALL SELECT count(*) FROM d.person WHERE age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age IS NULL EXCEPT ALL SELECT count(*) FROM ref_then WHERE age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref_then WHERE age IS NULL EXCEPT ALL SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person WHERE age IS NULL EXCEPT ALL SELECT name FROM ref WHERE age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref WHERE age IS NULL EXCEPT ALL SELECT name FROM d.person WHERE age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person AT (VERSION => 4) WHERE age IS NULL EXCEPT ALL SELECT name FROM ref_then WHERE age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref_then WHERE age IS NULL EXCEPT ALL SELECT name FROM d.person AT (VERSION => 4) WHERE age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person WHERE age IS NULL EXCEPT ALL SELECT tags FROM ref WHERE age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref WHERE age IS NULL EXCEPT ALL SELECT tags FROM d.person WHERE age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person AT (VERSION => 4) WHERE age IS NULL EXCEPT ALL SELECT tags FROM ref_then WHERE age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref_then WHERE age IS NULL EXCEPT ALL SELECT tags FROM d.person AT (VERSION => 4) WHERE age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person WHERE age IS NULL EXCEPT ALL SELECT name, tags FROM ref WHERE age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref WHERE age IS NULL EXCEPT ALL SELECT name, tags FROM d.person WHERE age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age IS NULL EXCEPT ALL SELECT name, tags FROM ref_then WHERE age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref_then WHERE age IS NULL EXCEPT ALL SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person WHERE age IS NULL EXCEPT ALL SELECT id FROM ref WHERE age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref WHERE age IS NULL EXCEPT ALL SELECT id FROM d.person WHERE age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person AT (VERSION => 4) WHERE age IS NULL EXCEPT ALL SELECT id FROM ref_then WHERE age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref_then WHERE age IS NULL EXCEPT ALL SELECT id FROM d.person AT (VERSION => 4) WHERE age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT count(*) FROM ref WHERE age > 40 OR age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT count(*) FROM d.person WHERE age > 40 OR age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT count(*) FROM ref_then WHERE age > 40 OR age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref_then WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age > 40 OR age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT name FROM ref WHERE age > 40 OR age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT name FROM d.person WHERE age > 40 OR age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person AT (VERSION => 4) WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT name FROM ref_then WHERE age > 40 OR age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref_then WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT name FROM d.person AT (VERSION => 4) WHERE age > 40 OR age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT tags FROM ref WHERE age > 40 OR age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT tags FROM d.person WHERE age > 40 OR age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person AT (VERSION => 4) WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT tags FROM ref_then WHERE age > 40 OR age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref_then WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT tags FROM d.person AT (VERSION => 4) WHERE age > 40 OR age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT name, tags FROM ref WHERE age > 40 OR age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT name, tags FROM d.person WHERE age > 40 OR age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT name, tags FROM ref_then WHERE age > 40 OR age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref_then WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age > 40 OR age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT id FROM ref WHERE age > 40 OR age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT id FROM d.person WHERE age > 40 OR age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person AT (VERSION => 4) WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT id FROM ref_then WHERE age > 40 OR age IS NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref_then WHERE age > 40 OR age IS NULL EXCEPT ALL SELECT id FROM d.person AT (VERSION => 4) WHERE age > 40 OR age IS NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT count(*) FROM ref WHERE age > 40 OR name = 'n1')) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT count(*) FROM d.person WHERE age > 40 OR name = 'n1')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT count(*) FROM ref_then WHERE age > 40 OR name = 'n1')) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref_then WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age > 40 OR name = 'n1')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT name FROM ref WHERE age > 40 OR name = 'n1')) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT name FROM d.person WHERE age > 40 OR name = 'n1')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person AT (VERSION => 4) WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT name FROM ref_then WHERE age > 40 OR name = 'n1')) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref_then WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT name FROM d.person AT (VERSION => 4) WHERE age > 40 OR name = 'n1')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT tags FROM ref WHERE age > 40 OR name = 'n1')) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT tags FROM d.person WHERE age > 40 OR name = 'n1')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person AT (VERSION => 4) WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT tags FROM ref_then WHERE age > 40 OR name = 'n1')) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref_then WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT tags FROM d.person AT (VERSION => 4) WHERE age > 40 OR name = 'n1')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT name, tags FROM ref WHERE age > 40 OR name = 'n1')) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT name, tags FROM d.person WHERE age > 40 OR name = 'n1')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT name, tags FROM ref_then WHERE age > 40 OR name = 'n1')) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref_then WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age > 40 OR name = 'n1')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT id FROM ref WHERE age > 40 OR name = 'n1')) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT id FROM d.person WHERE age > 40 OR name = 'n1')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person AT (VERSION => 4) WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT id FROM ref_then WHERE age > 40 OR name = 'n1')) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref_then WHERE age > 40 OR name = 'n1' EXCEPT ALL SELECT id FROM d.person AT (VERSION => 4) WHERE age > 40 OR name = 'n1')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT count(*) FROM ref WHERE coalesce(age, 0) = 0)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT count(*) FROM d.person WHERE coalesce(age, 0) = 0)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person AT (VERSION => 4) WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT count(*) FROM ref_then WHERE coalesce(age, 0) = 0)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref_then WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT count(*) FROM d.person AT (VERSION => 4) WHERE coalesce(age, 0) = 0)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT name FROM ref WHERE coalesce(age, 0) = 0)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT name FROM d.person WHERE coalesce(age, 0) = 0)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person AT (VERSION => 4) WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT name FROM ref_then WHERE coalesce(age, 0) = 0)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref_then WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT name FROM d.person AT (VERSION => 4) WHERE coalesce(age, 0) = 0)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT tags FROM ref WHERE coalesce(age, 0) = 0)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT tags FROM d.person WHERE coalesce(age, 0) = 0)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person AT (VERSION => 4) WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT tags FROM ref_then WHERE coalesce(age, 0) = 0)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref_then WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT tags FROM d.person AT (VERSION => 4) WHERE coalesce(age, 0) = 0)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT name, tags FROM ref WHERE coalesce(age, 0) = 0)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT name, tags FROM d.person WHERE coalesce(age, 0) = 0)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person AT (VERSION => 4) WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT name, tags FROM ref_then WHERE coalesce(age, 0) = 0)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref_then WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT name, tags FROM d.person AT (VERSION => 4) WHERE coalesce(age, 0) = 0)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT id FROM ref WHERE coalesce(age, 0) = 0)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT id FROM d.person WHERE coalesce(age, 0) = 0)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person AT (VERSION => 4) WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT id FROM ref_then WHERE coalesce(age, 0) = 0)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref_then WHERE coalesce(age, 0) = 0 EXCEPT ALL SELECT id FROM d.person AT (VERSION => 4) WHERE coalesce(age, 0) = 0)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT count(*) FROM ref WHERE age > 10 AND name LIKE 'n1%')) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT count(*) FROM d.person WHERE age > 10 AND name LIKE 'n1%')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT count(*) FROM ref_then WHERE age > 10 AND name LIKE 'n1%')) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref_then WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age > 10 AND name LIKE 'n1%')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT name FROM ref WHERE age > 10 AND name LIKE 'n1%')) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT name FROM d.person WHERE age > 10 AND name LIKE 'n1%')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person AT (VERSION => 4) WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT name FROM ref_then WHERE age > 10 AND name LIKE 'n1%')) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref_then WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT name FROM d.person AT (VERSION => 4) WHERE age > 10 AND name LIKE 'n1%')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT tags FROM ref WHERE age > 10 AND name LIKE 'n1%')) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT tags FROM d.person WHERE age > 10 AND name LIKE 'n1%')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person AT (VERSION => 4) WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT tags FROM ref_then WHERE age > 10 AND name LIKE 'n1%')) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref_then WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT tags FROM d.person AT (VERSION => 4) WHERE age > 10 AND name LIKE 'n1%')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT name, tags FROM ref WHERE age > 10 AND name LIKE 'n1%')) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT name, tags FROM d.person WHERE age > 10 AND name LIKE 'n1%')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT name, tags FROM ref_then WHERE age > 10 AND name LIKE 'n1%')) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref_then WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age > 10 AND name LIKE 'n1%')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT id FROM ref WHERE age > 10 AND name LIKE 'n1%')) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT id FROM d.person WHERE age > 10 AND name LIKE 'n1%')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person AT (VERSION => 4) WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT id FROM ref_then WHERE age > 10 AND name LIKE 'n1%')) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref_then WHERE age > 10 AND name LIKE 'n1%' EXCEPT ALL SELECT id FROM d.person AT (VERSION => 4) WHERE age > 10 AND name LIKE 'n1%')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person WHERE len(tags) = 2 EXCEPT ALL SELECT count(*) FROM ref WHERE len(tags) = 2)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref WHERE len(tags) = 2 EXCEPT ALL SELECT count(*) FROM d.person WHERE len(tags) = 2)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person AT (VERSION => 4) WHERE len(tags) = 2 EXCEPT ALL SELECT count(*) FROM ref_then WHERE len(tags) = 2)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref_then WHERE len(tags) = 2 EXCEPT ALL SELECT count(*) FROM d.person AT (VERSION => 4) WHERE len(tags) = 2)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person WHERE len(tags) = 2 EXCEPT ALL SELECT name FROM ref WHERE len(tags) = 2)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref WHERE len(tags) = 2 EXCEPT ALL SELECT name FROM d.person WHERE len(tags) = 2)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person AT (VERSION => 4) WHERE len(tags) = 2 EXCEPT ALL SELECT name FROM ref_then WHERE len(tags) = 2)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref_then WHERE len(tags) = 2 EXCEPT ALL SELECT name FROM d.person AT (VERSION => 4) WHERE len(tags) = 2)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person WHERE len(tags) = 2 EXCEPT ALL SELECT tags FROM ref WHERE len(tags) = 2)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref WHERE len(tags) = 2 EXCEPT ALL SELECT tags FROM d.person WHERE len(tags) = 2)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person AT (VERSION => 4) WHERE len(tags) = 2 EXCEPT ALL SELECT tags FROM ref_then WHERE len(tags) = 2)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref_then WHERE len(tags) = 2 EXCEPT ALL SELECT tags FROM d.person AT (VERSION => 4) WHERE len(tags) = 2)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person WHERE len(tags) = 2 EXCEPT ALL SELECT name, tags FROM ref WHERE len(tags) = 2)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref WHERE len(tags) = 2 EXCEPT ALL SELECT name, tags FROM d.person WHERE len(tags) = 2)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person AT (VERSION => 4) WHERE len(tags) = 2 EXCEPT ALL SELECT name, tags FROM ref_then WHERE len(tags) = 2)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref_then WHERE len(tags) = 2 EXCEPT ALL SELECT name, tags FROM d.person AT (VERSION => 4) WHERE len(tags) = 2)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person WHERE len(tags) = 2 EXCEPT ALL SELECT id FROM ref WHERE len(tags) = 2)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref WHERE len(tags) = 2 EXCEPT ALL SELECT id FROM d.person WHERE len(tags) = 2)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person AT (VERSION => 4) WHERE len(tags) = 2 EXCEPT ALL SELECT id FROM ref_then WHERE len(tags) = 2)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref_then WHERE len(tags) = 2 EXCEPT ALL SELECT id FROM d.person AT (VERSION => 4) WHERE len(tags) = 2)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person WHERE tags IS NOT NULL EXCEPT ALL SELECT count(*) FROM ref WHERE tags IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref WHERE tags IS NOT NULL EXCEPT ALL SELECT count(*) FROM d.person WHERE tags IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person AT (VERSION => 4) WHERE tags IS NOT NULL EXCEPT ALL SELECT count(*) FROM ref_then WHERE tags IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref_then WHERE tags IS NOT NULL EXCEPT ALL SELECT count(*) FROM d.person AT (VERSION => 4) WHERE tags IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person WHERE tags IS NOT NULL EXCEPT ALL SELECT name FROM ref WHERE tags IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref WHERE tags IS NOT NULL EXCEPT ALL SELECT name FROM d.person WHERE tags IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person AT (VERSION => 4) WHERE tags IS NOT NULL EXCEPT ALL SELECT name FROM ref_then WHERE tags IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref_then WHERE tags IS NOT NULL EXCEPT ALL SELECT name FROM d.person AT (VERSION => 4) WHERE tags IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person WHERE tags IS NOT NULL EXCEPT ALL SELECT tags FROM ref WHERE tags IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref WHERE tags IS NOT NULL EXCEPT ALL SELECT tags FROM d.person WHERE tags IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person AT (VERSION => 4) WHERE tags IS NOT NULL EXCEPT ALL SELECT tags FROM ref_then WHERE tags IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref_then WHERE tags IS NOT NULL EXCEPT ALL SELECT tags FROM d.person AT (VERSION => 4) WHERE tags IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person WHERE tags IS NOT NULL EXCEPT ALL SELECT name, tags FROM ref WHERE tags IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref WHERE tags IS NOT NULL EXCEPT ALL SELECT name, tags FROM d.person WHERE tags IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person AT (VERSION => 4) WHERE tags IS NOT NULL EXCEPT ALL SELECT name, tags FROM ref_then WHERE tags IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref_then WHERE tags IS NOT NULL EXCEPT ALL SELECT name, tags FROM d.person AT (VERSION => 4) WHERE tags IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person WHERE tags IS NOT NULL EXCEPT ALL SELECT id FROM ref WHERE tags IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref WHERE tags IS NOT NULL EXCEPT ALL SELECT id FROM d.person WHERE tags IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person AT (VERSION => 4) WHERE tags IS NOT NULL EXCEPT ALL SELECT id FROM ref_then WHERE tags IS NOT NULL)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref_then WHERE tags IS NOT NULL EXCEPT ALL SELECT id FROM d.person AT (VERSION => 4) WHERE tags IS NOT NULL)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person WHERE age % 7 = 3 EXCEPT ALL SELECT count(*) FROM ref WHERE age % 7 = 3)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref WHERE age % 7 = 3 EXCEPT ALL SELECT count(*) FROM d.person WHERE age % 7 = 3)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age % 7 = 3 EXCEPT ALL SELECT count(*) FROM ref_then WHERE age % 7 = 3)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref_then WHERE age % 7 = 3 EXCEPT ALL SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age % 7 = 3)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person WHERE age % 7 = 3 EXCEPT ALL SELECT name FROM ref WHERE age % 7 = 3)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref WHERE age % 7 = 3 EXCEPT ALL SELECT name FROM d.person WHERE age % 7 = 3)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person AT (VERSION => 4) WHERE age % 7 = 3 EXCEPT ALL SELECT name FROM ref_then WHERE age % 7 = 3)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref_then WHERE age % 7 = 3 EXCEPT ALL SELECT name FROM d.person AT (VERSION => 4) WHERE age % 7 = 3)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person WHERE age % 7 = 3 EXCEPT ALL SELECT tags FROM ref WHERE age % 7 = 3)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref WHERE age % 7 = 3 EXCEPT ALL SELECT tags FROM d.person WHERE age % 7 = 3)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person AT (VERSION => 4) WHERE age % 7 = 3 EXCEPT ALL SELECT tags FROM ref_then WHERE age % 7 = 3)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref_then WHERE age % 7 = 3 EXCEPT ALL SELECT tags FROM d.person AT (VERSION => 4) WHERE age % 7 = 3)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person WHERE age % 7 = 3 EXCEPT ALL SELECT name, tags FROM ref WHERE age % 7 = 3)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref WHERE age % 7 = 3 EXCEPT ALL SELECT name, tags FROM d.person WHERE age % 7 = 3)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age % 7 = 3 EXCEPT ALL SELECT name, tags FROM ref_then WHERE age % 7 = 3)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref_then WHERE age % 7 = 3 EXCEPT ALL SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age % 7 = 3)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person WHERE age % 7 = 3 EXCEPT ALL SELECT id FROM ref WHERE age % 7 = 3)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref WHERE age % 7 = 3 EXCEPT ALL SELECT id FROM d.person WHERE age % 7 = 3)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person AT (VERSION => 4) WHERE age % 7 = 3 EXCEPT ALL SELECT id FROM ref_then WHERE age % 7 = 3)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref_then WHERE age % 7 = 3 EXCEPT ALL SELECT id FROM d.person AT (VERSION => 4) WHERE age % 7 = 3)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person WHERE name = 'n12' EXCEPT ALL SELECT count(*) FROM ref WHERE name = 'n12')) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref WHERE name = 'n12' EXCEPT ALL SELECT count(*) FROM d.person WHERE name = 'n12')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person AT (VERSION => 4) WHERE name = 'n12' EXCEPT ALL SELECT count(*) FROM ref_then WHERE name = 'n12')) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref_then WHERE name = 'n12' EXCEPT ALL SELECT count(*) FROM d.person AT (VERSION => 4) WHERE name = 'n12')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person WHERE name = 'n12' EXCEPT ALL SELECT name FROM ref WHERE name = 'n12')) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref WHERE name = 'n12' EXCEPT ALL SELECT name FROM d.person WHERE name = 'n12')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person AT (VERSION => 4) WHERE name = 'n12' EXCEPT ALL SELECT name FROM ref_then WHERE name = 'n12')) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref_then WHERE name = 'n12' EXCEPT ALL SELECT name FROM d.person AT (VERSION => 4) WHERE name = 'n12')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person WHERE name = 'n12' EXCEPT ALL SELECT tags FROM ref WHERE name = 'n12')) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref WHERE name = 'n12' EXCEPT ALL SELECT tags FROM d.person WHERE name = 'n12')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person AT (VERSION => 4) WHERE name = 'n12' EXCEPT ALL SELECT tags FROM ref_then WHERE name = 'n12')) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref_then WHERE name = 'n12' EXCEPT ALL SELECT tags FROM d.person AT (VERSION => 4) WHERE name = 'n12')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person WHERE name = 'n12' EXCEPT ALL SELECT name, tags FROM ref WHERE name = 'n12')) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref WHERE name = 'n12' EXCEPT ALL SELECT name, tags FROM d.person WHERE name = 'n12')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person AT (VERSION => 4) WHERE name = 'n12' EXCEPT ALL SELECT name, tags FROM ref_then WHERE name = 'n12')) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref_then WHERE name = 'n12' EXCEPT ALL SELECT name, tags FROM d.person AT (VERSION => 4) WHERE name = 'n12')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person WHERE name = 'n12' EXCEPT ALL SELECT id FROM ref WHERE name = 'n12')) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref WHERE name = 'n12' EXCEPT ALL SELECT id FROM d.person WHERE name = 'n12')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person AT (VERSION => 4) WHERE name = 'n12' EXCEPT ALL SELECT id FROM ref_then WHERE name = 'n12')) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref_then WHERE name = 'n12' EXCEPT ALL SELECT id FROM d.person AT (VERSION => 4) WHERE name = 'n12')) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person WHERE age <> 4 EXCEPT ALL SELECT count(*) FROM ref WHERE age <> 4)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref WHERE age <> 4 EXCEPT ALL SELECT count(*) FROM d.person WHERE age <> 4)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age <> 4 EXCEPT ALL SELECT count(*) FROM ref_then WHERE age <> 4)) = 0
+        AND (SELECT count(*) FROM (SELECT count(*) FROM ref_then WHERE age <> 4 EXCEPT ALL SELECT count(*) FROM d.person AT (VERSION => 4) WHERE age <> 4)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person WHERE age <> 4 EXCEPT ALL SELECT name FROM ref WHERE age <> 4)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref WHERE age <> 4 EXCEPT ALL SELECT name FROM d.person WHERE age <> 4)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name FROM d.person AT (VERSION => 4) WHERE age <> 4 EXCEPT ALL SELECT name FROM ref_then WHERE age <> 4)) = 0
+        AND (SELECT count(*) FROM (SELECT name FROM ref_then WHERE age <> 4 EXCEPT ALL SELECT name FROM d.person AT (VERSION => 4) WHERE age <> 4)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person WHERE age <> 4 EXCEPT ALL SELECT tags FROM ref WHERE age <> 4)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref WHERE age <> 4 EXCEPT ALL SELECT tags FROM d.person WHERE age <> 4)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT tags FROM d.person AT (VERSION => 4) WHERE age <> 4 EXCEPT ALL SELECT tags FROM ref_then WHERE age <> 4)) = 0
+        AND (SELECT count(*) FROM (SELECT tags FROM ref_then WHERE age <> 4 EXCEPT ALL SELECT tags FROM d.person AT (VERSION => 4) WHERE age <> 4)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person WHERE age <> 4 EXCEPT ALL SELECT name, tags FROM ref WHERE age <> 4)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref WHERE age <> 4 EXCEPT ALL SELECT name, tags FROM d.person WHERE age <> 4)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age <> 4 EXCEPT ALL SELECT name, tags FROM ref_then WHERE age <> 4)) = 0
+        AND (SELECT count(*) FROM (SELECT name, tags FROM ref_then WHERE age <> 4 EXCEPT ALL SELECT name, tags FROM d.person AT (VERSION => 4) WHERE age <> 4)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person WHERE age <> 4 EXCEPT ALL SELECT id FROM ref WHERE age <> 4)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref WHERE age <> 4 EXCEPT ALL SELECT id FROM d.person WHERE age <> 4)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT id FROM d.person AT (VERSION => 4) WHERE age <> 4 EXCEPT ALL SELECT id FROM ref_then WHERE age <> 4)) = 0
+        AND (SELECT count(*) FROM (SELECT id FROM ref_then WHERE age <> 4 EXCEPT ALL SELECT id FROM d.person AT (VERSION => 4) WHERE age <> 4)) = 0
+       THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# Fused join with a driving filter on one side
+statement ok
+CREATE TABLE ref_join AS SELECT r.name, r.age, a.balance FROM ref r JOIN (SELECT id, balance FROM d.account) a ON a.id = r.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT p.name, p.age, a.balance FROM d.person p JOIN d.account a ON a.id = p.id WHERE p.age > 20
+        EXCEPT ALL SELECT * FROM ref_join WHERE age > 20)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+query I
+SELECT count(*) FROM d.person WHERE age IS NULL
+----
+<REGEX>:[1-9][0-9]*

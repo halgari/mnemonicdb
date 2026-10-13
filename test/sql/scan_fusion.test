@@ -442,6 +442,24 @@ SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT 
 ----
 match
 
+# left_filtered_optional_side: filters on the optional side select matches, they must not drop rows
+statement ok
+SET mnemonicdb_fuse_scans = false
+
+statement ok
+CREATE OR REPLACE TABLE unfused AS SELECT p.name, a.balance FROM d.person p LEFT JOIN (SELECT * FROM d.account WHERE balance > 100) a ON a.id = p.id
+
+statement ok
+SET mnemonicdb_fuse_scans = true
+
+statement ok
+CREATE OR REPLACE TABLE fused AS SELECT p.name, a.balance FROM d.person p LEFT JOIN (SELECT * FROM d.account WHERE balance > 100) a ON a.id = p.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM unfused EXCEPT ALL SELECT * FROM fused)) = 0 AND (SELECT count(*) FROM (SELECT * FROM fused EXCEPT ALL SELECT * FROM unfused)) = 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
 # Results are not trivially empty
 query I
 SELECT count(*) FROM d.person p JOIN d.account a ON a.id = p.id LEFT JOIN d.address c ON c.id = p.id

@@ -1,5 +1,49 @@
 # Performance
 
+## Projection pushdown, direct decoding, release build (2026-10-13)
+
+- **NULL-rejecting filters drive membership.** A pushed filter that is false
+  or NULL when its column is NULL (comparisons, BETWEEN, IN, IS NOT NULL, AND
+  with any such child, OR of only such children) means rows without that
+  attribute never pass. That attribute then decides table membership, and the
+  scan reads only the filtered and projected attributes; the others aren't
+  touched. `WHERE age = 42` on a 4-column table: 0.075 → 0.022 s.
+- **Direct decoding.** Merge-mode scans decide membership from cursor
+  positions, then decode each value straight from the RocksDB key into the
+  output vector. List elements go into the list's child vector. No string
+  copies, no `Value` objects.
+- **Fusion bug fixed.** Outer joins whose optional side carries pushed filters
+  are no longer fused. Those filters select matches, not output rows.
+
+`bench/bench.py --rows 1000000` on the **release** build:
+
+| benchmark | before these changes | now | native |
+|---|---:|---:|---:|
+| `count(*)` | 0.087 | 0.075 | 0.001 |
+| one column | 0.093 | 0.080 | 0.001 |
+| all 4 columns | 0.090 | 0.100 | 0.006 |
+| unindexed filter (`age = 42`) | 0.075 | 0.022 | 0.001 |
+| filter + other column (`sum(score) WHERE age > 90`) | — | 0.044 | 0.001 |
+| list column scan (333k rows × 3 elements) | — | 0.134 | 0.002 |
+| indexed range | 0.038 | 0.026 | 0.002 |
+| join on id (fused) | 0.082 | 0.070 | 0.008 |
+| join + indexed filter | 0.025 | 0.020 | 0.003 |
+| UPDATE 10% | 1.547 | 0.946 | 0.005 |
+
+**Release vs reldebug:** identical within noise. DuckDB's `reldebug` already
+compiles with `-O3 -DNDEBUG` and only adds `-g`.
+
+**Thread scaling** (release, 1M rows, compacted):
+
+| threads | `count(*)` | all columns |
+|---:|---:|---:|
+| 1 | 0.414 | 0.504 |
+| 2 | 0.207 | 0.256 |
+| 4 | 0.105 | 0.131 |
+| 8 | 0.070 | 0.083 |
+
+Linear to 4 threads, about 6× at 8 (shared vCPUs).
+
 ## After the performance pass (2026-10-13)
 
 Same machine and workload as the baseline below. "Native" is a DuckDB table
