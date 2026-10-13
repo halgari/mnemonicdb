@@ -1,0 +1,172 @@
+# name: test/sql/history.test
+# description: mnemonicdb_history returns every assertion and retraction, with values as VARIANT
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/history.mnemonic' AS d (TYPE mnemonicdb)
+
+# tx 2
+statement ok
+CREATE TABLE d.person (name VARCHAR, age INTEGER, tags VARCHAR[], info STRUCT(a INTEGER, b VARCHAR), friend REF, born DATE)
+
+# tx 3
+statement ok
+INSERT INTO d.person (id, name, age, tags, info, born) VALUES
+    (tempid('a'), 'Alice', 30, ['x', 'y'], {'a': 1, 'b': 'q'}, DATE '1990-01-02'),
+    (tempid('b'), 'Bob', 40, NULL, NULL, NULL)
+
+statement ok
+SET VARIABLE alice = (SELECT id FROM d.person WHERE name = 'Alice')
+
+statement ok
+SET VARIABLE bob = (SELECT id FROM d.person WHERE name = 'Bob')
+
+# tx 4
+statement ok
+UPDATE d.person SET age = 31, tags = ['y', 'z'], friend = getvariable('bob') WHERE name = 'Alice'
+
+# tx 5
+statement ok
+DELETE FROM d.person WHERE name = 'Bob'
+
+# tx 6
+statement ok
+ALTER TABLE d.person DROP COLUMN info
+
+# One column: assertions and retractions in transaction order
+query IIT
+SELECT tx, value::INTEGER, added FROM mnemonicdb_history('d', table_name := 'person', column_name := 'age')
+----
+3	30	true
+3	40	true
+4	30	false
+4	31	true
+5	40	false
+
+# One entity: everything that ever happened to it, including the dropped column (still attributed to its table)
+query IITTT
+SELECT tx, table_name, column_name, value::VARCHAR, added FROM mnemonicdb_history('d', entity := getvariable('alice'))
+----
+3	person	name	Alice	true
+3	person	age	30	true
+3	person	tags	x	true
+3	person	tags	y	true
+3	person	info	{'a': 1, 'b': q}	true
+3	person	born	1990-01-02	true
+4	person	age	30	false
+4	person	age	31	true
+4	person	tags	x	false
+4	person	tags	z	true
+4	person	friend	216172782113783810	true
+6	person	info	{'a': 1, 'b': q}	false
+
+# Values keep their types inside the VARIANT
+query TTT
+SELECT column_name, variant_typeof(value), value::VARCHAR
+FROM mnemonicdb_history('d', entity := getvariable('alice')) WHERE tx = 3 ORDER BY column_name, value::VARCHAR
+----
+age	INT32	30
+born	DATE	1990-01-02
+info	OBJECT(a, b)	{'a': 1, 'b': q}
+name	VARCHAR	Alice
+tags	VARCHAR	x
+tags	VARCHAR	y
+
+query IT
+SELECT (value::STRUCT(a INTEGER, b VARCHAR)).a, (value::STRUCT(a INTEGER, b VARCHAR)).b
+FROM mnemonicdb_history('d', entity := getvariable('alice')) WHERE column_name = 'info' AND added
+----
+1	q
+
+query T
+SELECT value::UBIGINT = getvariable('bob') FROM mnemonicdb_history('d', entity := getvariable('alice')) WHERE column_name = 'friend'
+----
+true
+
+# A whole table, in transaction order, includes dropped columns
+query II
+SELECT tx, count(*) FROM mnemonicdb_history('d', table_name := 'person') GROUP BY tx ORDER BY tx
+----
+3	8
+4	5
+5	2
+6	1
+
+# Transaction ranges
+query I
+SELECT count(*) FROM mnemonicdb_history('d', table_name := 'person', since := 4, until := 4)
+----
+5
+
+query I
+SELECT DISTINCT tx FROM mnemonicdb_history('d', since := 5) ORDER BY tx
+----
+5
+6
+
+# The whole database: schema and transaction datoms too
+query TTT
+SELECT DISTINCT schema_name, table_name, column_name FROM mnemonicdb_history('d') WHERE schema_name = 'sys' AND table_name = 'tx'
+----
+sys	tx	instant
+
+query I
+SELECT count(DISTINCT tx) FROM mnemonicdb_history('d')
+----
+6
+
+# The history agrees with AT queries: replaying assertions/retractions up to tx 4 gives the state at tx 4
+query II
+SELECT column_name, string_agg(value::VARCHAR, ',' ORDER BY value::VARCHAR) FROM (
+    SELECT column_name, value, sum(CASE WHEN added THEN 1 ELSE -1 END) n
+    FROM mnemonicdb_history('d', entity := getvariable('alice'), until := 4)
+    GROUP BY column_name, value
+) WHERE n > 0 AND column_name IN ('age', 'tags') GROUP BY column_name ORDER BY column_name
+----
+age	31
+tags	y,z
+
+query II
+SELECT age, tags FROM d.person AT (VERSION => 4) WHERE name = 'Alice'
+----
+31	[y, z]
+
+# Pending writes of the current transaction are visible to it
+statement ok
+BEGIN
+
+statement ok
+UPDATE d.person SET age = 32 WHERE name = 'Alice'
+
+query IT
+SELECT tx, value::VARCHAR FROM mnemonicdb_history('d', table_name := 'person', column_name := 'age', since := 7)
+----
+7	31
+7	32
+
+statement ok
+ROLLBACK
+
+statement error
+SELECT * FROM mnemonicdb_history('d', table_name := 'nope')
+----
+does not exist
+
+statement error
+SELECT * FROM mnemonicdb_history('d', column_name := 'age')
+----
+needs table_name
+
+# History survives reattach
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/history.mnemonic' AS d (TYPE mnemonicdb)
+
+query I
+SELECT count(*) FROM mnemonicdb_history('d', table_name := 'person')
+----
+16

@@ -85,6 +85,8 @@ public:
 	const TableDef *FindTable(const string &schema, const string &name) const;
 	const TableDef *FindTable(EntityId id) const;
 	const AttributeDef &GetAttribute(AttrId local) const;
+	//! The attribute with this local number, if it is part of the schema (dropped columns are not)
+	const AttributeDef *FindAttributeById(AttrId local) const;
 	const AttributeDef *FindAttribute(const TableDef &table, const string &name) const;
 	vector<const TableDef *> TablesInSchema(const string &schema) const;
 

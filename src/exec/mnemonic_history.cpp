@@ -1,0 +1,301 @@
+#include "mnemonicdb/mnemonic_history.hpp"
+#include "mnemonicdb/mnemonic_catalog.hpp"
+#include "mnemonicdb/mnemonic_transaction.hpp"
+
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/function/table_function.hpp"
+
+#include "rocksdb/db.h"
+
+namespace duckdb {
+
+using mnemonicdb::AttrId;
+using mnemonicdb::ColumnFamily;
+using mnemonicdb::Datom;
+using mnemonicdb::EntityId;
+using mnemonicdb::TxId;
+
+struct HistoryBindData : public TableFunctionData {
+	explicit HistoryBindData(MnemonicCatalog &catalog) : catalog(catalog) {
+	}
+	MnemonicCatalog &catalog;
+	//! Restrict to these attributes (a table's or one column), unless empty
+	vector<AttrId> attributes;
+	optional_idx entity;
+	TxId since = 0;
+	TxId until = mnemonicdb::LOCAL_MASK;
+};
+
+//! One assertion or retraction
+struct HistoryEvent {
+	TxId tx;
+	Datom datom;
+	bool added;
+
+	bool operator<(const HistoryEvent &other) const {
+		return std::tie(tx, datom.e, datom.a, datom.v, added) <
+		       std::tie(other.tx, other.datom.e, other.datom.a, other.datom.v, other.added);
+	}
+};
+
+//! How to describe and decode one attribute, including attributes whose column was dropped
+struct AttributeInfo {
+	string schema;
+	string table;
+	string column;
+	unique_ptr<mnemonicdb::ValueCodec> codec;
+};
+
+struct HistoryState : public GlobalTableFunctionState {
+	//! Entity or attribute history: all events, sorted
+	vector<HistoryEvent> events;
+	idx_t next_event = 0;
+	//! Whole database or table history: the txlog, in transaction order
+	std::unique_ptr<rocksdb::Iterator> log;
+	unordered_set<AttrId> attribute_filter;
+	unordered_map<AttrId, unique_ptr<AttributeInfo>> attributes;
+
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> HistoryBind(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
+	if (input.inputs[0].IsNull()) {
+		throw BinderException("mnemonicdb_history: the database name cannot be NULL");
+	}
+	auto name = input.inputs[0].GetValue<string>();
+	auto &catalog = Catalog::GetCatalog(context, Identifier(name));
+	if (catalog.GetCatalogType() != MnemonicCatalog::CATALOG_TYPE) {
+		throw BinderException("mnemonicdb_history: \"%s\" is not a MnemonicDB database", name);
+	}
+	auto &mnemonic_catalog = catalog.Cast<MnemonicCatalog>();
+	auto result = make_uniq<HistoryBindData>(mnemonic_catalog);
+	auto &schema = MnemonicTransaction::Get(context, mnemonic_catalog).GetSchema();
+
+	string table_name;
+	string column_name;
+	for (auto &entry : input.named_parameters) {
+		auto &key = entry.first;
+		auto &value = entry.second;
+		if (value.IsNull()) {
+			continue;
+		}
+		if (key == "table_name") {
+			table_name = value.GetValue<string>();
+		} else if (key == "column_name") {
+			column_name = value.GetValue<string>();
+		} else if (key == "entity") {
+			result->entity = value.GetValue<uint64_t>();
+		} else if (key == "since") {
+			result->since = value.GetValue<uint64_t>();
+		} else if (key == "until") {
+			result->until = value.GetValue<uint64_t>();
+		}
+	}
+	if (!column_name.empty() && table_name.empty()) {
+		throw BinderException("mnemonicdb_history: column_name := needs table_name :=");
+	}
+	if (!table_name.empty()) {
+		// "table" or "schema.table"
+		string schema_name = "main";
+		auto dot = table_name.find('.');
+		if (dot != string::npos) {
+			schema_name = table_name.substr(0, dot);
+			table_name = table_name.substr(dot + 1);
+		}
+		auto table = schema.FindTable(schema_name, table_name);
+		if (!table) {
+			throw BinderException("mnemonicdb_history: table \"%s.%s\" does not exist", schema_name, table_name);
+		}
+		if (column_name.empty()) {
+			result->attributes = table->attributes;
+			// Columns dropped from the table keep their history: their table link is in the history index
+			auto &view = MnemonicTransaction::Get(context, mnemonic_catalog).GetReadView();
+			string table_ref;
+			mnemonicdb::PutEntityId(table_ref, table->id);
+			for (auto &datom : view.ScanPrefix(ColumnFamily::AEVT_HIST,
+			                                   mnemonicdb::AevtPrefix(mnemonicdb::sys::ATTRIBUTES_TABLE))) {
+				auto local = static_cast<AttrId>(mnemonicdb::LocalOf(datom.e));
+				if (datom.v == table_ref && !schema.FindAttributeById(local)) {
+					result->attributes.push_back(local);
+				}
+			}
+		} else {
+			auto attr = schema.FindAttribute(*table, column_name);
+			if (!attr) {
+				throw BinderException("mnemonicdb_history: table \"%s\" has no column \"%s\"", table_name,
+				                      column_name);
+			}
+			result->attributes.push_back(attr->Local());
+		}
+	}
+
+	names = {Identifier("tx"),          Identifier("entity"),    Identifier("schema_name"), Identifier("table_name"),
+	         Identifier("column_name"), Identifier("attribute"), Identifier("value"),       Identifier("added")};
+	return_types = {LogicalType::UBIGINT, mnemonicdb::RefType(), LogicalType::VARCHAR,     LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, mnemonicdb::RefType(), LogicalType::VARIANT(), LogicalType::BOOLEAN};
+	return std::move(result);
+}
+
+//! Collect the events of the datoms under `prefix` in a current index and its history index
+static void CollectEvents(mnemonicdb::ReadView &view, ColumnFamily cf, ColumnFamily history_cf, const string &prefix,
+                          vector<HistoryEvent> &events) {
+	auto kind = mnemonicdb::IndexKindOf(cf);
+	for (auto history : {false, true}) {
+		auto it = view.NewIterator(history ? history_cf : cf);
+		for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
+			auto datom = mnemonicdb::DecodeKey(kind, std::string_view(it->key().data(), it->key().size()));
+			events.push_back(HistoryEvent {datom.t, datom, true});
+			if (history) {
+				auto retracted_by =
+				    mnemonicdb::DecodeHistoryValue(std::string_view(it->value().data(), it->value().size()));
+				events.push_back(HistoryEvent {retracted_by, datom, false});
+			}
+		}
+		if (!it->status().ok()) {
+			throw IOException("MnemonicDB: RocksDB error: %s", it->status().ToString());
+		}
+	}
+}
+
+static unique_ptr<GlobalTableFunctionState> HistoryInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto &data = input.bind_data->Cast<HistoryBindData>();
+	auto &transaction = MnemonicTransaction::Get(context, data.catalog);
+	transaction.MarkDataRead();
+	auto &view = transaction.GetReadView();
+	auto state = make_uniq<HistoryState>();
+	state->attribute_filter.insert(data.attributes.begin(), data.attributes.end());
+
+	if (data.entity.IsValid()) {
+		auto entity = data.entity.GetIndex();
+		if (data.attributes.empty()) {
+			CollectEvents(view, ColumnFamily::EAVT, ColumnFamily::EAVT_HIST, mnemonicdb::EavtPrefix(entity),
+			              state->events);
+		} else {
+			for (auto attr : data.attributes) {
+				CollectEvents(view, ColumnFamily::EAVT, ColumnFamily::EAVT_HIST, mnemonicdb::EavtPrefix(entity, attr),
+				              state->events);
+			}
+		}
+	} else if (data.attributes.size() == 1) {
+		CollectEvents(view, ColumnFamily::AEVT, ColumnFamily::AEVT_HIST, mnemonicdb::AevtPrefix(data.attributes[0]),
+		              state->events);
+	} else {
+		state->log = view.NewIterator(ColumnFamily::TXLOG);
+		state->log->Seek(mnemonicdb::TxlogPrefix(data.since));
+		return std::move(state);
+	}
+	std::sort(state->events.begin(), state->events.end());
+	return std::move(state);
+}
+
+//! Name, table and decoder of an attribute; dropped columns are described from their own definition datoms
+static AttributeInfo &GetAttributeInfo(ClientContext &context, HistoryState &state, MnemonicTransaction &transaction,
+                                       AttrId local) {
+	auto entry = state.attributes.find(local);
+	if (entry != state.attributes.end()) {
+		return *entry->second;
+	}
+	auto info = make_uniq<AttributeInfo>();
+	auto &schema = transaction.GetSchema();
+	auto attr = schema.FindAttributeById(local);
+	if (attr) {
+		auto table = schema.FindTable(attr->table);
+		info->schema = table ? table->schema : string();
+		info->table = table ? table->name : string();
+		info->column = attr->name;
+		info->codec = make_uniq<mnemonicdb::ValueCodec>(attr->codec);
+	} else {
+		// A dropped column: its definition datoms are still there, only its table link was retracted
+		auto &view = transaction.GetReadView();
+		auto read = [&](AttrId sys_attr) -> string {
+			auto datoms = view.ScanPrefix(ColumnFamily::EAVT, mnemonicdb::EavtPrefix(mnemonicdb::AttrEntity(local), sys_attr));
+			return datoms.empty() ? string() : schema.GetAttribute(sys_attr).codec.DecodeValue(datoms[0].v).ToString();
+		};
+		info->column = read(mnemonicdb::sys::ATTRIBUTES_NAME);
+		auto table_links = view.ScanPrefix(ColumnFamily::EAVT_HIST,
+		                                   mnemonicdb::EavtPrefix(mnemonicdb::AttrEntity(local), mnemonicdb::sys::ATTRIBUTES_TABLE));
+		if (!table_links.empty()) {
+			auto table = schema.FindTable(mnemonicdb::GetEntityId(table_links.back().v.data()));
+			if (table) {
+				info->schema = table->schema;
+				info->table = table->name;
+			}
+		}
+		auto type_name = read(mnemonicdb::sys::ATTRIBUTES_TYPE);
+		if (type_name.empty()) {
+			throw InternalException("MnemonicDB: attribute %d has no definition", local);
+		}
+		mnemonicdb::AttributeDef dropped(mnemonicdb::AttrEntity(local), 0, info->column,
+		                                 TransformStringToLogicalType(type_name, context), mnemonicdb::Uniqueness::NONE,
+		                                 false);
+		info->codec = make_uniq<mnemonicdb::ValueCodec>(dropped.codec);
+	}
+	auto &result = *info;
+	state.attributes[local] = std::move(info);
+	return result;
+}
+
+static void HistoryFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &data = input.bind_data->Cast<HistoryBindData>();
+	auto &state = input.global_state->Cast<HistoryState>();
+	auto &transaction = MnemonicTransaction::Get(context, data.catalog);
+
+	idx_t count = 0;
+	auto emit = [&](TxId tx, const Datom &datom, bool added) {
+		auto &info = GetAttributeInfo(context, state, transaction, datom.a);
+		output.data[0].SetValue(count, Value::UBIGINT(tx));
+		output.data[1].SetValue(count, Value::UBIGINT(datom.e));
+		output.data[2].SetValue(count, info.schema.empty() ? Value() : Value(info.schema));
+		output.data[3].SetValue(count, info.table.empty() ? Value() : Value(info.table));
+		output.data[4].SetValue(count, Value(info.column));
+		output.data[5].SetValue(count, Value::UBIGINT(mnemonicdb::AttrEntity(datom.a)));
+		output.data[6].SetValue(count, info.codec->DecodeValue(datom.v).DefaultCastAs(LogicalType::VARIANT()));
+		output.data[7].SetValue(count, Value::BOOLEAN(added));
+		count++;
+	};
+
+	if (state.log) {
+		auto &it = *state.log;
+		for (; count < STANDARD_VECTOR_SIZE && it.Valid(); it.Next()) {
+			auto datom = mnemonicdb::DecodeKey(mnemonicdb::IndexKind::TXLOG,
+			                                   std::string_view(it.key().data(), it.key().size()));
+			if (datom.t > data.until) {
+				break;
+			}
+			if (!state.attribute_filter.empty() && state.attribute_filter.count(datom.a) == 0) {
+				continue;
+			}
+			auto op = mnemonicdb::DecodeTxOp(std::string_view(it.value().data(), it.value().size()));
+			emit(datom.t, datom, op == mnemonicdb::TxOp::ASSERT);
+		}
+		if (!it.status().ok()) {
+			throw IOException("MnemonicDB: RocksDB error: %s", it.status().ToString());
+		}
+	} else {
+		while (count < STANDARD_VECTOR_SIZE && state.next_event < state.events.size()) {
+			auto &event = state.events[state.next_event++];
+			if (event.tx < data.since || event.tx > data.until) {
+				continue;
+			}
+			emit(event.tx, event.datom, event.added);
+		}
+	}
+	output.SetCardinality(count);
+}
+
+void RegisterHistoryFunction(ExtensionLoader &loader) {
+	TableFunction function("mnemonicdb_history", {LogicalType::VARCHAR}, HistoryFunction, HistoryBind, HistoryInit);
+	function.named_parameters["table_name"] = LogicalType::VARCHAR;
+	function.named_parameters["column_name"] = LogicalType::VARCHAR;
+	function.named_parameters["entity"] = LogicalType::UBIGINT;
+	function.named_parameters["since"] = LogicalType::UBIGINT;
+	function.named_parameters["until"] = LogicalType::UBIGINT;
+	loader.RegisterFunction(function);
+}
+
+} // namespace duckdb

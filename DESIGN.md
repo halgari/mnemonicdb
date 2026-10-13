@@ -266,6 +266,35 @@ DuckDB's own optimizers and fuses joins on entity id into a single scan.
 A further step would seek the cursors of required tables forward
 (leapfrog) instead of reading every attribute in full.
 
+### Raw history
+
+`mnemonicdb_history('db', table_name :=, column_name :=, entity :=, since :=, until :=)`
+returns one row per assertion or retraction, in transaction order:
+
+| column | type |
+|---|---|
+| `tx` | `UBIGINT` (transaction number) |
+| `entity` | `REF` |
+| `schema_name`, `table_name`, `column_name` | `VARCHAR` |
+| `attribute` | `REF` (the attribute entity) |
+| `value` | `VARIANT` (any attribute type, nested types included) |
+| `added` | `BOOLEAN` (true = asserted, false = retracted) |
+
+- **Sources:**
+  - whole database or `table_name` alone: the `txlog`, streamed and
+    seeked to `since`;
+  - `column_name`: AEVT plus `aevt_hist`;
+  - `entity`: EAVT plus `eavt_hist`.
+
+  Assertions come from index keys, and retractions from history values.
+- **Dropped columns** keep their history. They're decoded from their own
+  definition datoms, attributed to the table they were on (found through
+  `sys.attributes.table_id` in history), and included in that table's
+  history.
+- **Visibility:** the reading transaction's pending writes are included.
+- Parameters are named `table_name` / `column_name` because `table` and
+  `column` are reserved words.
+
 ## 6. Writing and transactions
 
 ### Lifecycle
@@ -457,7 +486,9 @@ test/unit/                codec round-trip tests
 7. **Constraints and indexes.** `REF` + VAET, `UNIQUE` / `PRIMARY KEY`,
    upsert, `CREATE INDEX`, AVET filter pushdown, single-datom add/retract.
 8. **Schema evolution.** `ALTER COLUMN TYPE` and index rewrites.
-9. **Later.** Scan-fusion optimizer pass, history table function, excision.
+9. **Done:** atomic statements, the scan-fusion optimizer pass, and the
+   history table function. **Later:** excision, leapfrog seeks in fused
+   scans, multi-threaded scans, join statistics.
 
 Milestones 1–6 together show the riskiest parts working end to end.
 

@@ -156,6 +156,11 @@ const AttributeDef &Schema::GetAttribute(AttrId local) const {
 	return entry->second;
 }
 
+const AttributeDef *Schema::FindAttributeById(AttrId local) const {
+	auto entry = attributes.find(local);
+	return entry == attributes.end() ? nullptr : &entry->second;
+}
+
 const AttributeDef *Schema::FindAttribute(const TableDef &table, const string &name) const {
 	for (auto local : table.attributes) {
 		auto &attr = GetAttribute(local);
