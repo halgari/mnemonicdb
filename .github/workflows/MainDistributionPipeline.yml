@@ -20,8 +20,9 @@ jobs:
       duckdb_version: 2bb5316a8b59904a5dc513b88b81b048e25bbcc5
       ci_tools_version: a68570fde10384547868301a12327d5c67909527
       extension_name: mnemonicdb
-      # RocksDB needs threads and a real filesystem; WebAssembly builds would need a port of their own
-      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
+      # RocksDB needs threads and a real filesystem, so WebAssembly would need a port of its own. RocksDB also needs
+      # GCC 11+ for C++20, and the MinGW toolchain (Rtools 42) ships GCC 10.
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw'
 
   code-quality-check:
     name: Code Quality Check
