@@ -1,3 +1,51 @@
+# Performance
+
+## After the performance pass (2026-10-13)
+
+Same machine and workload as the baseline below. "Native" is a DuckDB table
+with an `id BIGINT PRIMARY KEY`.
+
+| benchmark | baseline (s) | now (s) | speedup | native (s) |
+|---|---:|---:|---:|---:|
+| load 1M rows × 4 cols | 21.74 | 15.63 | 1.4× | 1.05 |
+| load 500k rows (INSERT … SELECT) | 2.30 | 1.62 | 1.4× | 0.12 |
+| `count(*)` | 0.362 | 0.087 | 4.2× | 0.001 |
+| sum over all 4 columns | 0.452 | 0.090 | 5.0× | 0.006 |
+| unindexed filter | 0.363 | 0.075 | 4.8× | 0.001 |
+| indexed range (3% of rows) | 0.242 | 0.038 | 6.4× | 0.002 |
+| 2-way join on id (fused) | 0.396 | 0.082 | 4.8× | 0.008 |
+| join with a 1% table (fused) | — | 0.033 | | 0.002 |
+| same, unfused hash join | — | 0.079 | | |
+| join + indexed filter | 0.117 | 0.025 | 4.7× | 0.003 |
+| UPDATE 10% of rows | 1.59 | 0.92 | 1.7× | 0.004 |
+| DELETE 1% | 0.145 | 0.078 | 1.9× | 0.016 |
+| point lookups / small transactions | ≈ native | ≈ native | | |
+| size on disk (MB, before compaction) | 392 | 103 | 3.8× | 94 |
+| size after `mnemonicdb_compact` (1M-row table alone) | 338 | 61 | 5.5× | |
+
+What changed:
+1. **New entities** skip lookups for attributes the transaction hasn't
+   written yet, and undo-retraction only seeks for pairs this transaction
+   retracted.
+2. **PrefixReader** keeps cached iterators per column family and merges
+   pending writes, so point lookups create no iterators.
+3. **Compression:** LZ4, with ZSTD for the bottommost level (vendored,
+   statically linked lz4 and zstd).
+4. **Row estimates** from exact per-attribute datom counts.
+5. **Parallel scans** over entity ranges or candidate slices, plus parallel
+   UPDATE/DELETE sinks so their source scans run in parallel.
+6. **Leapfrog in fused joins:** cursors of required tables jump ahead to the
+   next entity every required table has. The work estimate uses the largest
+   table, so selective fused joins still run in parallel.
+
+Remaining gaps, and what would close them:
+- **Scans:** about 75 ns per key per thread is RocksDB's floor for this
+  layout. Getting near native needs a columnar cache of current state (see
+  the recommendations in the conversation log / DESIGN.md roadmap).
+- **Bulk load and UPDATE:** dominated by indexing pending writes in the
+  WriteBatchWithIndex and by memtable inserts at commit. An SST-ingestion
+  bulk path is the next step.
+
 # Performance baseline (2026-10-13)
 
 8 vCPU VM, `reldebug` build, DuckDB `main` at `2bb5316a8b5`, RocksDB 11.8.1,

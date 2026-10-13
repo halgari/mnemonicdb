@@ -1,0 +1,172 @@
+# name: test/sql/parallel_scan.test_slow
+# description: Parallel scans (entity ranges and candidate slices) return exactly what a single-threaded scan does
+# group: [mnemonicdb]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/parallel.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.person (name VARCHAR, age INTEGER, score DOUBLE, tags VARCHAR[])
+
+statement ok
+CREATE TABLE d.account (balance BIGINT)
+
+# tx 3
+statement ok
+INSERT INTO d.person (name, age, score, tags) SELECT 'p' || i, i % 1000, i / 3.0, CASE WHEN i % 5 = 0 THEN ['x', 'y' || (i % 3)] END FROM range(250000) t(i)
+
+statement ok
+INSERT INTO d.account (id, balance) SELECT id, age * 2 FROM d.person WHERE age % 3 = 0
+
+statement ok
+UPDATE d.person SET score = -score WHERE age % 7 = 0
+
+statement ok
+DELETE FROM d.person WHERE age % 11 = 0
+
+statement ok
+CREATE INDEX person_age ON d.person (age)
+
+statement ok
+SET threads = 1
+
+statement ok
+CREATE OR REPLACE TABLE single AS SELECT count(*), sum(age), round(sum(score), 3), count(DISTINCT name) FROM d.person
+
+statement ok
+SET threads = 8
+
+statement ok
+CREATE OR REPLACE TABLE multi AS SELECT count(*), sum(age), round(sum(score), 3), count(DISTINCT name) FROM d.person
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM single EXCEPT ALL SELECT * FROM multi)) = 0 AND (SELECT count(*) FROM (SELECT * FROM multi EXCEPT ALL SELECT * FROM single)) = 0 AND (SELECT count(*) FROM single) > 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+statement ok
+SET threads = 1
+
+statement ok
+CREATE OR REPLACE TABLE single AS SELECT id, name, age FROM d.person WHERE age % 97 = 3
+
+statement ok
+SET threads = 8
+
+statement ok
+CREATE OR REPLACE TABLE multi AS SELECT id, name, age FROM d.person WHERE age % 97 = 3
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM single EXCEPT ALL SELECT * FROM multi)) = 0 AND (SELECT count(*) FROM (SELECT * FROM multi EXCEPT ALL SELECT * FROM single)) = 0 AND (SELECT count(*) FROM single) > 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+statement ok
+SET threads = 1
+
+statement ok
+CREATE OR REPLACE TABLE single AS SELECT count(*), round(sum(score), 3) FROM d.person WHERE age BETWEEN 10 AND 30
+
+statement ok
+SET threads = 8
+
+statement ok
+CREATE OR REPLACE TABLE multi AS SELECT count(*), round(sum(score), 3) FROM d.person WHERE age BETWEEN 10 AND 30
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM single EXCEPT ALL SELECT * FROM multi)) = 0 AND (SELECT count(*) FROM (SELECT * FROM multi EXCEPT ALL SELECT * FROM single)) = 0 AND (SELECT count(*) FROM single) > 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+statement ok
+SET threads = 1
+
+statement ok
+CREATE OR REPLACE TABLE single AS SELECT count(*), round(sum(score), 3) FROM d.person p AT (VERSION => 3)
+
+statement ok
+SET threads = 8
+
+statement ok
+CREATE OR REPLACE TABLE multi AS SELECT count(*), round(sum(score), 3) FROM d.person p AT (VERSION => 3)
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM single EXCEPT ALL SELECT * FROM multi)) = 0 AND (SELECT count(*) FROM (SELECT * FROM multi EXCEPT ALL SELECT * FROM single)) = 0 AND (SELECT count(*) FROM single) > 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+statement ok
+SET threads = 1
+
+statement ok
+CREATE OR REPLACE TABLE single AS SELECT p.id, a.balance FROM d.person p JOIN d.account a ON a.id = p.id
+
+statement ok
+SET threads = 8
+
+statement ok
+CREATE OR REPLACE TABLE multi AS SELECT p.id, a.balance FROM d.person p JOIN d.account a ON a.id = p.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM single EXCEPT ALL SELECT * FROM multi)) = 0 AND (SELECT count(*) FROM (SELECT * FROM multi EXCEPT ALL SELECT * FROM single)) = 0 AND (SELECT count(*) FROM single) > 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+statement ok
+SET threads = 1
+
+statement ok
+CREATE OR REPLACE TABLE single AS SELECT count(*), sum(a.balance), count(p.tags) FROM d.person p LEFT JOIN d.account a ON a.id = p.id
+
+statement ok
+SET threads = 8
+
+statement ok
+CREATE OR REPLACE TABLE multi AS SELECT count(*), sum(a.balance), count(p.tags) FROM d.person p LEFT JOIN d.account a ON a.id = p.id
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM single EXCEPT ALL SELECT * FROM multi)) = 0 AND (SELECT count(*) FROM (SELECT * FROM multi EXCEPT ALL SELECT * FROM single)) = 0 AND (SELECT count(*) FROM single) > 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+statement ok
+SET threads = 1
+
+statement ok
+CREATE OR REPLACE TABLE single AS SELECT id, tags FROM d.person WHERE tags IS NOT NULL
+
+statement ok
+SET threads = 8
+
+statement ok
+CREATE OR REPLACE TABLE multi AS SELECT id, tags FROM d.person WHERE tags IS NOT NULL
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM single EXCEPT ALL SELECT * FROM multi)) = 0 AND (SELECT count(*) FROM (SELECT * FROM multi EXCEPT ALL SELECT * FROM single)) = 0 AND (SELECT count(*) FROM single) > 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+statement ok
+SET threads = 1
+
+statement ok
+CREATE OR REPLACE TABLE single AS SELECT age, count(*) FROM d.person GROUP BY age
+
+statement ok
+SET threads = 8
+
+statement ok
+CREATE OR REPLACE TABLE multi AS SELECT age, count(*) FROM d.person GROUP BY age
+
+query I
+SELECT CASE WHEN (SELECT count(*) FROM (SELECT * FROM single EXCEPT ALL SELECT * FROM multi)) = 0 AND (SELECT count(*) FROM (SELECT * FROM multi EXCEPT ALL SELECT * FROM single)) = 0 AND (SELECT count(*) FROM single) > 0 THEN 'match' ELSE 'MISMATCH' END
+----
+match
+
+# The plain scan really is split into several tasks
+query I
+SELECT count(*) FROM d.person
+----
+227250

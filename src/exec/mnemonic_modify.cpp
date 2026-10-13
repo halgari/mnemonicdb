@@ -33,19 +33,35 @@ public:
 	struct State : public GlobalSinkState {
 		State(ClientContext &context, const vector<LogicalType> &types) : rows(context, types) {
 		}
+		mutex lock;
 		ColumnDataCollection rows;
 		idx_t count = 0;
 		unordered_set<EntityId> seen;
+	};
+	//! Each thread buffers its rows; row order does not matter for UPDATE and DELETE
+	struct LocalState : public LocalSinkState {
+		LocalState(ClientContext &context, const vector<LogicalType> &types) : rows(context, types) {
+		}
+		ColumnDataCollection rows;
 	};
 
 public:
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
 		return make_uniq<State>(context, children[0].get().GetTypes());
 	}
+	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override {
+		return make_uniq<LocalState>(context.client, children[0].get().GetTypes());
+	}
 	//! Rows are buffered and changed in Finalize, so the statement never reads its own writes
 	SinkResultType Sink(ExecutionContext &, DataChunk &chunk, OperatorSinkInput &input) const override {
-		input.global_state.Cast<State>().rows.Append(chunk);
+		input.local_state.Cast<LocalState>().rows.Append(chunk);
 		return SinkResultType::NEED_MORE_INPUT;
+	}
+	SinkCombineResultType Combine(ExecutionContext &, OperatorSinkCombineInput &input) const override {
+		auto &state = input.global_state.Cast<State>();
+		lock_guard<mutex> guard(state.lock);
+		state.rows.Combine(input.local_state.Cast<LocalState>().rows);
+		return SinkCombineResultType::FINISHED;
 	}
 	SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &context,
 	                          OperatorSinkFinalizeInput &input) const override {
@@ -89,7 +105,7 @@ public:
 		return true;
 	}
 	bool ParallelSink() const override {
-		return false;
+		return true;
 	}
 	bool IsSource() const override {
 		return true;

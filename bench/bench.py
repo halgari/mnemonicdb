@@ -31,6 +31,7 @@ def workload(engine, path):
                                 " CREATE TABLE d.account (balance BIGINT);", False))
         steps.append(("load_person", f"INSERT INTO d.person (name, age, email, score) SELECT 'p' || i, i % 100, 'e' || i, i / 7.0 FROM range({N}) t(i);", True))
         steps.append(("load_account", f"INSERT INTO d.account (id, balance) SELECT id, age * 10 FROM d.person WHERE age < 50;", True))
+        steps.append(("load_vip", "CREATE TABLE d.vip (level INTEGER); INSERT INTO d.vip (id, level) SELECT id, 1 FROM d.person WHERE age = 0;", False))
         idq = "(SELECT id FROM d.person WHERE email = 'e123456')"
     else:
         steps.append(("attach", f"ATTACH '{path}' AS d;", False))
@@ -38,6 +39,7 @@ def workload(engine, path):
                                 " CREATE TABLE d.account (id BIGINT PRIMARY KEY, balance BIGINT);", False))
         steps.append(("load_person", f"INSERT INTO d.person SELECT i + 1, 'p' || i, i % 100, 'e' || i, i / 7.0 FROM range({N}) t(i);", True))
         steps.append(("load_account", f"INSERT INTO d.account SELECT id, age * 10 FROM d.person WHERE age < 50;", True))
+        steps.append(("load_vip", "CREATE TABLE d.vip (id BIGINT PRIMARY KEY, level INTEGER); INSERT INTO d.vip SELECT id, 1 FROM d.person WHERE age = 0;", False))
         idq = "(SELECT id FROM d.person WHERE email = 'e123456')"
     steps += [
         ("checkpoint", "CHECKPOINT d;", True),
@@ -55,10 +57,12 @@ def workload(engine, path):
     steps += [
         ("range_indexed", "SELECT count(*), sum(score) FROM d.person WHERE age BETWEEN 10 AND 12;", True),
         ("join_2way", "SELECT count(*), sum(a.balance), sum(p.score) FROM d.person p JOIN d.account a ON a.id = p.id;", True),
+        ("join_selective", "SELECT count(*), sum(p.score) FROM d.person p JOIN d.vip v ON v.id = p.id;", True),
     ]
     if engine == "mnemonic":
         steps += [
             ("join_2way_unfused", "SET mnemonicdb_fuse_scans = false; SELECT count(*), sum(a.balance), sum(p.score) FROM d.person p JOIN d.account a ON a.id = p.id; SET mnemonicdb_fuse_scans = true;", True),
+            ("join_selective_unfused", "SET mnemonicdb_fuse_scans = false; SELECT count(*), sum(p.score) FROM d.person p JOIN d.vip v ON v.id = p.id; SET mnemonicdb_fuse_scans = true;", True),
             ("join_filtered", "SELECT count(*), sum(a.balance) FROM d.person p JOIN d.account a ON a.id = p.id WHERE p.age = 7;", True),
         ]
     else:

@@ -7,6 +7,7 @@
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -62,13 +63,16 @@ column_t FusedRowIdColumn(idx_t index) {
 //! Iterates the datoms of one attribute in AEVT order. Reading the current state uses the current index only;
 //! reading as of transaction T merges in the history index and keeps datoms with Tassert <= T < Tretract.
 struct AttributeCursor {
-	AttributeCursor(mnemonicdb::ReadView &view, const AttributeDef &attr, optional_idx as_of)
-	    : attr(attr), prefix(mnemonicdb::AevtPrefix(attr.Local())), as_of(as_of),
+	//! A cursor over the entities in [start, end) (end 0: no end)
+	AttributeCursor(mnemonicdb::ReadView &view, const AttributeDef &attr, optional_idx as_of, EntityId start = 0,
+	                EntityId end = 0)
+	    : attr(attr), prefix(mnemonicdb::AevtPrefix(attr.Local())), as_of(as_of), end(end),
 	      current(view.NewIterator(ColumnFamily::AEVT, prefix)) {
-		current->Seek(prefix);
+		auto seek = start == 0 ? prefix : mnemonicdb::AevtPrefix(attr.Local(), start);
+		current->Seek(seek);
 		if (as_of.IsValid()) {
 			history = view.NewIterator(ColumnFamily::AEVT_HIST, prefix);
-			history->Seek(prefix);
+			history->Seek(seek);
 		}
 		Settle();
 	}
@@ -76,6 +80,7 @@ struct AttributeCursor {
 	const AttributeDef &attr;
 	string prefix;
 	optional_idx as_of;
+	EntityId end;
 	std::unique_ptr<rocksdb::Iterator> current;
 	std::unique_ptr<rocksdb::Iterator> history;
 	//! The iterator positioned on the datom this cursor is at, or null when exhausted
@@ -85,6 +90,24 @@ struct AttributeCursor {
 
 	void Next() {
 		at->Next();
+		Settle();
+	}
+	//! Move to the first datom of an entity >= target: a few steps forward first, since the target is often close
+	void SeekTo(EntityId target) {
+		for (idx_t step = 0; step < 4; step++) {
+			if (!valid || entity >= target) {
+				return;
+			}
+			Next();
+		}
+		if (!valid || entity >= target) {
+			return;
+		}
+		auto key = mnemonicdb::AevtPrefix(attr.Local(), target);
+		current->Seek(key);
+		if (history) {
+			history->Seek(key);
+		}
 		Settle();
 	}
 	//! The V segment of the current key: AEVT keys are A2 E6 V T5
@@ -144,8 +167,13 @@ private:
 				at = history.get();
 			}
 			if (Visible(at)) {
-				valid = true;
 				entity = mnemonicdb::GetEntityId(at->key().data() + mnemonicdb::PACKED_ATTR_SIZE);
+				if (end != 0 && entity >= end) {
+					at = nullptr;
+					valid = false;
+					return;
+				}
+				valid = true;
 				return;
 			}
 			at->Next();
@@ -207,7 +235,14 @@ struct ScanFilter {
 	//! Index into the scanned columns
 	idx_t column;
 	const ExpressionFilter &filter;
-	unique_ptr<ExpressionExecutor> executor;
+};
+
+//! A unit of scan work: an entity range (merge mode) or a slice of the candidates (lookup mode)
+struct ScanTask {
+	EntityId start = 0;
+	EntityId end = 0;
+	idx_t candidate_begin = 0;
+	idx_t candidate_end = 0;
 };
 
 //! An encoded value range [lower, upper] on an AVET-indexed attribute; an empty bound is unbounded
@@ -232,19 +267,38 @@ struct MnemonicScanState : public GlobalTableFunctionState {
 	vector<std::pair<idx_t, idx_t>> table_attributes;
 	vector<bool> table_required;
 	vector<vector<idx_t>> id_columns;
-	DataChunk scan_chunk;
 
-	//! Merge mode: one cursor per attribute over AEVT
-	vector<AttributeCursor> cursors;
-	//! Lookup mode: the candidate entities, sorted, and the next one to produce
+	//! Lookup mode: the candidate entities, sorted; otherwise AEVT cursors merge each task's entity range
 	bool lookup_mode = false;
-	unique_ptr<mnemonicdb::PrefixReader> reader;
 	vector<EntityId> candidates;
-	idx_t next_candidate = 0;
+
+	//! Work handed out to threads
+	mutex task_lock;
+	vector<ScanTask> tasks;
+	idx_t next_task = 0;
 
 	idx_t MaxThreads() const override {
-		return 1;
+		return MaxValue<idx_t>(tasks.size(), 1);
 	}
+	bool NextTask(ScanTask &task) {
+		lock_guard<mutex> guard(task_lock);
+		if (next_task >= tasks.size()) {
+			return false;
+		}
+		task = tasks[next_task++];
+		return true;
+	}
+};
+
+//! Per-thread scan state
+struct MnemonicScanLocalState : public LocalTableFunctionState {
+	DataChunk scan_chunk;
+	vector<unique_ptr<ExpressionExecutor>> executors;
+	unique_ptr<mnemonicdb::PrefixReader> reader;
+	vector<AttributeCursor> cursors;
+	bool active = false;
+	ScanTask task;
+	idx_t next_candidate = 0;
 };
 
 static optional_ptr<const Expression> ColumnSide(const Expression &left, const Expression &right,
@@ -501,6 +555,91 @@ static ScanColumn ResolveColumn(const MnemonicScanBindData &bind_data, const Mne
 	throw InternalException("MnemonicDB: unknown scan column %d", column_id);
 }
 
+static idx_t EstimateTableRows(MnemonicTableEntry &table);
+
+//! Below this many estimated rows a scan runs as a single task
+static constexpr idx_t PARALLEL_SCAN_THRESHOLD = 100000;
+//! Rough number of rows per task in a parallel scan
+static constexpr idx_t ROWS_PER_TASK = 50000;
+static constexpr idx_t MAX_SCAN_TASKS = 256;
+
+//! The smallest and largest entity with a datom (visible or historical) of any of the scan's attributes
+static bool EntityBounds(mnemonicdb::ReadView &view, const MnemonicScanState &state, bool with_history,
+                         EntityId &min_entity, EntityId &max_entity) {
+	bool any = false;
+	for (auto &attribute : state.attributes) {
+		auto local = attribute.attr.get().Local();
+		auto prefix = mnemonicdb::AevtPrefix(local);
+		for (auto cf : {ColumnFamily::AEVT, ColumnFamily::AEVT_HIST}) {
+			if (cf == ColumnFamily::AEVT_HIST && !with_history) {
+				continue;
+			}
+			auto it = view.NewIterator(cf, prefix);
+			it->Seek(prefix);
+			if (!it->Valid() || !it->key().starts_with(prefix)) {
+				continue;
+			}
+			auto first = mnemonicdb::GetEntityId(it->key().data() + mnemonicdb::PACKED_ATTR_SIZE);
+			// The next attribute's prefix bounds this one from above
+			it->SeekForPrev(local == UINT16_MAX ? prefix + string(64, '\xff') : mnemonicdb::AevtPrefix(local + 1));
+			if (!it->Valid() || !it->key().starts_with(prefix)) {
+				continue;
+			}
+			auto last = mnemonicdb::GetEntityId(it->key().data() + mnemonicdb::PACKED_ATTR_SIZE);
+			min_entity = any ? MinValue(min_entity, first) : first;
+			max_entity = any ? MaxValue(max_entity, last) : last;
+			any = true;
+		}
+	}
+	return any;
+}
+
+static void PlanTasks(ClientContext &context, const MnemonicScanBindData &bind_data, MnemonicScanState &state,
+                      mnemonicdb::ReadView &view) {
+	auto threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+	if (state.lookup_mode) {
+		std::sort(state.candidates.begin(), state.candidates.end());
+		state.candidates.erase(std::unique(state.candidates.begin(), state.candidates.end()), state.candidates.end());
+		auto count = state.candidates.size();
+		idx_t per_task = count < 4096 || threads <= 1 ? MaxValue<idx_t>(count, 1)
+		                                             : MaxValue<idx_t>(1024, count / (threads * 4));
+		for (idx_t begin = 0; begin < count || begin == 0; begin += per_task) {
+			ScanTask task;
+			task.candidate_begin = begin;
+			task.candidate_end = MinValue(count, begin + per_task);
+			state.tasks.push_back(task);
+			if (count == 0) {
+				break;
+			}
+		}
+		return;
+	}
+	EntityId min_entity = 0;
+	EntityId max_entity = 0;
+	if (!EntityBounds(view, state, bind_data.as_of.IsValid(), min_entity, max_entity)) {
+		state.tasks.push_back(ScanTask {});
+		return;
+	}
+	// Work is proportional to what the scan reads, not what it returns: size tasks by the largest table
+	idx_t rows = 0;
+	for (auto &table : bind_data.tables) {
+		rows = MaxValue(rows, EstimateTableRows(table.table.get()));
+	}
+	idx_t task_count = 1;
+	if (threads > 1 && rows >= PARALLEL_SCAN_THRESHOLD) {
+		task_count = MinValue<idx_t>(MAX_SCAN_TASKS, MaxValue<idx_t>(threads, rows / ROWS_PER_TASK));
+	}
+	// Entity ids are allocated in order, so an even split of the id range is an even split of the rows
+	auto span = max_entity - min_entity + 1;
+	task_count = MinValue<idx_t>(task_count, span);
+	for (idx_t i = 0; i < task_count; i++) {
+		ScanTask task;
+		task.start = min_entity + EntityId(span * i / task_count);
+		task.end = i + 1 == task_count ? max_entity + 1 : min_entity + EntityId(span * (i + 1) / task_count);
+		state.tasks.push_back(task);
+	}
+}
+
 static unique_ptr<GlobalTableFunctionState> MnemonicScanInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<MnemonicScanBindData>();
 	auto &catalog = bind_data.tables[0].table.get().catalog;
@@ -538,7 +677,6 @@ static unique_ptr<GlobalTableFunctionState> MnemonicScanInit(ClientContext &cont
 		state->columns.push_back(column);
 	}
 	state->projection_ids = input.projection_ids;
-	state->scan_chunk.Initialize(context, state->column_types);
 
 	// Every pushed filter is accepted and applied exactly to each row. Filters on an id or on an AVET-indexed
 	// column may also narrow the scan to candidate entities.
@@ -554,8 +692,7 @@ static unique_ptr<GlobalTableFunctionState> MnemonicScanInit(ClientContext &cont
 			}
 			auto &expression_filter = ExpressionFilter::GetExpressionFilter(filter, "mnemonicdb scan");
 			auto column = entry.GetIndex().GetIndex();
-			state->filters.push_back(
-			    ScanFilter {column, expression_filter, make_uniq<ExpressionExecutor>(context, *expression_filter.expr)});
+			state->filters.push_back(ScanFilter {column, expression_filter});
 			auto &scan_column = state->columns[column];
 			if (scan_column.kind == ScanColumn::Kind::ID && !id_points_filter.IsValid()) {
 				vector<Value> points;
@@ -585,18 +722,21 @@ static unique_ptr<GlobalTableFunctionState> MnemonicScanInit(ClientContext &cont
 		state->lookup_mode = true;
 		auto &attr = state->attributes[state->columns[range_filter.GetIndex()].attribute].attr.get();
 		state->candidates = EntitiesInRanges(view, attr, ranges, bind_data.as_of);
-	} else {
-		for (auto &attribute : state->attributes) {
-			state->cursors.emplace_back(view, attribute.attr.get(), bind_data.as_of);
-		}
 	}
-	if (state->lookup_mode) {
-		state->reader = make_uniq<mnemonicdb::PrefixReader>(view);
-		std::sort(state->candidates.begin(), state->candidates.end());
-		state->candidates.erase(std::unique(state->candidates.begin(), state->candidates.end()),
-		                        state->candidates.end());
-	}
+	PlanTasks(context, bind_data, *state, view);
 	return std::move(state);
+}
+
+static unique_ptr<LocalTableFunctionState> MnemonicScanInitLocal(ExecutionContext &context,
+                                                                 TableFunctionInitInput &,
+                                                                 GlobalTableFunctionState *global_state) {
+	auto &state = global_state->Cast<MnemonicScanState>();
+	auto local = make_uniq<MnemonicScanLocalState>();
+	local->scan_chunk.Initialize(context.client, state.column_types);
+	for (auto &filter : state.filters) {
+		local->executors.push_back(make_uniq<ExpressionExecutor>(context.client, *filter.filter.expr));
+	}
+	return std::move(local);
 }
 
 //! Whether the entity is a member of table `t`, given the values read for every attribute
@@ -611,7 +751,8 @@ static bool IsMember(const MnemonicScanState &state, const vector<vector<string>
 
 //! Write one entity's values into row `row` of the scan chunk, or return false if it is not a member of every
 //! required table. `values[a]` holds the encoded values of attribute a.
-static bool WriteRow(MnemonicScanState &state, EntityId entity, const vector<vector<string>> &values, idx_t row) {
+static bool WriteRow(MnemonicScanState &state, DataChunk &chunk, EntityId entity, const vector<vector<string>> &values,
+                     idx_t row) {
 	auto table_count = state.table_required.size();
 	vector<bool> member(table_count);
 	for (idx_t t = 0; t < table_count; t++) {
@@ -620,7 +761,6 @@ static bool WriteRow(MnemonicScanState &state, EntityId entity, const vector<vec
 			return false;
 		}
 	}
-	auto &chunk = state.scan_chunk;
 	for (idx_t a = 0; a < values.size(); a++) {
 		auto &columns = state.attribute_columns[a];
 		if (columns.empty()) {
@@ -661,19 +801,85 @@ static bool WriteRow(MnemonicScanState &state, EntityId entity, const vector<vec
 }
 
 //! Produce the next entity from the AEVT cursors; false when exhausted
-static bool NextMerged(MnemonicScanState &state, EntityId &entity, vector<vector<string>> &values) {
-	bool any = false;
-	for (auto &cursor : state.cursors) {
-		if (cursor.valid && (!any || cursor.entity < entity)) {
-			entity = cursor.entity;
-			any = true;
+//! The next entity that is a member of every required table, skipping ahead (leapfrog) past entities missing from
+//! any of them; false when no such entity remains
+static bool NextRequiredEntity(MnemonicScanState &state, MnemonicScanLocalState &local, EntityId &entity) {
+	auto table_count = state.table_required.size();
+	while (true) {
+		bool agreed = true;
+		bool first = true;
+		EntityId candidate = 0;
+		for (idx_t t = 0; t < table_count; t++) {
+			if (!state.table_required[t]) {
+				continue;
+			}
+			// The table's next member is the smallest entity any of its attribute cursors is on
+			bool any = false;
+			EntityId next = 0;
+			for (idx_t a = state.table_attributes[t].first; a < state.table_attributes[t].second; a++) {
+				auto &cursor = local.cursors[a];
+				if (cursor.valid && (!any || cursor.entity < next)) {
+					next = cursor.entity;
+					any = true;
+				}
+			}
+			if (!any) {
+				return false;
+			}
+			if (!first && next != candidate) {
+				agreed = false;
+			}
+			candidate = first ? next : MaxValue(candidate, next);
+			first = false;
+		}
+		if (agreed) {
+			entity = candidate;
+			return true;
+		}
+		for (idx_t t = 0; t < table_count; t++) {
+			if (!state.table_required[t]) {
+				continue;
+			}
+			for (idx_t a = state.table_attributes[t].first; a < state.table_attributes[t].second; a++) {
+				local.cursors[a].SeekTo(candidate);
+			}
 		}
 	}
-	if (!any) {
-		return false;
+}
+
+static bool NextMerged(MnemonicScanState &state, MnemonicScanLocalState &local, EntityId &entity,
+                       vector<vector<string>> &values) {
+	bool has_required = false;
+	for (auto required : state.table_required) {
+		has_required = has_required || required;
 	}
-	for (idx_t a = 0; a < state.cursors.size(); a++) {
-		auto &cursor = state.cursors[a];
+	if (has_required) {
+		if (!NextRequiredEntity(state, local, entity)) {
+			return false;
+		}
+		// Optional tables only need their cursors brought up to the entity
+		for (idx_t t = 0; t < state.table_required.size(); t++) {
+			if (state.table_required[t]) {
+				continue;
+			}
+			for (idx_t a = state.table_attributes[t].first; a < state.table_attributes[t].second; a++) {
+				local.cursors[a].SeekTo(entity);
+			}
+		}
+	} else {
+		bool any = false;
+		for (auto &cursor : local.cursors) {
+			if (cursor.valid && (!any || cursor.entity < entity)) {
+				entity = cursor.entity;
+				any = true;
+			}
+		}
+		if (!any) {
+			return false;
+		}
+	}
+	for (idx_t a = 0; a < local.cursors.size(); a++) {
+		auto &cursor = local.cursors[a];
 		// Membership needs every attribute's presence, but values are only kept for projected ones
 		bool wanted = !state.attribute_columns[a].empty();
 		while (cursor.valid && cursor.entity == entity) {
@@ -687,11 +893,11 @@ static bool NextMerged(MnemonicScanState &state, EntityId &entity, vector<vector
 }
 
 //! Produce the next candidate entity's values; false when exhausted
-static bool NextCandidate(MnemonicScanState &state, mnemonicdb::ReadView &view, optional_idx as_of, EntityId &entity,
-                          vector<vector<string>> &values) {
+static bool NextCandidate(MnemonicScanState &state, MnemonicScanLocalState &local, optional_idx as_of,
+                          EntityId &entity, vector<vector<string>> &values) {
 	constexpr size_t head = mnemonicdb::PACKED_ID_SIZE + mnemonicdb::PACKED_ATTR_SIZE;
-	while (state.next_candidate < state.candidates.size()) {
-		entity = state.candidates[state.next_candidate++];
+	while (local.next_candidate < local.task.candidate_end) {
+		entity = state.candidates[local.next_candidate++];
 		if (!mnemonicdb::IsWellFormed(entity)) {
 			continue;
 		}
@@ -699,7 +905,7 @@ static bool NextCandidate(MnemonicScanState &state, mnemonicdb::ReadView &view, 
 		for (idx_t a = 0; a < state.attributes.size(); a++) {
 			auto &attr = state.attributes[a].attr.get();
 			auto prefix = mnemonicdb::EavtPrefix(entity, attr.Local());
-			ForEachVisible(*state.reader, ColumnFamily::EAVT, ColumnFamily::EAVT_HIST, prefix, as_of, [&](std::string_view key) {
+			ForEachVisible(*local.reader, ColumnFamily::EAVT, ColumnFamily::EAVT_HIST, prefix, as_of, [&](std::string_view key) {
 				any = true;
 				values[a].emplace_back(key.substr(head, key.size() - head - mnemonicdb::PACKED_TX_SIZE));
 			});
@@ -713,11 +919,33 @@ static bool NextCandidate(MnemonicScanState &state, mnemonicdb::ReadView &view, 
 	return false;
 }
 
+//! Start the thread's next task; false when there is no work left
+static bool StartTask(MnemonicScanState &state, MnemonicScanLocalState &local, mnemonicdb::ReadView &view,
+                      optional_idx as_of) {
+	if (!state.NextTask(local.task)) {
+		return false;
+	}
+	local.active = true;
+	if (state.lookup_mode) {
+		local.next_candidate = local.task.candidate_begin;
+		if (!local.reader) {
+			local.reader = make_uniq<mnemonicdb::PrefixReader>(view);
+		}
+		return true;
+	}
+	local.cursors.clear();
+	for (auto &attribute : state.attributes) {
+		local.cursors.emplace_back(view, attribute.attr.get(), as_of, local.task.start, local.task.end);
+	}
+	return true;
+}
+
 static void MnemonicScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &bind_data = input.bind_data->Cast<MnemonicScanBindData>();
 	auto &state = input.global_state->Cast<MnemonicScanState>();
+	auto &local = input.local_state->Cast<MnemonicScanLocalState>();
 	auto &view = MnemonicTransaction::Get(context, bind_data.tables[0].table.get().catalog).GetReadView();
-	auto &chunk = state.scan_chunk;
+	auto &chunk = local.scan_chunk;
 
 	vector<vector<string>> values(state.attributes.size());
 	while (true) {
@@ -725,17 +953,21 @@ static void MnemonicScan(ClientContext &context, TableFunctionInput &input, Data
 		idx_t count = 0;
 		bool exhausted = false;
 		while (count < STANDARD_VECTOR_SIZE) {
+			if (!local.active && !StartTask(state, local, view, bind_data.as_of)) {
+				exhausted = true;
+				break;
+			}
 			for (auto &v : values) {
 				v.clear();
 			}
 			EntityId entity = 0;
-			bool found = state.lookup_mode ? NextCandidate(state, view, bind_data.as_of, entity, values)
-			                               : NextMerged(state, entity, values);
+			bool found = state.lookup_mode ? NextCandidate(state, local, bind_data.as_of, entity, values)
+			                               : NextMerged(state, local, entity, values);
 			if (!found) {
-				exhausted = true;
-				break;
+				local.active = false;
+				continue;
 			}
-			if (WriteRow(state, entity, values, count)) {
+			if (WriteRow(state, chunk, entity, values, count)) {
 				count++;
 			}
 		}
@@ -743,16 +975,17 @@ static void MnemonicScan(ClientContext &context, TableFunctionInput &input, Data
 
 		// Apply every pushed filter exactly
 		idx_t selected = count;
-		for (auto &filter : state.filters) {
+		for (idx_t f = 0; f < state.filters.size(); f++) {
 			if (selected == 0) {
 				break;
 			}
+			auto &filter = state.filters[f];
 			DataChunk filter_input;
 			filter_input.InitializeEmpty({state.column_types[filter.column]});
 			filter_input.data[0].Reference(chunk.data[filter.column]);
 			filter_input.SetCardinalityUnsafe(chunk.size());
 			SelectionVector filter_sel(STANDARD_VECTOR_SIZE);
-			auto passed = filter.executor->SelectExpression(filter_input, filter_sel);
+			auto passed = local.executors[f]->SelectExpression(filter_input, filter_sel);
 			chunk.Slice(filter_sel, passed);
 			selected = passed;
 		}
@@ -849,7 +1082,7 @@ static unique_ptr<NodeStatistics> MnemonicScanCardinality(ClientContext &, const
 }
 
 static TableFunction BaseScanFunction() {
-	TableFunction function("mnemonicdb_scan", {}, MnemonicScan, nullptr, MnemonicScanInit);
+	TableFunction function("mnemonicdb_scan", {}, MnemonicScan, nullptr, MnemonicScanInit, MnemonicScanInitLocal);
 	function.projection_pushdown = true;
 	function.filter_pushdown = true;
 	function.filter_prune = true;
