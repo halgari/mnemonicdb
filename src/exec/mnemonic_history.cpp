@@ -35,7 +35,10 @@ struct HistoryBindData : public TableFunctionData {
 	TxId until = mnemonicdb::LOCAL_MASK;
 	//! mnemonicdb_tx_changes: only the reading transaction's pending datoms
 	bool tx_changes = false;
-	//! The planner's row estimate, computed once
+	//! The planner's row estimate, computed once per bind (the cardinality
+	//! callback only gets a const FunctionData). A prepared statement keeps its
+	//! plan, and so this estimate, across executions in later transactions;
+	//! only the plan's shape depends on it, never the result.
 	mutable optional_idx estimate;
 };
 
@@ -373,6 +376,36 @@ static void HistoryFunction(ClientContext &context, TableFunctionInput &input, D
 //! Upper limit on the pending txlog entries counted for an estimate
 static constexpr idx_t TX_CHANGES_COUNT_LIMIT = 20000;
 
+//! The estimate for a transaction with more txlog entries than were counted:
+//! `matched` of the entries before `stopped_at` matched; scale it by the share of
+//! all entries that were scanned. txlog keys are T5 E6 A2 V, so entries are in
+//! entity order; that share is estimated from where the scan stopped in the
+//! entity range of the transaction (from its first entry to its last), as a
+//! transaction's new entities are allocated consecutively.
+static idx_t ScaleTxChanges(MnemonicTransaction &transaction, const string &prefix, EntityId first_entity,
+                            const rocksdb::Slice &stopped_at, idx_t matched) {
+	auto stop_entity = mnemonicdb::GetEntityId(stopped_at.data() + mnemonicdb::PACKED_TX_SIZE);
+	auto last = transaction.GetReadView().NewIterator(ColumnFamily::TXLOG, prefix);
+	last->SeekForPrev(prefix + string(mnemonicdb::PACKED_ID_SIZE + mnemonicdb::PACKED_ATTR_SIZE + 1, '\xff'));
+	if (!last->Valid() || !last->key().starts_with(prefix)) {
+		return matched;
+	}
+	auto last_entity = mnemonicdb::GetEntityId(last->key().data() + mnemonicdb::PACKED_TX_SIZE);
+	// Only comparable within one partition: ids of different partitions are
+	// 2^56 apart, which says nothing about how many entries lie between. With
+	// more partitions still ahead, assume a tenth was seen.
+	double fraction = 0.1;
+	auto part = mnemonicdb::PartitionOf(last_entity);
+	if (mnemonicdb::PartitionOf(first_entity) == part && mnemonicdb::PartitionOf(stop_entity) == part &&
+	    last_entity > first_entity) {
+		auto first = double(mnemonicdb::LocalOf(first_entity));
+		fraction = (double(mnemonicdb::LocalOf(stop_entity)) - first + 1) /
+		           (double(mnemonicdb::LocalOf(last_entity)) - first + 1);
+	}
+	fraction = MinValue(MaxValue(fraction, 0.001), 1.0);
+	return MaxValue<idx_t>(matched, idx_t(double(matched) / fraction));
+}
+
 //! The number of rows mnemonicdb_tx_changes will return: its pending txlog
 //! entries (those of the filtered attributes), counted up to a limit
 static idx_t EstimateTxChanges(ClientContext &context, const HistoryBindData &data) {
@@ -386,11 +419,16 @@ static idx_t EstimateTxChanges(ClientContext &context, const HistoryBindData &da
 	unordered_set<AttrId> filter(data.attributes.begin(), data.attributes.end());
 	idx_t scanned = 0;
 	idx_t matched = 0;
+	EntityId first_entity = 0;
 	for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
 		if (++scanned > TX_CHANGES_COUNT_LIMIT) {
-			// A large transaction: what was seen, scaled up as if the batch were
-			// ten times larger (only the order of magnitude matters to the planner)
-			return MaxValue<idx_t>(matched, 1) * 10;
+			return ScaleTxChanges(transaction, prefix, first_entity, it->key(), matched);
+		}
+		// The first entity of the partition the scan is in (e.g. past the tx
+		// entity's own datoms)
+		auto entity = mnemonicdb::GetEntityId(it->key().data() + mnemonicdb::PACKED_TX_SIZE);
+		if (scanned == 1 || mnemonicdb::PartitionOf(entity) != mnemonicdb::PartitionOf(first_entity)) {
+			first_entity = entity;
 		}
 		if (!data.filtered) {
 			matched++;

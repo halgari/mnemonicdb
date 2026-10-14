@@ -327,15 +327,49 @@ static void FuseScansInternal(OptimizerExtensionInput &input, unique_ptr<Logical
 //! Mark scans that a hash join feeds a key set at runtime, so that a scan which
 //! receives none knows the join's build side was empty (or all NULL) and reads
 //! nothing. Only where this is certain:
-//! - the join is an equality join, so it is planned as a hash join, which pushes
-//!   a filter whenever its build side has a non-NULL key;
+//! - the join is an equality join, so it is planned as a PhysicalHashJoin
+//!   (plan_comparison_join.cpp: any equality condition picks the hash join
+//!   unless prefer_range_joins is set and an IEJoin is possible, which needs
+//!   inequality conditions; on this DuckDB build a forced range join over an
+//!   equality fails with "Unimplemented join type for merge join" anyway);
 //! - its type drops probe rows without a match (INNER, SEMI, RIGHT, RIGHT_SEMI);
 //! - the key and the scanned column have the same type, so pushing never fails
 //!   on a cast;
 //! - the scan runs in the join's probe pipeline (only projections and filters in
 //!   between), so the build side has finished when the scan starts;
 //! - not inside a recursive CTE, whose joins run repeatedly.
-static void MarkJoinKeyScans(LogicalOperator &op, bool in_recursive_cte) {
+//!
+//! DuckDB invariants this relies on (physical_hash_join.cpp, pinned at
+//! 2bb5316a8b5; tests in test/sql/key_set_seek.test, "Empty key sets" and
+//! "Push paths"):
+//! - every finalize path of PhysicalHashJoin (in-memory, perfect hash, and
+//!   external) calls JoinFilterPushdownInfo::FinalizeFilters when the build has
+//!   rows, and FinalizeFilters pushes, per probe column with a non-NULL min/max,
+//!   at least one of: `col = v`, an IN list, min/max bounds, or a prefix-range
+//!   key bitmap;
+//! - a key bitmap registered instead of the min/max bounds (the `continue`
+//!   after TryRegisterPrefixRangeFilter) is published by
+//!   PublishDeferredRuntimeFilters in the join's finalize, before its probe
+//!   pipeline starts.
+//! Debug builds check that a marked scan which got any filter got one on every
+//! marked column (MnemonicScanInit).
+//! How many joins push key sets into each dynamic filter set
+static void CountJoinFilterTargets(LogicalOperator &op, unordered_map<const DynamicTableFilterSet *, idx_t> &counts) {
+	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = op.Cast<LogicalComparisonJoin>();
+		if (join.filter_pushdown) {
+			for (auto &probe : join.filter_pushdown->probe_info) {
+				counts[probe.dynamic_filters.get()]++;
+			}
+		}
+	}
+	for (auto &child : op.children) {
+		CountJoinFilterTargets(*child, counts);
+	}
+}
+
+static void MarkJoinKeyScans(LogicalOperator &op, bool in_recursive_cte,
+                             const unordered_map<const DynamicTableFilterSet *, idx_t> &counts) {
 	if (op.type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) {
 		in_recursive_cte = true;
 	}
@@ -369,19 +403,29 @@ static void MarkJoinKeyScans(LogicalOperator &op, bool in_recursive_cte) {
 					}
 				}
 				if (certain) {
-					scan->bind_data->Cast<MnemonicScanBindData>().join_key_filters = scan->dynamic_filters;
+					auto &bind_data = scan->bind_data->Cast<MnemonicScanBindData>();
+					bind_data.join_key_filters = scan->dynamic_filters;
+					// With a single join pushing here, its columns are what a debug
+					// build checks for
+					if (counts.at(probe.dynamic_filters.get()) == 1) {
+						for (auto &column : probe.columns) {
+							bind_data.join_key_columns.push_back(column.probe_column_index.column_index.GetIndex());
+						}
+					}
 				}
 			}
 		}
 	}
 	for (auto &child : op.children) {
-		MarkJoinKeyScans(*child, in_recursive_cte);
+		MarkJoinKeyScans(*child, in_recursive_cte, counts);
 	}
 }
 
 static void FuseScans(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	FuseScansInternal(input, plan);
-	MarkJoinKeyScans(*plan, false);
+	unordered_map<const DynamicTableFilterSet *, idx_t> counts;
+	CountJoinFilterTargets(*plan, counts);
+	MarkJoinKeyScans(*plan, false, counts);
 }
 
 static void FuseScansInternal(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {

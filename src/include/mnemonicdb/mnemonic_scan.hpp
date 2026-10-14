@@ -30,6 +30,9 @@ struct MnemonicScanBindData : public TableFunctionData {
 	//! key set into these filters at runtime, and pushes nothing only when its
 	//! build side has no key: the scan then reads nothing
 	shared_ptr<DynamicTableFilterSet> join_key_filters;
+	//! The scan columns that join pushes into, when it is the only one (checked
+	//! in debug builds)
+	vector<idx_t> join_key_columns;
 
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;

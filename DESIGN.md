@@ -313,7 +313,10 @@ which chooses the driving mode:
 
 Candidates are filled in by EAVT point lookups (plus `eavt_hist` under `AT`).
 Candidates from hints are used only while there are at most
-max(1024, rows / 64) of them; past that a merge is cheaper. Every other query
+max(1024, rows / 64) of them; past that a merge is cheaper. A join's key list
+stays a hint when an exact filter only bounds it; points intersected with an
+exact filter's own points are no more than those, and are followed however
+many. Every other query
 merges the AEVT ranges, bounded by any range on `id` (a join's min/max). A key
 set that is empty (contradictory filters, only NULLs, bounds that cross) reads
 nothing.
@@ -323,7 +326,8 @@ therefore marks scans that an equality hash join feeds in the same pipeline
 (only projections and filters in between; INNER, SEMI, RIGHT or RIGHT_SEMI;
 key and column of the same type; not in a recursive CTE). Such a join pushes a
 filter whenever its build side has a non-NULL key, so a marked scan that
-receives none reads nothing. DuckDB normally skips the probe pipeline itself
+receives none reads nothing. The DuckDB behaviour this relies on is listed at
+`MarkJoinKeyScans` and pinned by `test/sql/key_set_push_paths.test`. DuckDB normally skips the probe pipeline itself
 in that case, but not always (for example inside a streamed CTE).
 
 **Reading fewer attributes.** Membership normally needs every attribute of a
@@ -697,7 +701,8 @@ INSERT INTO d.sys.assertions (name, query, doc) VALUES
   committing session's.
 - **Estimates.** `mnemonicdb_tx_changes` reports its row count to the planner
   (its pending txlog entries for the filtered attributes, counted up to
-  20,000), so a join builds its hash table on the changes rather than on a
+  20,000; past that, the count so far is scaled by the share of the
+  transaction's entity range the count reached), so a join builds its hash table on the changes rather than on a
   large table. `mnemonicdb_history` estimates twice the current datoms of the
   attributes it reads. Table scans report distinct counts for `id` and for
   UNIQUE / PRIMARY KEY columns (never min/max, which DuckDB would trust for

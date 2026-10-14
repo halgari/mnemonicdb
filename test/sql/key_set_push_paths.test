@@ -1,0 +1,119 @@
+# name: test/sql/key_set_push_paths.test
+# description: Pins the DuckDB behaviour the scan's "read nothing" mark relies on: a hash join with a non-NULL build key pushes some filter into a marked scan before it starts, on the key-bitmap-only path and on the external hash join path
+# group: [sql]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/key_set_push_paths.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.item (k INTEGER)
+
+statement ok
+INSERT INTO d.item (k) SELECT i FROM range(400000) t(i)
+
+statement ok
+CREATE TABLE ks AS SELECT id, k FROM d.item
+
+statement ok
+CALL enable_logging(level = 'debug', storage = 'memory')
+
+#----------------------------------------------------------------------
+# Key bitmap only: no IN list (threshold 0), the bitmap replaces min/max, and
+# is published in the join's finalize, before the probe-side scan starts
+#----------------------------------------------------------------------
+statement ok
+SET dynamic_or_filter_threshold = 0
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM d.item WHERE id IN (SELECT id FROM ks WHERE k % 997 = 3)
+----
+analyzed_plan	<REGEX>:.*Dynamic Filters: optional: id IN PRF\(#0\) .*
+
+foreach threads 1 4
+
+statement ok
+SET threads = {threads}
+
+query II
+SELECT count(*), sum(k) FROM d.item WHERE id IN (SELECT id FROM ks WHERE k % 997 = 3)
+----
+402	80360403
+
+# Two keys at the ends of the id range, and keys of other partitions only
+query II
+SELECT count(*), sum(k) FROM d.item WHERE id IN (SELECT id FROM ks WHERE k IN (0, 399999))
+----
+2	399999
+
+query I
+SELECT count(*) FROM d.item WHERE id IN (SELECT id + 72057594037927936 FROM ks WHERE k < 100)
+----
+0
+
+endloop
+
+statement ok
+RESET dynamic_or_filter_threshold
+
+#----------------------------------------------------------------------
+# External hash join: min/max bounds and a Bloom filter, pushed from the
+# external finalize path
+#----------------------------------------------------------------------
+statement ok
+SET threads = 1
+
+statement ok
+SET debug_force_external = true
+
+query II
+SELECT count(*), sum(k) FROM d.item WHERE id IN (SELECT id FROM ks)
+----
+400000	79999800000
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE message LIKE '%HASH_JOIN%external=1%'
+----
+true
+
+query II
+SELECT count(*), sum(i.k) FROM d.item i JOIN (SELECT id FROM ks WHERE k % 2 = 1) s ON s.id = i.id
+----
+200000	40000000000
+
+# An empty build side never goes external; the marked scan reads nothing
+query I
+SELECT count(*) FROM d.item WHERE id IN (SELECT id FROM ks WHERE k < 0)
+----
+0
+
+statement ok
+RESET debug_force_external
+
+statement ok
+RESET threads
+
+#----------------------------------------------------------------------
+# mnemonicdb_tx_changes estimates past the 20,000 entries it counts: scaled by
+# the share of the transaction's entities counted
+#----------------------------------------------------------------------
+statement ok
+CREATE TABLE d.other (v INTEGER)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.item (k) SELECT i FROM range(30000) t(i)
+
+statement ok
+INSERT INTO d.other (v) SELECT i FROM range(1000) t(i)
+
+query II
+EXPLAIN SELECT * FROM mnemonicdb_tx_changes('d')
+----
+physical_plan	<REGEX>:.*MNEMONICDB_TX_CHANGES.*~(30,[0-9]{3}|31,[0-9]{3}) rows.*
+
+statement ok
+ROLLBACK

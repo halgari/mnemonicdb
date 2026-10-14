@@ -36,6 +36,7 @@ unique_ptr<FunctionData> MnemonicScanBindData::Copy() const {
 	result->fused = fused;
 	result->as_of = as_of;
 	result->join_key_filters = join_key_filters;
+	result->join_key_columns = join_key_columns;
 	return std::move(result);
 }
 
@@ -357,10 +358,18 @@ struct KeySet {
 	Value upper;
 	//! The value is a key of each of these join key bitmaps
 	vector<reference<const PrefixRangeFunctionData>> key_filters;
-	//! Whether some part comes from a filter that is not optional (written by
-	//! the user, so worth following however many keys it has)
-	bool exact = false;
+	//! Whether the points, and the bounds, come from a filter that is not
+	//! optional (written by the user, so worth following however many keys it
+	//! has). Points intersected with an exact filter's points are no more than
+	//! those; a join's key list intersected with an exact range is still a hint.
+	bool exact_points = false;
+	bool exact_bounds = false;
 
+	//! Whether what drives the scan (the points if any, else the bounds) is
+	//! exact
+	bool Exact() const {
+		return has_points ? exact_points : exact_bounds;
+	}
 	bool Constrains() const {
 		return has_points || has_lower || has_upper || !key_filters.empty();
 	}
@@ -393,7 +402,9 @@ struct KeySet {
 			if (!has_points) {
 				points = std::move(other.points);
 				has_points = true;
+				exact_points = other.exact_points;
 			} else {
+				exact_points = exact_points || other.exact_points;
 				SortUnique(points);
 				SortUnique(other.points);
 				vector<Value> both;
@@ -411,7 +422,7 @@ struct KeySet {
 		for (auto &filter : other.key_filters) {
 			key_filters.push_back(filter);
 		}
-		exact = exact || other.exact;
+		exact_bounds = exact_bounds || other.exact_bounds;
 	}
 	//! Drop points outside the bounds, and duplicates
 	void Normalize() {
@@ -500,7 +511,7 @@ static bool AnalyzeFilter(const Expression &expr, const LogicalType &type, KeySe
 	case ExpressionType::CONJUNCTION_OR: {
 		// A union of point sets only
 		vector<Value> points;
-		bool exact = false;
+		bool exact = true;
 		for (auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
 			KeySet child_keys;
 			if (!AnalyzeFilter(*child, type, child_keys, optional) || !child_keys.has_points ||
@@ -509,11 +520,12 @@ static bool AnalyzeFilter(const Expression &expr, const LogicalType &type, KeySe
 			}
 			child_keys.Normalize();
 			points.insert(points.end(), child_keys.points.begin(), child_keys.points.end());
-			exact = exact || child_keys.exact;
+			// The union is as exact as its least exact part
+			exact = exact && child_keys.exact_points;
 		}
 		keys.has_points = true;
 		keys.points = std::move(points);
-		keys.exact = exact;
+		keys.exact_points = exact;
 		return true;
 	}
 	case ExpressionType::COMPARE_IN: {
@@ -536,7 +548,7 @@ static bool AnalyzeFilter(const Expression &expr, const LogicalType &type, KeySe
 		}
 		keys.has_points = true;
 		keys.points = std::move(points);
-		keys.exact = !optional;
+		keys.exact_points = !optional;
 		return true;
 	}
 	case ExpressionType::COMPARE_BETWEEN: {
@@ -555,7 +567,7 @@ static bool AnalyzeFilter(const Expression &expr, const LogicalType &type, KeySe
 		    !CastConstant(BoundBetweenExpression::UpperBound(between), type, upper)) {
 			return false;
 		}
-		keys.exact = !optional;
+		keys.exact_points = keys.exact_bounds = !optional;
 		if (lower.IsNull() || upper.IsNull()) {
 			// Never true
 			keys.has_points = true;
@@ -596,7 +608,7 @@ static bool AnalyzeFilter(const Expression &expr, const LogicalType &type, KeySe
 	default:
 		return false;
 	}
-	keys.exact = !optional;
+	keys.exact_points = keys.exact_bounds = !optional;
 	if (value.IsNull()) {
 		// Never true
 		keys.has_points = true;
@@ -643,7 +655,8 @@ struct EntityKeys {
 	EntityId lower = 0;
 	EntityId upper = UINT64_MAX;
 	vector<reference<const PrefixRangeFunctionData>> key_filters;
-	bool exact = false;
+	//! Whether the points come from a filter that is not optional
+	bool exact_points = false;
 
 	bool Empty() const {
 		return lower > upper || (has_points && points.empty());
@@ -658,7 +671,7 @@ struct EntityKeys {
 
 static EntityKeys ToEntityKeys(const KeySet &keys) {
 	EntityKeys result;
-	result.exact = keys.exact;
+	result.exact_points = keys.has_points && keys.exact_points;
 	result.key_filters = keys.key_filters;
 	if (keys.has_lower) {
 		auto lower = keys.lower.GetValue<uint64_t>();
@@ -710,15 +723,16 @@ static void IntersectEntityKeys(EntityKeys &keys, EntityKeys &other) {
 				}
 			}
 			keys.points = std::move(both);
+			keys.exact_points = keys.exact_points || other.exact_points;
 		} else {
 			keys.points = std::move(other.points);
 			keys.has_points = true;
+			keys.exact_points = other.exact_points;
 		}
 	}
 	for (auto &filter : other.key_filters) {
 		keys.key_filters.push_back(filter);
 	}
-	keys.exact = keys.exact || other.exact;
 	if (keys.has_points) {
 		vector<EntityId> kept;
 		for (auto id : keys.points) {
@@ -1182,6 +1196,15 @@ static unique_ptr<GlobalTableFunctionState> MnemonicScanInit(ClientContext &cont
 		rows = MaxValue(rows, EstimateTableRows(table.table.get()));
 	}
 	idx_t hint_limit = MaxValue<idx_t>(MIN_HINT_KEYS, rows / ROWS_PER_HINT_KEY);
+#ifdef DEBUG
+	// The join that marked this scan pushes into every one of its columns, or
+	// (empty build side) into none
+	if (bind_data.join_key_filters && bind_data.join_key_filters->HasFilters()) {
+		for (auto column : bind_data.join_key_columns) {
+			D_ASSERT(input.filters && input.filters->HasFilter(ProjectionIndex(column)));
+		}
+	}
+#endif
 	if (bind_data.join_key_filters && !bind_data.join_key_filters->HasFilters()) {
 		// The join feeding this scan its key set has an empty build side: no row
 		// can match
@@ -1202,7 +1225,7 @@ static unique_ptr<GlobalTableFunctionState> MnemonicScanInit(ClientContext &cont
 					id_keys.has_points = true;
 				}
 			}
-			if (id_keys.has_points && !id_keys.exact && id_keys.points.size() > hint_limit) {
+			if (id_keys.has_points && !id_keys.exact_points && id_keys.points.size() > hint_limit) {
 				// A long hint (dynamic_or_filter_threshold raised): its bounds still help
 				auto bounds = std::minmax_element(id_keys.points.begin(), id_keys.points.end());
 				id_keys.lower = MaxValue(id_keys.lower, *bounds.first);
@@ -1220,10 +1243,10 @@ static unique_ptr<GlobalTableFunctionState> MnemonicScanInit(ClientContext &cont
 	if (!state->lookup_mode) {
 		// Exact filters first: they were written for this
 		std::stable_sort(attribute_keys.begin(), attribute_keys.end(),
-		                 [](const AttributeKeys &a, const AttributeKeys &b) { return a.keys.exact > b.keys.exact; });
+		                 [](const AttributeKeys &a, const AttributeKeys &b) { return a.keys.Exact() > b.keys.Exact(); });
 		for (auto &entry : attribute_keys) {
 			auto &attr = state->attributes[entry.attribute].attr.get();
-			auto limit = entry.keys.exact ? optional_idx() : optional_idx(hint_limit);
+			auto limit = entry.keys.Exact() ? optional_idx() : optional_idx(hint_limit);
 			vector<EntityId> candidates;
 			bool found = false;
 			if (attr.HasAvet()) {
