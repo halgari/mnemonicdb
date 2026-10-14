@@ -13,6 +13,7 @@ class MnemonicSchemaEntry;
 class MnemonicTableEntry;
 class MnemonicCatalog;
 class MnemonicTransaction;
+class AssertionStatementCache;
 
 //! The catalog entries for one immutable Schema. Transactions hold on to the
 //! generation they read, so entries stay alive for as long as any transaction
@@ -114,6 +115,10 @@ public:
 	void RegisterAssertionContext(ClientContext &context, MnemonicTransaction &parent);
 	void UnregisterAssertionContext(ClientContext &context);
 	optional_ptr<MnemonicTransaction> FindAssertionParent(ClientContext &context);
+	//! The parsed assertion queries, kept across commits
+	AssertionStatementCache &GetAssertionCache() {
+		return *assertion_cache;
+	}
 
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
@@ -130,6 +135,7 @@ private:
 	shared_ptr<MnemonicCatalogGeneration> generation;
 	mutex assertion_lock;
 	unordered_map<ClientContext *, MnemonicTransaction *> assertion_contexts;
+	unique_ptr<AssertionStatementCache> assertion_cache;
 };
 
 } // namespace duckdb

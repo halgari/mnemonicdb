@@ -324,7 +324,10 @@ nothing.
 A join whose build side is empty pushes no filter at all. The optimizer pass
 therefore marks scans that an equality hash join feeds in the same pipeline
 (only projections and filters in between; INNER, SEMI, RIGHT or RIGHT_SEMI;
-key and column of the same type; not in a recursive CTE). Such a join pushes a
+key and column of the same type; in the recursive step of a recursive CTE,
+only joins whose build side reads the working table, since DuckDB may build an
+invariant one once and reuse it; the anchor runs once and is marked like any
+other subplan). Such a join pushes a
 filter whenever its build side has a non-NULL key, so a marked scan that
 receives none reads nothing. The DuckDB behaviour this relies on is listed at
 `MarkJoinKeyScans` and pinned by `test/sql/key_set_push_paths.test`. DuckDB normally skips the probe pipeline itself
@@ -661,8 +664,8 @@ INSERT INTO d.sys.assertions (name, query, doc) VALUES
 - **Rules for the query.** It must parse to exactly one SELECT. It runs in a
   `READ ONLY` transaction and cannot write to any database. Its rows are
   streamed and counted, and only the first 5 are rendered. Assertions are
-  independent and callers must not depend on their order (they currently run
-  ordered by name).
+  independent and callers must not depend on their order: several run at once
+  (see Mechanism), and failures are reported ordered by name.
 - **Failure.** All failing assertions are reported in one error, joined by
   `"; "`:
   ```
@@ -692,9 +695,22 @@ INSERT INTO d.sys.assertions (name, query, doc) VALUES
      owned, never released) and catalog generation, and a read view overlaying
      the parent's write batch. `SetReadWrite` throws, so it never takes the
      writer lock and cannot deadlock against its parent.
-  4. `USE <this database>`, then for each assertion `BEGIN TRANSACTION READ
-     ONLY`, the query, `ROLLBACK`.
-  5. Unregister; throw if anything failed.
+  4. Steps 2 and 3 happen on `mnemonicdb_assertion_threads` connections at
+     once (default 4, at most one per assertion; this thread is one of them).
+     Each runs `USE <this database>` and `BEGIN TRANSACTION READ ONLY`, then
+     takes the next assertion not yet taken and runs it, until none are left,
+     then `ROLLBACK`. One read-only transaction serves all the assertions a
+     connection runs; after a query fails at run time (which leaves a DuckDB
+     transaction unusable) the connection rolls back and begins a new one.
+     Failures are reported in name order whatever ran where. The setting is read
+     from the committing connection.
+  5. A query is parsed once and the statement kept on the catalog (keyed by its
+     text and the parser options, which a fresh connection takes from the global
+     settings); each commit copies the cached statement. Entries for queries no
+     longer in sys.assertions are dropped after each evaluation. Parsing is a
+     large share of an assertion's cost: DuckDB's PEG parser takes about 3 µs
+     per byte, so tens of milliseconds for a few kilobytes of SQL.
+  6. Unregister; throw if anything failed.
 
   Other connections are unaffected: the registry is keyed by
   `ClientContext`. The assertion connection uses default settings, not the
@@ -707,10 +723,12 @@ INSERT INTO d.sys.assertions (name, query, doc) VALUES
   attributes it reads. Table scans report distinct counts for `id` and for
   UNIQUE / PRIMARY KEY columns (never min/max, which DuckDB would trust for
   pruning).
-- **Cost.** One connection per checked commit plus three statements per
-  assertion. In a reldebug build, an autocommit single-row INSERT took about
-  0.5 ms with no assertions and about 1.4 ms more per simple
-  `mnemonicdb_tx_changes`-driven assertion.
+- **Cost.** Up to `mnemonicdb_assertion_threads` connections per checked
+  commit, each with two statements besides its queries; each query is parsed
+  once per database and then planned and run per commit. With twelve trivial
+  assertions a commit spends about 2 ms evaluating them. Mauvi's twelve (1M
+  items, a single-row change) went from about 280 ms to 40 ms; see the Mauvi
+  repository's `invariant_bench` for the breakdown.
 
 ## 7b. User schemas and named types
 

@@ -1,0 +1,139 @@
+# name: test/sql/key_set_recursive.test
+# description: Recursive CTEs: a scan in the anchor, or in the recursive step under a join that is built from the working table, reads nothing when the join has no keys (an empty anchor, the last step of a walk); answers are those of plain tables
+# group: [sql]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/key_set_recursive.mnemonic' AS d (TYPE mnemonicdb)
+
+# Chains of ten nodes: node k has parent k - 1, except every tenth (a root)
+statement ok
+CREATE TABLE d.node (k INTEGER, parent REF)
+
+statement ok
+INSERT INTO d.node (k) SELECT i FROM range(30000) t(i)
+
+statement ok
+UPDATE d.node SET parent = p.id FROM (SELECT id, k FROM d.node) p WHERE p.k = d.node.k - 1 AND d.node.k % 10 <> 0
+
+statement ok
+CREATE TABLE ref_node AS SELECT * FROM d.node
+
+statement ok
+SET VARIABLE none = (SELECT list(id) FROM ref_node WHERE false)
+
+statement ok
+SET VARIABLE leaf = (SELECT list(id) FROM ref_node WHERE k = 12349)
+
+statement ok
+SET enable_profiling = 'json'
+
+statement ok
+SET profiling_output = '{TEST_DIR}/key_set_recursive_profile.json'
+
+#----------------------------------------------------------------------
+# An empty anchor: neither the anchor's scan nor the step's (which runs once
+# anyway, on the empty working table) reads anything
+#----------------------------------------------------------------------
+query I
+WITH RECURSIVE anc(id, parent) AS (
+    SELECT id, parent FROM d.node WHERE id IN (SELECT unnest(getvariable('none')))
+  UNION
+    SELECT id, parent FROM d.node WHERE id IN (SELECT parent FROM anc)
+)
+SELECT count(*) FROM anc
+----
+0
+
+query I
+SELECT regexp_extract(content, '"total_rows_scanned": *([0-9]+)', 1) FROM read_text('{TEST_DIR}/key_set_recursive_profile.json')
+----
+0
+
+#----------------------------------------------------------------------
+# A walk up from a leaf seeks each ancestor; its last step, on the root's NULL
+# parent, has no key and reads nothing
+#----------------------------------------------------------------------
+query I
+WITH RECURSIVE anc(id, parent) AS (
+    SELECT id, parent FROM d.node WHERE id IN (SELECT unnest(getvariable('leaf')))
+  UNION
+    SELECT id, parent FROM d.node WHERE id IN (SELECT parent FROM anc)
+)
+SELECT count(*) FROM anc
+----
+10
+
+query I
+SELECT regexp_extract(content, '"total_rows_scanned": *([0-9]+)', 1) FROM read_text('{TEST_DIR}/key_set_recursive_profile.json')
+----
+10
+
+statement ok
+PRAGMA disable_profiling
+
+query II
+WITH RECURSIVE anc(id, parent) AS (
+    SELECT id, parent FROM d.node WHERE id IN (SELECT unnest(getvariable('leaf')))
+  UNION
+    SELECT id, parent FROM d.node WHERE id IN (SELECT parent FROM anc)
+)
+SELECT count(*), min(n.k) FROM anc JOIN ref_node n ON n.id = anc.id
+----
+10	12340
+
+#----------------------------------------------------------------------
+# Joins in a recursive step whose build side doesn't read the working table
+# (built once, possibly reused) keep reading what they must
+#----------------------------------------------------------------------
+statement ok
+CREATE TABLE picked AS SELECT id FROM ref_node WHERE k % 3 <> 0
+
+foreach threads 1 4
+
+statement ok
+SET threads = {threads}
+
+query I
+WITH RECURSIVE walk(id, depth) AS (
+    SELECT id, 0 FROM d.node WHERE k % 10 = 0 AND k < 2000
+  UNION ALL
+    SELECT n.id, w.depth + 1 FROM walk w JOIN d.node n ON n.parent = w.id
+    WHERE n.id IN (SELECT id FROM picked) AND w.depth < 12
+)
+SELECT count(*) = (
+    WITH RECURSIVE walk(id, depth) AS (
+        SELECT id, 0 FROM ref_node WHERE k % 10 = 0 AND k < 2000
+      UNION ALL
+        SELECT n.id, w.depth + 1 FROM walk w JOIN ref_node n ON n.parent = w.id
+        WHERE n.id IN (SELECT id FROM picked) AND w.depth < 12
+    )
+    SELECT count(*) FROM walk)
+FROM walk
+----
+true
+
+# Down from every root: each step's join is built from the working table
+query II
+WITH RECURSIVE down(id, depth) AS (
+    SELECT id, 0 FROM d.node WHERE k % 10 = 0
+  UNION ALL
+    SELECT n.id, w.depth + 1 FROM d.node n JOIN down w ON n.parent = w.id
+)
+SELECT count(*), max(depth) FROM down
+----
+30000	9
+
+# A walk whose anchor is empty except under a condition no row meets
+query I
+WITH RECURSIVE down(id) AS (
+    SELECT id FROM d.node WHERE id IN (SELECT id FROM ref_node WHERE k < 0)
+  UNION
+    SELECT n.id FROM d.node n WHERE n.parent IN (SELECT id FROM down)
+)
+SELECT count(*) FROM down
+----
+0
+
+endloop

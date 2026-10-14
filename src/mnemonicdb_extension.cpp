@@ -3,6 +3,7 @@
 #include "mnemonicdb_extension.hpp"
 #include "mnemonicdb/codec_functions.hpp"
 #include "mnemonicdb/mnemonic_datom_functions.hpp"
+#include "mnemonicdb/mnemonic_assertions.hpp"
 #include "mnemonicdb/mnemonic_fusion.hpp"
 #include "mnemonicdb/mnemonic_history.hpp"
 #include "mnemonicdb/mnemonic_catalog.hpp"
@@ -184,6 +185,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterCodecFunctions(loader);
 	RegisterDatomFunctions(loader);
 	RegisterScanFusion(loader);
+	RegisterAssertionSettings(loader);
 	RegisterHistoryFunction(loader);
 }
 

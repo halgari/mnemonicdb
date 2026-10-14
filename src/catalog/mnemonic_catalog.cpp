@@ -1,4 +1,5 @@
 #include "mnemonicdb/mnemonic_catalog.hpp"
+#include "mnemonicdb/mnemonic_assertions.hpp"
 #include "mnemonicdb/mnemonic_index.hpp"
 #include "mnemonicdb/mnemonic_insert.hpp"
 #include "mnemonicdb/mnemonic_modify.hpp"
@@ -142,7 +143,8 @@ void MnemonicCatalogGeneration::ScanTables(const string &schema_name,
 //===--------------------------------------------------------------------===//
 MnemonicCatalog::MnemonicCatalog(AttachedDatabase &db, unique_ptr<mnemonicdb::Store> store_p,
                                  shared_ptr<const mnemonicdb::Schema> schema)
-    : Catalog(db), store(std::move(store_p)), initial_schema(std::move(schema)) {
+    : Catalog(db), store(std::move(store_p)), initial_schema(std::move(schema)),
+      assertion_cache(make_uniq<AssertionStatementCache>()) {
 }
 
 MnemonicCatalog::~MnemonicCatalog() = default;

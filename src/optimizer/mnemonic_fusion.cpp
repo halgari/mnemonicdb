@@ -11,7 +11,9 @@
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_recursive_cte.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
 
 namespace duckdb {
@@ -337,7 +339,15 @@ static void FuseScansInternal(OptimizerExtensionInput &input, unique_ptr<Logical
 //!   on a cast;
 //! - the scan runs in the join's probe pipeline (only projections and filters in
 //!   between), so the build side has finished when the scan starts;
-//! - not inside a recursive CTE, whose joins run repeatedly.
+//! - inside the recursive step of a recursive CTE, only when its build side
+//!   reads the CTE's working table: such a join is built again in every
+//!   iteration before its probe pipeline starts (recursive_cte.cpp re-runs the
+//!   step's pipelines in dependency order), while a join that doesn't may be an
+//!   invariant build DuckDB materializes once and reuses. The step runs at least
+//!   once even when the anchor returns nothing, so without the mark its scan
+//!   would read a first chunk of its table for a join that can match nothing.
+//!   A filter left from an earlier iteration only makes the scan read keys the
+//!   join then drops.
 //!
 //! DuckDB invariants this relies on (physical_hash_join.cpp, pinned at
 //! 2bb5316a8b5; tests in test/sql/key_set_seek.test, "Empty key sets" and
@@ -368,12 +378,36 @@ static void CountJoinFilterTargets(LogicalOperator &op, unordered_map<const Dyna
 	}
 }
 
-static void MarkJoinKeyScans(LogicalOperator &op, bool in_recursive_cte,
-                             const unordered_map<const DynamicTableFilterSet *, idx_t> &counts) {
-	if (op.type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) {
-		in_recursive_cte = true;
+//! Whether `op` reads the working table of the recursive CTE `cte`
+static bool ReadsWorkingTable(const LogicalOperator &op, TableIndex cte) {
+	if (op.type == LogicalOperatorType::LOGICAL_CTE_REF && op.Cast<LogicalCTERef>().cte_index == cte) {
+		return true;
 	}
-	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN && !in_recursive_cte) {
+	for (auto &child : op.children) {
+		if (ReadsWorkingTable(*child, cte)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! `recursion` is the innermost recursive CTE whose recursive step contains `op`,
+//! if any
+static void MarkJoinKeyScans(LogicalOperator &op, optional_ptr<const LogicalRecursiveCTE> recursion,
+                             const unordered_map<const DynamicTableFilterSet *, idx_t> &counts) {
+	if (op.type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE && op.children.size() == 2) {
+		// The anchor (children[0]) runs as often as the plan around it; the
+		// recursive step (children[1]) once per iteration
+		MarkJoinKeyScans(*op.children[0], recursion, counts);
+		MarkJoinKeyScans(*op.children[1], &op.Cast<LogicalRecursiveCTE>(), counts);
+		return;
+	}
+	// Inside a recursive step, only a join whose build side reads the working
+	// table is certain to be built again, before its probe, in every iteration
+	// (DuckDB may build an invariant one once and reuse it)
+	bool rebuilt = !recursion || (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+	                              op.children.size() == 2 && ReadsWorkingTable(*op.children[1], recursion->table_index));
+	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN && rebuilt) {
 		auto &join = op.Cast<LogicalComparisonJoin>();
 		auto join_type = join.join_type;
 		bool drops_unmatched = join_type == JoinType::INNER || join_type == JoinType::SEMI ||
@@ -417,7 +451,7 @@ static void MarkJoinKeyScans(LogicalOperator &op, bool in_recursive_cte,
 		}
 	}
 	for (auto &child : op.children) {
-		MarkJoinKeyScans(*child, in_recursive_cte, counts);
+		MarkJoinKeyScans(*child, recursion, counts);
 	}
 }
 
@@ -425,7 +459,7 @@ static void FuseScans(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 	FuseScansInternal(input, plan);
 	unordered_map<const DynamicTableFilterSet *, idx_t> counts;
 	CountJoinFilterTargets(*plan, counts);
-	MarkJoinKeyScans(*plan, false, counts);
+	MarkJoinKeyScans(*plan, nullptr, counts);
 }
 
 static void FuseScansInternal(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {

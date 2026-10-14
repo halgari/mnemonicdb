@@ -1,0 +1,101 @@
+# name: test/sql/assertion_evaluation.test
+# description: How a commit evaluates its assertions (several connections at once, each in one read-only transaction, parsed queries kept across commits) never changes what it reports
+# group: [sql]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/assertion_evaluation.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.person (name VARCHAR PRIMARY KEY, age INTEGER)
+
+# One errors at run time on 'Boom', three fail on 'Bad', two pass
+statement ok
+INSERT INTO d.sys.assertions (name, query) VALUES
+    ('a_boom', 'SELECT error(''boom'') FROM person WHERE name = ''Boom'''),
+    ('b_bad', 'SELECT name FROM person WHERE name = ''Bad'''),
+    ('c_ok', 'SELECT 1 WHERE false'),
+    ('d_bad_age', 'SELECT name, age FROM person WHERE name = ''Bad'''),
+    ('e_ok', 'SELECT name FROM person WHERE age > 1000'),
+    ('f_negative', 'SELECT entity FROM mnemonicdb_tx_changes() WHERE column_name = ''age'' AND added AND value::INTEGER < 0')
+
+query I
+SELECT current_setting('mnemonicdb_assertion_threads')
+----
+4
+
+#----------------------------------------------------------------------
+# Every failure is reported, in name order, however many connections
+# evaluate them; a query that fails at run time leaves its connection's
+# transaction unusable, and the assertions after it run in a new one
+#----------------------------------------------------------------------
+foreach threads 0 1 2 4 16
+
+statement ok
+SET mnemonicdb_assertion_threads = {threads}
+
+statement ok
+INSERT INTO d.person (name, age) VALUES ('Ann{threads}', 1)
+
+statement error
+INSERT INTO d.person (name, age) VALUES ('Bad', 1)
+----
+<REGEX>:.*assertion "b_bad" failed \(1 row\): \(Bad\); assertion "d_bad_age" failed \(1 row\): \(Bad, 1\).*
+
+statement error
+INSERT INTO d.person (name, age) VALUES ('Boom', 1), ('Bad', -1)
+----
+<REGEX>:.*assertion "a_boom" could not run: [^;]*boom[^;]*; assertion "b_bad" failed \(1 row\): \(Bad\); assertion "d_bad_age" failed \(1 row\): \(Bad, -1\); assertion "f_negative" failed \(1 row\): \(\d+\).*
+
+statement ok
+UPDATE d.person SET age = age + 1 WHERE name = 'Ann{threads}'
+
+endloop
+
+query I
+SELECT count(*) FROM d.person
+----
+5
+
+statement ok
+RESET mnemonicdb_assertion_threads
+
+#----------------------------------------------------------------------
+# A parsed query is reused only under the parser options it was parsed with:
+# integer_division changes what `/` means
+#----------------------------------------------------------------------
+statement ok
+INSERT INTO d.sys.assertions (name, query) VALUES ('g_division', 'SELECT 1 WHERE 7 / 2 = 3')
+
+statement ok
+INSERT INTO d.person (name, age) VALUES ('Cy', 2)
+
+statement ok
+SET GLOBAL integer_division = true
+
+statement error
+INSERT INTO d.person (name, age) VALUES ('Di', 2)
+----
+assertion "g_division" failed (1 row): (1)
+
+statement ok
+RESET GLOBAL integer_division
+
+statement ok
+INSERT INTO d.person (name, age) VALUES ('Di', 2)
+
+# A changed query is parsed again; the commit that changes it is checked with
+# the new one
+statement error
+UPDATE d.sys.assertions SET query = 'SELECT name FROM person WHERE name = ''Di''' WHERE name = 'g_division'
+----
+assertion "g_division" failed (1 row): (Di)
+
+statement ok
+UPDATE d.sys.assertions SET query = 'SELECT name FROM person WHERE name = ''Ed''' WHERE name = 'g_division'
+
+statement error
+INSERT INTO d.person (name, age) VALUES ('Ed', 2)
+----
+assertion "g_division" failed (1 row): (Ed)
