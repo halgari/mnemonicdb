@@ -33,7 +33,9 @@ struct DatomFunctionState : public GlobalTableFunctionState {
 static void RegisterDatabaseWrite(ClientContext &context, TableFunctionBindInput &input, Catalog &catalog,
                                   const char *function_name, DatabaseModificationType modification) {
 	if (!input.binder) {
-		throw InternalException("%s: bound without a binder", function_name);
+		throw BinderException(
+		    "%s: cannot be used here (it writes, and this context has no statement to record the write on)",
+		    function_name);
 	}
 	input.binder->GetStatementProperties().RegisterDBModify(catalog, context, modification);
 }

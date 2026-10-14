@@ -189,16 +189,6 @@ unique_ptr<Store> Store::Open(const string &path, bool read_only, const StoreOpt
 	CheckStatus(status, path);
 	store->db = unique_ptr<rocksdb::DB>(db.release());
 
-	// After the open: opening grows the pools to what max_background_jobs needs
-	// (one flush and one compaction thread at least). With no flush thread,
-	// RocksDB runs flushes in the compaction pool.
-	if (options.num_low_pri_threads >= 0) {
-		db_options.env->SetBackgroundThreads(options.num_low_pri_threads, rocksdb::Env::Priority::LOW);
-	}
-	if (options.num_high_pri_threads >= 0) {
-		db_options.env->SetBackgroundThreads(options.num_high_pri_threads, rocksdb::Env::Priority::HIGH);
-	}
-
 	// The default column family is unused; keep only ours, indexed by
 	// ColumnFamily
 	store->db->DestroyColumnFamilyHandle(all_handles[0]);
@@ -208,6 +198,25 @@ unique_ptr<Store> Store::Open(const string &path, bool read_only, const StoreOpt
 	store->LoadMeta(created);
 	store->LoadAttributeCounts();
 	return store;
+}
+
+void Store::ResizeThreadPools(const StoreOptions &options) {
+	// Opening a database grows the pools to what its max_background_jobs needs
+	// (one flush and one compaction thread at least), so this runs after the
+	// open. With no flush thread, RocksDB runs flushes in the compaction pool.
+	auto env = rocksdb::Env::Default();
+	if (options.num_low_pri_threads >= 0) {
+		env->SetBackgroundThreads(options.num_low_pri_threads, rocksdb::Env::Priority::LOW);
+	}
+	if (options.num_high_pri_threads >= 0) {
+		env->SetBackgroundThreads(options.num_high_pri_threads, rocksdb::Env::Priority::HIGH);
+	}
+}
+
+Store::ThreadPoolSizes Store::GetThreadPoolSizes() {
+	auto env = rocksdb::Env::Default();
+	return {env->GetBackgroundThreads(rocksdb::Env::Priority::LOW),
+	        env->GetBackgroundThreads(rocksdb::Env::Priority::HIGH)};
 }
 
 void Store::LoadMeta(bool created) {

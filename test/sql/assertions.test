@@ -456,9 +456,9 @@ assertion "broken" could not run: Invalid Input Error: boom
 # an assertion cannot write, even through a table function
 statement error
 INSERT INTO d.sys.assertions (name, query) VALUES ('broken',
-    'SELECT * FROM mnemonicdb_add(''d.person'', (SELECT id FROM person WHERE name = ''Alice''), ''age'', 1) WHERE false')
+    'SELECT * FROM mnemonicdb_add(''d.person'', mnemonicdb_make_id(16, 1), ''age'', 1) WHERE false')
 ----
-assertion "broken" could not run
+assertion "broken" could not run: TransactionContext Error: Cannot write to database ""d"" - transaction is launched in read-only mode
 
 statement error
 INSERT INTO d.sys.assertions (name) VALUES ('broken')

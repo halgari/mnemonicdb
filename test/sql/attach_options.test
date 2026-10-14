@@ -2,11 +2,33 @@
 # description: ATTACH options capping RocksDB's background threads (MN-13); invalid values are rejected
 # group: [sql]
 
+# The flush / compaction pools are process-wide, so this test changes them for
+# the tests that run after it in the same process. It only ever lowers the
+# flush pool (to 0) and never raises either pool above its default (1 each).
+# Opening any database grows both pools back to what it needs (1 each with the
+# default MAX_BACKGROUND_JOBS), so even if this test fails half-way, the next
+# ATTACH in any later test restores the defaults. The test checks that below.
+
 require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/attach_options_keep.mnemonic' AS keep (TYPE mnemonicdb)
+
+query II
+SELECT low_pri_threads, high_pri_threads FROM mnemonicdb_info('keep')
+----
+1	1
 
 # The minimum caps
 statement ok
 ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS 1, MAX_FILE_OPENING_THREADS 1, NUM_LOW_PRI_THREADS 1, NUM_HIGH_PRI_THREADS 0)
+
+# Process-wide: visible through every database
+query IIII
+SELECT d.low_pri_threads, d.high_pri_threads, k.low_pri_threads, k.high_pri_threads
+FROM mnemonicdb_info('d') d, mnemonicdb_info('keep') k
+----
+1	0	1	0
 
 statement ok
 CREATE TABLE d.t (x INTEGER)
@@ -25,12 +47,30 @@ SELECT count(*) FROM d.t
 ----
 1000
 
+# DETACH does not restore the pools
 statement ok
 DETACH d
 
+query II
+SELECT low_pri_threads, high_pri_threads FROM mnemonicdb_info('keep')
+----
+1	0
+
+# An ATTACH without the options grows them back to what it needs
+statement ok
+ATTACH '{TEST_DIR}/attach_options_other.mnemonic' AS other (TYPE mnemonicdb)
+
+query II
+SELECT low_pri_threads, high_pri_threads FROM mnemonicdb_info('keep')
+----
+1	1
+
+statement ok
+DETACH other
+
 # Values given as strings or in lower case, and a read-only attach
 statement ok
-ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, READ_ONLY, max_background_jobs '4', num_high_pri_threads 1)
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, READ_ONLY, max_background_jobs '2', num_high_pri_threads 1)
 
 query I
 SELECT count(*) FROM d.t
@@ -40,9 +80,14 @@ SELECT count(*) FROM d.t
 statement ok
 DETACH d
 
-# Back to the defaults
+# Explicitly the defaults
 statement ok
-ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS 2, NUM_LOW_PRI_THREADS 1, NUM_HIGH_PRI_THREADS 1)
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS 2, MAX_FILE_OPENING_THREADS 16, NUM_LOW_PRI_THREADS 1, NUM_HIGH_PRI_THREADS 1)
+
+query II
+SELECT low_pri_threads, high_pri_threads FROM mnemonicdb_info('keep')
+----
+1	1
 
 statement ok
 DETACH d
@@ -51,32 +96,43 @@ DETACH d
 statement error
 ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS 0)
 ----
-ATTACH option MAX_BACKGROUND_JOBS must be between 1 and 1024, got 0
+ATTACH option MAX_BACKGROUND_JOBS must be between 1 and 256, got 0
 
 statement error
 ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS -3)
 ----
-must be between 1 and 1024
+must be between 1 and 256
 
 statement error
-ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS 100000)
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS 257)
 ----
-must be between 1 and 1024
+must be between 1 and 256, got 257
+
+# Integers too large for BIGINT are out of range too, as numbers or strings
+statement error
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS 99999999999999999999999)
+----
+must be between 1 and 256, got 99999999999999999999999
+
+statement error
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS '99999999999999999999999')
+----
+must be between 1 and 256, got 99999999999999999999999
 
 statement error
 ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_FILE_OPENING_THREADS 0)
 ----
-ATTACH option MAX_FILE_OPENING_THREADS must be between 1 and 1024
+ATTACH option MAX_FILE_OPENING_THREADS must be between 1 and 256
 
 statement error
 ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, NUM_LOW_PRI_THREADS 0)
 ----
-ATTACH option NUM_LOW_PRI_THREADS must be between 1 and 1024
+ATTACH option NUM_LOW_PRI_THREADS must be between 1 and 256
 
 statement error
 ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, NUM_HIGH_PRI_THREADS -1)
 ----
-ATTACH option NUM_HIGH_PRI_THREADS must be between 0 and 1024
+ATTACH option NUM_HIGH_PRI_THREADS must be between 0 and 256
 
 statement error
 ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS 'many')
@@ -85,6 +141,11 @@ ATTACH option MAX_BACKGROUND_JOBS must be an integer
 
 statement error
 ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS 1.5)
+----
+must be an integer
+
+statement error
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS '1.5')
 ----
 must be an integer
 
@@ -98,11 +159,33 @@ ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUN
 ----
 unrecognized ATTACH option "max_background_threads"
 
-# A rejected ATTACH leaves nothing attached, and the database opens again
+# DuckDB's own storage options do not apply to MnemonicDB and are rejected
+statement error
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, BLOCK_SIZE 262144)
+----
+unrecognized ATTACH option "block_size"
+
+statement error
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, STORAGE_VERSION 'v1.0.0')
+----
+unrecognized ATTACH option
+
+statement error
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, ENCRYPTION_KEY 'secret')
+----
+unrecognized ATTACH option
+
+# A rejected ATTACH leaves nothing attached and the pools unchanged, and the
+# database opens again
 statement error
 SELECT * FROM d.t
 ----
 does not exist
+
+query II
+SELECT low_pri_threads, high_pri_threads FROM mnemonicdb_info('keep')
+----
+1	1
 
 statement ok
 ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb)

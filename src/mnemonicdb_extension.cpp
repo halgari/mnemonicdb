@@ -93,7 +93,9 @@ static mnemonicdb::StoreOptions ParseStoreOptions(const unordered_map<string, Va
 		int mnemonicdb::StoreOptions::*field;
 		int64_t min;
 	};
-	static constexpr int64_t MAX_THREADS = 1024;
+	// Each thread counts against the process's (or container's) thread limit,
+	// and the pools are process-wide, so keep a typo from starting thousands
+	static constexpr int64_t MAX_THREADS = 256;
 	static const ThreadOption THREAD_OPTIONS[] = {
 	    {"max_background_jobs", &mnemonicdb::StoreOptions::max_background_jobs, 1},
 	    {"max_file_opening_threads", &mnemonicdb::StoreOptions::max_file_opening_threads, 1},
@@ -116,22 +118,22 @@ static mnemonicdb::StoreOptions ParseStoreOptions(const unordered_map<string, Va
 		auto &input = entry.second;
 		// An integer, or a string of decimal digits; never a rounded fraction
 		bool integral = !input.IsNull() && input.type().IsIntegral();
+		string text = input.IsNull() ? "NULL" : input.ToString();
 		if (!input.IsNull() && input.type().id() == LogicalTypeId::VARCHAR) {
-			auto text = StringValue::Get(input);
 			StringUtil::Trim(text);
 			auto digits = !text.empty() && text[0] == '-' ? text.substr(1) : text;
-			integral = !digits.empty() && digits.size() <= 18 &&
+			integral = !digits.empty() &&
 			           std::all_of(digits.begin(), digits.end(), [](char c) { return c >= '0' && c <= '9'; });
 		}
-		auto value = integral ? input.DefaultTryCastAs(LogicalType::BIGINT) : optional<Value>();
-		if (!value || value->IsNull()) {
-			throw BinderException("MnemonicDB: ATTACH option %s must be an integer, got \"%s\"", upper,
-			                      input.ToString());
+		if (!integral) {
+			throw BinderException("MnemonicDB: ATTACH option %s must be an integer, got \"%s\"", upper, text);
 		}
-		auto n = value->GetValue<int64_t>();
+		// An integer too large for BIGINT is out of range too
+		auto value = input.DefaultTryCastAs(LogicalType::BIGINT);
+		auto n = value && !value->IsNull() ? value->GetValue<int64_t>() : NumericLimits<int64_t>::Maximum();
 		if (n < option->min || n > MAX_THREADS) {
-			throw BinderException("MnemonicDB: ATTACH option %s must be between %d and %d, got %d", upper, option->min,
-			                      MAX_THREADS, n);
+			throw BinderException("MnemonicDB: ATTACH option %s must be between %d and %d, got %s", upper, option->min,
+			                      MAX_THREADS, text);
 		}
 		result.*(option->field) = static_cast<int>(n);
 	}
@@ -151,7 +153,10 @@ static unique_ptr<Catalog> MnemonicAttach(optional_ptr<StorageExtensionInfo>, Cl
 	}
 	mnemonicdb::ReadView view(*store, nullptr);
 	auto schema = mnemonicdb::Schema::Load(view, context);
-	return make_uniq<MnemonicCatalog>(db, std::move(store), std::move(schema));
+	auto catalog = make_uniq<MnemonicCatalog>(db, std::move(store), std::move(schema));
+	// Last, once nothing can fail: the pools are process-wide
+	mnemonicdb::Store::ResizeThreadPools(store_options);
+	return std::move(catalog);
 }
 
 static unique_ptr<TransactionManager> MnemonicCreateTransactionManager(optional_ptr<StorageExtensionInfo>,

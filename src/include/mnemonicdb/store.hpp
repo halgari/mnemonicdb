@@ -37,7 +37,7 @@ struct StoreOptions {
 	int max_file_opening_threads = -1;
 	//! Env::SetBackgroundThreads(n, LOW / HIGH): the compaction and flush thread
 	//! pools. These pools belong to RocksDB's default Env and are shared by every
-	//! RocksDB database in the process.
+	//! RocksDB database in the process; applied by ResizeThreadPools, not Open.
 	int num_low_pri_threads = -1;
 	int num_high_pri_threads = -1;
 };
@@ -123,6 +123,16 @@ public:
 	void Compact();
 	//! Approximate on-disk size in bytes
 	uint64_t ApproximateSize();
+
+	//! Apply the pool sizes in `options` to RocksDB's process-wide flush and
+	//! compaction pools (when set)
+	static void ResizeThreadPools(const StoreOptions &options);
+	struct ThreadPoolSizes {
+		int low_pri;
+		int high_pri;
+	};
+	//! The current sizes of those pools
+	static ThreadPoolSizes GetThreadPoolSizes();
 
 private:
 	Store(string path, bool read_only);
