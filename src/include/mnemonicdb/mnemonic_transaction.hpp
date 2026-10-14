@@ -141,7 +141,12 @@ private:
 	//! Check that every named type `type` mentions is one of this database's
 	void CheckNamedTypes(const LogicalType &type) const;
 	//! CREATE OR REPLACE TYPE of an existing type: append ENUM values
-	void ReplaceType(const mnemonicdb::TypeDef &existing, const LogicalType &type);
+	void ReplaceType(const mnemonicdb::TypeDef &existing, const LogicalType &type, const string &doc);
+	//! Attributes whose column was dropped: their definition datoms remain (only
+	//! the table link is retracted) and their values are in history
+	vector<mnemonicdb::AttributeDef> DroppedAttributes(const mnemonicdb::Schema &schema, ClientContext &context);
+	//! Record on this transaction's sys.tx row that it re-encoded `attr`
+	void MarkReencoded(const mnemonicdb::AttributeDef &attr);
 
 private:
 	MnemonicCatalog &catalog;

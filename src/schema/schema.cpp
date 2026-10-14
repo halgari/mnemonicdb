@@ -1,7 +1,10 @@
 #include "mnemonicdb/schema.hpp"
 #include "mnemonicdb/tx_writer.hpp"
 
+#include "mnemonicdb/store.hpp"
+
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/parser/column_list.hpp"
@@ -104,6 +107,7 @@ static vector<BuiltinAttribute> BuiltinAttributes() {
 	    {sys::TYPES_NAME, sys::TYPES, "name", varchar, Uniqueness::NONE, false},
 	    {sys::TYPES_DEFINITION, sys::TYPES, "definition", varchar, Uniqueness::NONE, false},
 	    {sys::TYPES_DOC, sys::TYPES, "doc", varchar, Uniqueness::NONE, false},
+	    {sys::TX_REENCODED, sys::TX, "reencoded", LogicalType::LIST(RefType()), Uniqueness::NONE, false},
 	};
 }
 
@@ -174,6 +178,36 @@ bool TypeReferences(const LogicalType &type, const string &alias) {
 	}
 }
 
+static constexpr const char *DATABASE_PROPERTY = "mnemonicdb.database";
+
+string DatabaseTag(const Store &store) {
+	return std::to_string(reinterpret_cast<uintptr_t>(&store));
+}
+
+LogicalType MakeNamedType(const LogicalType &type, const string &schema, const string &name,
+                          const string &database_tag) {
+	auto info = duckdb::make_uniq<duckdb::ExtensionTypeInfo>();
+	info->properties[DATABASE_PROPERTY] = Value(database_tag);
+	return type.WithAlias(NamedTypeAlias(schema, name)).WithExtensionInfo(std::move(info));
+}
+
+string NamedTypeDatabase(const LogicalType &type) {
+	if (!type.HasExtensionInfo()) {
+		return string();
+	}
+	auto &properties = type.GetExtensionInfo()->properties;
+	auto entry = properties.find(DATABASE_PROPERTY);
+	return entry == properties.end() ? string() : entry->second.ToString();
+}
+
+LogicalType WithoutNamedTypeTag(const LogicalType &type) {
+	if (!type.HasAlias() || !IsNamedTypeAlias(type.GetAlias())) {
+		return type;
+	}
+	auto result = type.WithAlias(string());
+	return result.HasExtensionInfo() ? result.WithExtensionInfo(nullptr) : result;
+}
+
 bool IsNamedTypeAlias(const string &alias) {
 	return !alias.empty() && duckdb::QualifiedName::ParseComponents(alias).size() == 2;
 }
@@ -210,10 +244,7 @@ LogicalType StripNamedTypeAliases(const LogicalType &type) {
 		break;
 	}
 	default:
-		if (type.HasAlias() && IsNamedTypeAlias(type.GetAlias())) {
-			return type.WithAlias(string());
-		}
-		return type;
+		return WithoutNamedTypeTag(type);
 	}
 	if (type.HasAlias() && !IsNamedTypeAlias(type.GetAlias())) {
 		result = result.WithAlias(type.GetAlias());
@@ -311,8 +342,33 @@ static bool MentionsNamedType(const duckdb::ParsedExpression &expr, const Schema
 //! Resolve a parsed type expression. This database's named types are resolved
 //! here, as are the nested types that contain them; everything else binds
 //! through DuckDB (built-in types, REF, ENUM(...), DECIMAL(p,s), ...)
+//! A schema-qualified type name in `expr` that is not a named type of this
+//! database, if any
+static const duckdb::TypeExpression *UnknownNamedType(const duckdb::ParsedExpression &expr, const Schema &schema) {
+	if (expr.GetExpressionClass() != duckdb::ExpressionClass::TYPE) {
+		return nullptr;
+	}
+	auto &type_expr = expr.Cast<duckdb::TypeExpression>();
+	if (type_expr.GetQualifiedName().Path().size() >= 2 && !NamedTypeOf(type_expr, schema)) {
+		return &type_expr;
+	}
+	for (auto &child : type_expr.GetChildren()) {
+		if (auto unknown = UnknownNamedType(*child, schema)) {
+			return unknown;
+		}
+	}
+	return nullptr;
+}
+
 static LogicalType ResolveTypeExpression(const duckdb::ParsedExpression &expr, const Schema &schema,
                                          duckdb::ClientContext &context) {
+	if (auto unknown = UnknownNamedType(expr, schema)) {
+		// Stored types only ever name this database's own types: never fall back
+		// to the binder, which would find another catalog's type of that name
+		throw duckdb::IOException("MnemonicDB: stored type \"%s\" uses named type \"%s\", which this database "
+		                          "does not define",
+		                          expr.ToString(), unknown->GetQualifiedName().ToString());
+	}
 	if (!MentionsNamedType(expr, schema)) {
 		auto binder = duckdb::Binder::CreateBinder(context, nullptr);
 		auto result = LogicalType::UNBOUND(expr.Copy());
@@ -598,7 +654,8 @@ shared_ptr<Schema> Schema::Load(ReadView &view, duckdb::ClientContext &context) 
 	}
 	std::sort(user_types.begin(), user_types.end(), [](const TypeDef &a, const TypeDef &b) { return a.id < b.id; });
 	for (auto &def : user_types) {
-		def.type = schema->ParseType(def.definition, context).WithAlias(NamedTypeAlias(def.schema, def.name));
+		def.type = MakeNamedType(schema->ParseType(def.definition, context), def.schema, def.name,
+		                         DatabaseTag(view.GetStore()));
 		schema->AddType(std::move(def));
 	}
 

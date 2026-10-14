@@ -424,6 +424,7 @@ void MnemonicTransaction::AlterTable(const string &schema_name, AlterTableInfo &
 		writer.RewriteAttribute(attr, changed, [&](std::string_view v) {
 			return new_codec.EncodeValue(old_codec.DecodeValue(v).DefaultCastAs(target, true));
 		});
+		MarkReencoded(attr);
 		auto &sys_type = schema.GetAttribute(mnemonicdb::sys::ATTRIBUTES_TYPE);
 		writer.Assert(sys_type, attr.id, sys_type.codec.EncodeValue(Value(changed.declared.ToString())));
 		SetSchema(schema.WithAttribute(std::move(changed)));
@@ -670,7 +671,7 @@ void MnemonicTransaction::CheckNamedTypes(const LogicalType &type) const {
 		}
 		auto components = QualifiedName::ParseComponents(aliased.GetAlias());
 		auto def = schema.FindType(components[0].GetIdentifierName(), components[1].GetIdentifierName());
-		if (!def || def->type != aliased) {
+		if (mnemonicdb::NamedTypeDatabase(aliased) != mnemonicdb::DatabaseTag(store) || !def || def->type != aliased) {
 			throw BinderException("MnemonicDB: type \"%s\" is not a type of this database; a column can only use "
 			                      "named types from its own database",
 			                      aliased.GetAlias());
@@ -739,7 +740,7 @@ optional_ptr<CatalogEntry> MnemonicTransaction::CreateType(const string &schema_
 		throw NotImplementedException("MnemonicDB: a named type cannot be REF");
 	}
 	// A named type defined as another named type is a copy of its definition
-	auto type = info.type.HasAlias() ? info.type.WithAlias(string()) : info.type;
+	auto type = mnemonicdb::WithoutNamedTypeTag(info.type);
 	CheckNamedTypes(type);
 	// Throws for types the store cannot encode
 	mnemonicdb::ValueCodec codec(type.id() == LogicalTypeId::LIST ? ListType::GetChildType(type) : type);
@@ -749,7 +750,7 @@ optional_ptr<CatalogEntry> MnemonicTransaction::CreateType(const string &schema_
 		case OnCreateConflict::IGNORE_ON_CONFLICT:
 			return nullptr;
 		case OnCreateConflict::REPLACE_ON_CONFLICT:
-			ReplaceType(*existing, type);
+			ReplaceType(*existing, type, info.comment.IsNull() ? existing->doc : info.comment.ToString());
 			return generation->GetType(schema_name, type_name);
 		default:
 			throw CatalogException::EntryAlreadyExists(CatalogType::TYPE_ENTRY, info.GetTypeName());
@@ -766,16 +767,55 @@ optional_ptr<CatalogEntry> MnemonicTransaction::CreateType(const string &schema_
 	if (!info.comment.IsNull()) {
 		def.doc = info.comment.ToString();
 	}
-	def.type = type.WithAlias(mnemonicdb::NamedTypeAlias(def.schema, def.name));
+	def.type = mnemonicdb::MakeNamedType(type, def.schema, def.name, mnemonicdb::DatabaseTag(store));
 	mnemonicdb::Schema::WriteType(writer, schema, def);
 	SetSchema(schema.WithType(std::move(def)));
 	statement.Commit();
 	return generation->GetType(schema_name, type_name);
 }
 
-void MnemonicTransaction::ReplaceType(const mnemonicdb::TypeDef &existing, const LogicalType &type) {
-	auto old_type = existing.type.WithAlias(string());
+void MnemonicTransaction::MarkReencoded(const mnemonicdb::AttributeDef &attr) {
+	auto &marker = GetSchema().GetAttribute(mnemonicdb::sys::TX_REENCODED);
+	GetWriter().Assert(marker, CurrentTxEntity(), marker.codec.EncodeValue(Value::UBIGINT(attr.id)));
+}
+
+vector<mnemonicdb::AttributeDef> MnemonicTransaction::DroppedAttributes(const mnemonicdb::Schema &schema,
+                                                                        ClientContext &context) {
+	vector<mnemonicdb::AttributeDef> result;
+	auto &view = GetReadView();
+	auto &sys_type = schema.GetAttribute(mnemonicdb::sys::ATTRIBUTES_TYPE);
+	auto &sys_name = schema.GetAttribute(mnemonicdb::sys::ATTRIBUTES_NAME);
+	for (auto &datom :
+	     view.ScanPrefix(mnemonicdb::ColumnFamily::AEVT, mnemonicdb::AevtPrefix(mnemonicdb::sys::ATTRIBUTES_TYPE))) {
+		auto local = static_cast<mnemonicdb::AttrId>(mnemonicdb::LocalOf(datom.e));
+		if (local < 64 || schema.FindAttributeById(local)) {
+			continue;
+		}
+		auto names = view.ScanPrefix(mnemonicdb::ColumnFamily::EAVT,
+		                             mnemonicdb::EavtPrefix(datom.e, mnemonicdb::sys::ATTRIBUTES_NAME));
+		auto name = names.empty() ? string() : sys_name.codec.DecodeValue(names[0].v).ToString();
+		// An index's AVET entries moved to avet_hist when the column was dropped
+		bool had_avet = !view.ScanPrefix(mnemonicdb::ColumnFamily::AVET_HIST, mnemonicdb::AvetPrefix(local)).empty();
+		result.emplace_back(datom.e, 0, name, schema.ParseType(sys_type.codec.DecodeValue(datom.v).ToString(), context),
+		                    mnemonicdb::Uniqueness::NONE, had_avet);
+	}
+	return result;
+}
+
+void MnemonicTransaction::ReplaceType(const mnemonicdb::TypeDef &existing, const LogicalType &type, const string &doc) {
+	auto old_type = mnemonicdb::WithoutNamedTypeTag(existing.type);
 	if (old_type == type) {
+		if (doc != existing.doc) {
+			auto &writer = GetWriter();
+			MnemonicStatement statement(*this);
+			auto &schema = GetSchema();
+			auto &sys_doc = schema.GetAttribute(mnemonicdb::sys::TYPES_DOC);
+			writer.Assert(sys_doc, existing.id, sys_doc.codec.EncodeValue(Value(doc)));
+			auto changed = existing;
+			changed.doc = doc;
+			SetSchema(schema.WithoutType(existing.id)->WithType(std::move(changed)));
+			statement.Commit();
+		}
 		return;
 	}
 	auto qualified = existing.schema + "." + existing.name;
@@ -808,8 +848,15 @@ void MnemonicTransaction::ReplaceType(const mnemonicdb::TypeDef &existing, const
 	auto &old_schema = GetSchema();
 	auto &writer = GetWriter();
 	MnemonicStatement statement(*this);
+	// Columns dropped earlier keep their values in history, decoded with the
+	// type they were declared with: they are re-encoded too
+	auto old_dropped = DroppedAttributes(old_schema, *client);
 	auto &sys_definition = old_schema.GetAttribute(mnemonicdb::sys::TYPES_DEFINITION);
 	writer.Assert(sys_definition, existing.id, sys_definition.codec.EncodeValue(Value(type.ToString())));
+	if (doc != existing.doc) {
+		auto &sys_doc = old_schema.GetAttribute(mnemonicdb::sys::TYPES_DOC);
+		writer.Assert(sys_doc, existing.id, sys_doc.codec.EncodeValue(Value(doc)));
+	}
 	// Every type and attribute using the type is re-resolved by name. Old
 	// dictionary indexes stay valid, so stored values only need re-encoding where
 	// an ENUM grew past its physical width (e.g. 256 values)
@@ -825,6 +872,22 @@ void MnemonicTransaction::ReplaceType(const mnemonicdb::TypeDef &existing, const
 		writer.RewriteAttribute(*old_attr, new_attr, [&](std::string_view v) {
 			return new_codec.EncodeValue(old_codec.DecodeValue(v).DefaultCastAs(target, true));
 		});
+		MarkReencoded(*old_attr);
+	}
+	for (auto &old_attr : old_dropped) {
+		mnemonicdb::AttributeDef new_attr(old_attr.id, 0, old_attr.name,
+		                                  new_schema->ParseType(old_attr.declared.ToString(), *client),
+		                                  mnemonicdb::Uniqueness::NONE, old_attr.indexed);
+		if (SameEncoding(old_attr.value_type, new_attr.value_type)) {
+			continue;
+		}
+		auto &old_codec = old_attr.codec;
+		auto &new_codec = new_attr.codec;
+		auto &target = new_attr.value_type;
+		writer.RewriteAttribute(old_attr, new_attr, [&](std::string_view v) {
+			return new_codec.EncodeValue(old_codec.DecodeValue(v).DefaultCastAs(target, true));
+		});
+		MarkReencoded(old_attr);
 	}
 	SetSchema(std::move(new_schema));
 	statement.Commit();
@@ -849,9 +912,22 @@ void MnemonicTransaction::DropType(const string &schema_name, const string &type
 		}
 	}
 	for (auto other : schema.AllTypes()) {
-		if (other->id != def->id && mnemonicdb::TypeReferences(other->type.WithAlias(string()), alias)) {
+		if (other->id != def->id && mnemonicdb::TypeReferences(mnemonicdb::WithoutNamedTypeTag(other->type), alias)) {
 			throw CatalogException("MnemonicDB: type \"%s.%s\" cannot be dropped: type \"%s.%s\" uses it", def->schema,
 			                       def->name, other->schema, other->name);
+		}
+	}
+	// Dropped columns' history is decoded with their declared type, so a type
+	// stays as long as any column ever used it
+	auto client = context.lock();
+	if (!client) {
+		throw InternalException("MnemonicDB: no client context");
+	}
+	for (auto &dropped : DroppedAttributes(schema, *client)) {
+		if (mnemonicdb::TypeReferences(dropped.declared, alias)) {
+			throw CatalogException("MnemonicDB: type \"%s.%s\" cannot be dropped: dropped column \"%s\" still has "
+			                       "history that uses it",
+			                       def->schema, def->name, dropped.name);
 		}
 	}
 	auto &writer = GetWriter();

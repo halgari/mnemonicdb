@@ -18,6 +18,7 @@ using duckdb::vector;
 
 class TxWriter;
 class ReadView;
+class Store;
 
 enum class Uniqueness : uint8_t { NONE, VALUE, IDENTITY };
 
@@ -98,6 +99,17 @@ struct TypeDef {
 //! The alias a named type carries: its schema-qualified name, quoted where
 //! needed, e.g. `core.layer`
 string NamedTypeAlias(const string &schema, const string &name);
+//! The type of a named type of this database: `type` carrying the alias
+//! `schema.name`, tagged with the database it belongs to (`DatabaseTag`), so a
+//! named type of another database with the same name is told apart
+LogicalType MakeNamedType(const LogicalType &type, const string &schema, const string &name,
+                          const string &database_tag);
+//! Identifies one open database (its store) within the process
+string DatabaseTag(const Store &store);
+//! The database tag a named type carries, or empty
+string NamedTypeDatabase(const LogicalType &type);
+//! `type` without its own alias and tag (its children keep theirs)
+LogicalType WithoutNamedTypeTag(const LogicalType &type);
 //! Whether `type` mentions the named type with `alias` anywhere in it
 bool TypeReferences(const LogicalType &type, const string &alias);
 //! Whether `alias` is a named-type alias (schema-qualified), rather than an
@@ -220,6 +232,9 @@ static constexpr AttrId TYPES_SCHEMA = 17;
 static constexpr AttrId TYPES_NAME = 18;
 static constexpr AttrId TYPES_DEFINITION = 19;
 static constexpr AttrId TYPES_DOC = 20;
+//! sys.tx: the attributes whose stored values (history and txlog included) the
+//! transaction re-encoded, e.g. by ALTER COLUMN TYPE or an ENUM growing wider
+static constexpr AttrId TX_REENCODED = 21;
 } // namespace sys
 
 } // namespace mnemonicdb

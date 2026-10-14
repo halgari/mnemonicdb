@@ -37,6 +37,30 @@ static void Bootstrap(mnemonicdb::Store &store) {
 	store.ReleaseWriter();
 }
 
+//! A database created by an older version lacks the datoms describing built-ins
+//! added since (e.g. sys.schemas and its `main`/`sys` rows). On a read-write
+//! attach, write whichever are missing, once, in one transaction. Asserting a
+//! datom that is already current is a no-op, so this rewrites nothing that is
+//! there; when nothing is missing no transaction is written.
+static void UpgradeBuiltins(mnemonicdb::Store &store) {
+	store.AcquireWriter();
+	try {
+		auto tx = store.GetLastTx() + 1;
+		mnemonicdb::TxWriter writer(store, nullptr, tx);
+		mnemonicdb::Schema::WriteBootstrap(writer);
+		writer.FinishStatement();
+		if (writer.HasChanges()) {
+			auto instant = MaxValue<int64_t>(Timestamp::GetCurrentTimestamp().value, store.GetLastInstant() + 1);
+			mnemonicdb::Schema::WriteTxEntity(writer, *mnemonicdb::Schema::Builtin(), tx, instant);
+			store.Commit(writer.GetWriteBatch(), tx, instant, writer.GetCountDeltas());
+		}
+	} catch (...) {
+		store.ReleaseWriter();
+		throw;
+	}
+	store.ReleaseWriter();
+}
+
 static unique_ptr<Catalog> MnemonicAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
                                           AttachedDatabase &db, const string &, AttachInfo &info,
                                           AttachOptions &options) {
@@ -44,6 +68,8 @@ static unique_ptr<Catalog> MnemonicAttach(optional_ptr<StorageExtensionInfo>, Cl
 	auto store = mnemonicdb::Store::Open(info.path, read_only);
 	if (store->WasCreated()) {
 		Bootstrap(*store);
+	} else if (!read_only) {
+		UpgradeBuiltins(*store);
 	}
 	mnemonicdb::ReadView view(*store, nullptr);
 	auto schema = mnemonicdb::Schema::Load(view, context);

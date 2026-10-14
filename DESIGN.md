@@ -390,8 +390,9 @@ commits nothing and gets no `sys.tx` row. "Changed" means at least one
 - **Explicit ids must exist.** An explicit `id`, a REF value, or the entity
   given to `mnemonicdb_add` must name an allocated entity. New entities come
   from `tempid()` or an omitted `id`. Explicit ids therefore never collide
-  with later allocations and never move the counters. Partitions 4–15 and
-  255 are rejected.
+  with later allocations and never move the counters. Partitions 4–15
+  (including partition 4, schema objects) and 255 are rejected, in INSERT,
+  REF values and `mnemonicdb_add` alike.
 
 - **ON CONFLICT** is rewritten by DuckDB into MERGE INTO, which plans
   through our INSERT/UPDATE/DELETE operators. It finds conflict targets
@@ -425,7 +426,7 @@ everything else. Each attached database has a `sys` schema:
 |------------------|----------------------------------------------------------------|
 | `sys.tables`     | `schema`, `name`, `doc`                                        |
 | `sys.attributes` | `table_id REF`, `name`, `type` (DuckDB type string; a top-level LIST means cardinality-many), `uniqueness` (`value`/`identity`, NULL for none), `indexed`, `index` (index name), `doc` |
-| `sys.tx`         | `instant TIMESTAMPTZ`; users may `ALTER TABLE sys.tx ADD COLUMN` |
+| `sys.tx`         | `instant TIMESTAMPTZ`, `reencoded REF[]` (attributes whose stored values the transaction re-encoded, §7b); users may `ALTER TABLE sys.tx ADD COLUMN` |
 | `sys.assertions` | `name` (unique identity), `query`, `doc`: commit assertions, see §7a |
 | `sys.schemas`    | `name` (unique identity), `doc`: see §7b                       |
 | `sys.types`      | `schema`, `name`, `definition` (DuckDB type string), `doc`: named types, see §7b |
@@ -502,11 +503,10 @@ INSERT INTO d.sys.assertions (name, query, doc) VALUES
   not reload the schema. History is visible through `AT` and
   `mnemonicdb_history('d', table_name := 'sys.assertions')`.
   `mnemonicdb_add`/`mnemonicdb_retract` still refuse sys tables.
-- **Old databases.** Databases created before sys.assertions existed get the
-  table from code (built-in tables are never loaded from data), but their
-  bootstrap transaction did not write its descriptive datoms, so it has no
-  `sys.tables` row and its attributes have no `sys.attributes` rows there.
-  It works normally otherwise.
+- **Old databases.** Built-in tables are never loaded from data, so a
+  database created before sys.assertions existed gets the table from code.
+  Its descriptive datoms (`sys.tables` / `sys.attributes` rows) are written
+  by the first read-write attach of a newer version, see "Upgrading" in §7b.
 - **Scope.** Assertions run only when the committing transaction changed at
   least one datom (the net-empty check in §6). Read-only transactions and
   transactions whose writes cancel out evaluate none. A transaction that adds,
@@ -587,8 +587,17 @@ USE d.core;  -- unqualified names now resolve in core
   `sys.schemas.name` datom (unique identity) and optionally `doc`. `main`
   and `sys` are built in. CREATE SCHEMA writes the datoms in the creating
   transaction, so schemas have history (`AT`, `mnemonicdb_history('d',
-  table_name := 'sys.schemas')`) like tables. Databases created before
-  sys.schemas existed get it, and the `main`/`sys` rows, from code.
+  table_name := 'sys.schemas')`) like tables.
+- **Upgrading.** A database written by an older version (e.g. before
+  sys.schemas and sys.types) gets the missing built-in tables from code, so a
+  read-only attach works, but its `sys.schemas` has no rows. The first
+  read-write attach writes every missing built-in datom (the `main`/`sys`
+  rows, the `sys.tables` rows of the new tables, their attributes and
+  `sys.tx.reencoded`) in one transaction. It re-asserts the whole bootstrap
+  description, and since asserting a current datom is a no-op only the
+  missing ones are written; if none are missing no transaction is written.
+  `test/data/legacy_f456677` is a database written by f456677, used by
+  `test/sql/upgrade.test`.
 - **Tables** keep referring to their schema by name (`sys.tables.schema`).
   A table's identity is its entity ID and its attributes are keyed by their
   own IDs, so the same table name in two schemas never collides: the codec
@@ -608,10 +617,17 @@ USE d.core;  -- unqualified names now resolve in core
 - **Catalog.** The `Schema` snapshot holds the schemas and types; each catalog
   generation builds table and type entries for every schema in it. Schema
   catalog entries carry only a name and read everything through the
-  transaction's generation, so the catalog keeps one entry per name, created
-  on first use and never freed (DuckDB can hold an entry across a schema
-  change). A schema created in a transaction is visible only to it until
-  commit.
+  transaction's generation, so the catalog keeps one entry per exact name,
+  created on first use and never freed (DuckDB can hold an entry across a
+  schema change). Lookups are case-insensitive; a schema dropped and created
+  again in different case gets an entry spelled the new way. A schema created
+  in a transaction is visible only to it until commit.
+- **Cost of DDL.** Every DDL statement builds a new catalog generation: new
+  table, index and type entries for the whole database (the `Schema`
+  snapshot is copied, and an ENUM append re-reads it from the store). Many
+  DDL statements in one transaction therefore cost O(statements × schema
+  size); fine for migrations of hundreds of tables, not for thousands of
+  statements.
 
 ### Named types
 
@@ -626,14 +642,22 @@ CREATE TABLE d.mods.plugins (name VARCHAR, layer d.core.layer, conds d.core.cond
   which other named types appear by qualified name (`STRUCT(layer
   core.layer, priority INTEGER)`). Any type the codec supports can be named
   (ENUM, STRUCT, UNION, LIST, MAP, ...), except REF. A type defined as another
-  named type (`AS d.core.layer`) copies its definition.
+  named type (`CREATE TYPE d.core.b AS d.core.layer`) copies its
+  definition: `b` is a separate type that does not follow later appends to
+  `layer`.
 - **Columns** record the named type by reference: `sys.attributes.type` is
   `core.layer`, `core.cond[]`, `MAP(VARCHAR, core.layer)` and so on. On load,
   types are resolved in creation order, then column types; nested types that
   contain named types are rebuilt by MnemonicDB, everything else binds
-  through DuckDB. A column can use types of any schema of the same database;
-  a named type of another MnemonicDB database is refused. A DuckDB type from
-  another catalog (e.g. `memory.main.colour`) is copied structurally.
+  through DuckDB. A schema-qualified name in a stored type string is resolved
+  **only** among this database's named types, never through DuckDB's lookup
+  (which could find another catalog's type of the same name); a missing one
+  is an error. A column can use types of any schema of the same database. A
+  named type of another MnemonicDB database is refused even when its name and
+  definition match: our named types carry a tag of the database (store) they
+  belong to, and the tag must be this database's. A DuckDB type from another
+  catalog (e.g. `memory.main.colour`) has no identity here and is copied
+  structurally.
 - **What DuckDB sees.** Internally a named type carries the alias
   `schema.name`, which is how CREATE TABLE tells us which named type a column
   used. Column types exposed to DuckDB have those aliases stripped, exactly as
@@ -659,9 +683,27 @@ CREATE TABLE d.mods.plugins (name VARCHAR, layer d.core.layer, conds d.core.cond
   every column and type using the ENUM, at any depth, picks up the new values
   by name. Stored values are re-encoded (as by ALTER COLUMN TYPE, history and
   txlog included) only where the ENUM's physical width changes, i.e. when it
-  grows past 255 or 65,535 values.
-- **DROP TYPE** drops a type no column and no other type uses; CASCADE is
-  refused. The definition stays in history.
+  grows past 255 or 65,535 values. Every attribute ever declared with the
+  type is re-encoded: live columns and **dropped** columns, whose values live
+  on in history (found as attributes with a `sys.attributes.type` but no
+  table link).
+- **Past revisions decode with the current definition.** `AT`, history and
+  `mnemonicdb_tx_changes` always decode values with the type as it is now
+  (§7, "History"). For named types that is safe: an ENUM only ever grows, so
+  an old dictionary index means the same value under the new definition, and
+  a width change re-encodes every stored use. The price is that a width
+  change rewrites the bytes of old transactions' `txlog` entries (and
+  `_hist` entries): the datoms are the same, their encoding is not. The
+  migrating transaction lists the attributes it re-encoded in
+  `sys.tx.reencoded`, as does ALTER COLUMN TYPE.
+- **DROP TYPE** drops a type that no column, no dropped column with history,
+  and no other type uses; CASCADE is refused. Keeping the type while a
+  dropped column's history needs it is simpler than keeping dropped
+  definitions around for decoding, and keeps the rule "past revisions decode
+  with the current definition". The definition stays in history.
+- **COMMENT.** `CREATE OR REPLACE TYPE` writes the type's `doc` when the
+  statement carries a comment (DuckDB's parser does not produce one for
+  CREATE TYPE at the pinned commit, and `COMMENT ON TYPE` is not supported).
 - `duckdb_types()` lists named types.
 
 ## 8. Code layout (planned)

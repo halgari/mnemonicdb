@@ -58,7 +58,9 @@ static unique_ptr<FunctionData> DatomBind(ClientContext &context, TableFunctionB
 	}
 	auto entity = input.inputs[1].DefaultCastAs(LogicalType::UBIGINT).GetValue<uint64_t>();
 	if (!mnemonicdb::IsWellFormed(entity) || mnemonicdb::IsTempid(entity) ||
-	    mnemonicdb::PartitionOf(entity) < mnemonicdb::partition::DB) {
+	    mnemonicdb::PartitionOf(entity) < mnemonicdb::partition::DB ||
+	    (mnemonicdb::PartitionOf(entity) >= mnemonicdb::partition::FIRST_RESERVED &&
+	     mnemonicdb::PartitionOf(entity) < mnemonicdb::partition::FIRST_USER)) {
 		throw BinderException("%s: %d is not a valid entity ID", function_name, entity);
 	}
 	auto column = input.inputs[2].GetValue<string>();

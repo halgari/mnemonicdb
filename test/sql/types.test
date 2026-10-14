@@ -563,3 +563,267 @@ SELECT layer FROM d.mods.more ORDER BY layer
 ----
 system
 late
+
+#
+# History stays readable across type changes (a separate database)
+#
+
+statement ok
+ATTACH '{TEST_DIR}/types_history.mnemonic' AS h (TYPE mnemonicdb)
+
+# tx 2, 3, 4
+statement ok
+CREATE SCHEMA h.core
+
+statement ok
+CREATE TYPE h.core.wide AS ENUM (SELECT 'w' || range::VARCHAR FROM range(255))
+
+statement ok
+CREATE TYPE h.core.small AS ENUM ('a', 'b')
+
+# tx 5
+statement ok
+CREATE TABLE h.core.t (k VARCHAR PRIMARY KEY, w h.core.wide, gone h.core.wide, gone_list h.core.wide[], u UNION(n INTEGER, w h.core.wide), m MAP(VARCHAR, h.core.wide), gone_small h.core.small)
+
+# tx 6, 7
+statement ok
+INSERT INTO h.core.t (k, w, gone, gone_list, u, m, gone_small) VALUES ('a', 'w3', 'w7', ['w1', 'w254'], union_value(w := 'w9'), MAP {'x': 'w11'}, 'b')
+
+statement ok
+UPDATE h.core.t SET w = 'w200' WHERE k = 'a'
+
+# tx 8, 9, 10: dropped columns keep their values in history
+statement ok
+ALTER TABLE h.core.t DROP COLUMN gone
+
+statement ok
+ALTER TABLE h.core.t DROP COLUMN gone_list
+
+statement ok
+ALTER TABLE h.core.t DROP COLUMN gone_small
+
+# A type stays while a dropped column's history uses it
+statement error
+DROP TYPE h.core.small
+----
+dropped column "gone_small" still has history that uses it
+
+# tx 11: crossing 255 values widens the ENUM: every use is re-encoded, live or dropped
+statement ok
+CREATE OR REPLACE TYPE h.core.wide AS ENUM (SELECT 'w' || range::VARCHAR FROM range(300))
+
+# The migrating transaction records which attributes it re-encoded
+query T
+SELECT list_sort(list_transform(reencoded, lambda a: mnemonicdb_id_local(a))) FROM h.sys.tx WHERE mnemonicdb_id_local(id) = 11
+----
+[65, 66, 67, 68, 69]
+
+statement ok
+INSERT INTO h.core.t (k, w, u, m) VALUES ('b', 'w299', union_value(w := 'w256'), MAP {'y': 'w255'})
+
+query TTTT
+SELECT k, w, u, m FROM h.core.t ORDER BY k
+----
+a	w200	w9	{x=w11}
+b	w299	w256	{y=w255}
+
+query TT
+SELECT k, w FROM h.core.t AT (VERSION => 6)
+----
+a	w3
+
+query TTT
+SELECT column_name, value::VARCHAR, added FROM mnemonicdb_history('h', table_name := 'core.t') WHERE tx <= 10 ORDER BY tx, column_name, added
+----
+gone	w7	true
+gone_list	w1	true
+gone_list	w254	true
+gone_small	b	true
+k	a	true
+m	[{'key': x, 'value': w11}]	true
+u	w9	true
+w	w3	true
+w	w3	false
+w	w200	true
+gone	w7	false
+gone_list	w1	false
+gone_list	w254	false
+gone_small	b	false
+
+query I
+SELECT count(*) FROM mnemonicdb_history('h', schema_name := 'core')
+----
+18
+
+query TT
+SELECT column_name, value::VARCHAR FROM mnemonicdb_history('h', schema_name := 'core', table_name := 't', column_name := 'w') ORDER BY tx, added
+----
+w	w3
+w	w3
+w	w200
+w	w299
+
+# Stored type strings resolve only against this database: a same-named type
+# elsewhere is never used, and a missing one is an error
+statement ok
+CREATE SCHEMA memory.core
+
+statement ok
+CREATE TYPE memory.core.small AS ENUM ('x', 'y', 'z')
+
+query TT
+SELECT column_name, value::VARCHAR FROM mnemonicdb_history('h', table_name := 'core.t', column_name := NULL) WHERE column_name = 'gone_small' ORDER BY added DESC
+----
+gone_small	b
+gone_small	b
+
+statement error
+INSERT INTO h.sys.attributes (table_id, name, type) SELECT id, 'ghost', 'core.nothere' FROM h.sys.tables WHERE name = 't'
+----
+uses named type "core.nothere", which this database does not define
+
+statement ok
+DETACH h
+
+statement ok
+ATTACH '{TEST_DIR}/types_history.mnemonic' AS h (TYPE mnemonicdb)
+
+query TT
+SELECT k, w FROM h.core.t AT (VERSION => 7)
+----
+a	w200
+
+query I
+SELECT count(*) FROM mnemonicdb_history('h', table_name := 'core.t')
+----
+18
+
+#
+# A named type of another database is refused even when name and definition match
+#
+
+statement ok
+CREATE SCHEMA e.core
+
+statement ok
+CREATE TYPE e.core.small AS ENUM ('a', 'b')
+
+statement error
+CREATE TABLE h.core.bad (s e.core.small)
+----
+is not a type of this database
+
+statement ok
+CREATE TABLE h.core.good (s h.core.small)
+
+#
+# Transactions: CREATE TYPE / DROP TYPE roll back, and other connections see a type only after commit
+#
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TYPE h.core.temp AS ENUM ('t')
+
+statement ok
+CREATE TABLE h.core.uses_temp (t h.core.temp)
+
+statement error con2
+CREATE TABLE h.core.other (t h.core.temp)
+----
+temp
+
+statement ok
+ROLLBACK
+
+statement error
+CREATE TABLE h.core.other (t h.core.temp)
+----
+temp
+
+query I
+SELECT count(*) FROM h.sys.types WHERE name = 'temp'
+----
+0
+
+statement ok
+CREATE TYPE h.core.unused AS ENUM ('u')
+
+statement ok
+BEGIN
+
+statement ok
+DROP TYPE h.core.unused
+
+query I
+SELECT count(*) FROM h.sys.types WHERE name = 'unused'
+----
+0
+
+statement ok
+ROLLBACK
+
+query I
+SELECT count(*) FROM h.sys.types WHERE name = 'unused'
+----
+1
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TYPE h.core.later AS ENUM ('l')
+
+query I con2
+SELECT count(*) FROM duckdb_types() WHERE database_name = 'h' AND type_name = 'later'
+----
+0
+
+statement error con2
+CREATE TABLE h.core.too_early (l h.core.later)
+----
+later
+
+statement ok
+COMMIT
+
+query I con2
+SELECT count(*) FROM duckdb_types() WHERE database_name = 'h' AND type_name = 'later'
+----
+1
+
+statement ok con2
+CREATE TABLE h.core.uses_later (l h.core.later)
+
+#
+# A commit assertion over a table using a named type
+#
+
+statement ok
+INSERT INTO h.sys.assertions (name, query) VALUES ('no_w0', 'SELECT k FROM core.t WHERE w = ''w0''')
+
+statement error
+INSERT INTO h.core.t (k, w) VALUES ('z', 'w0')
+----
+assertion "no_w0" failed (1 row): (z)
+
+statement ok
+INSERT INTO h.core.t (k, w) VALUES ('z', 'w1')
+
+#
+# Reserved partitions (4 = schema objects) cannot be written by users
+#
+
+statement ok
+SET VARIABLE core_schema = (SELECT id FROM h.sys.schemas WHERE name = 'core')
+
+statement error
+CALL mnemonicdb_add('h.core.t', getvariable('core_schema'), 'k', 'zzz')
+----
+not a valid entity ID
+
+statement error
+INSERT INTO h.core.t (id, k) VALUES (getvariable('core_schema'), 'zzz')
+----
+reserved partition

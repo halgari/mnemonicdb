@@ -46,6 +46,7 @@ types	schema	VARCHAR
 types	name	VARCHAR
 types	definition	VARCHAR
 types	doc	VARCHAR
+tx	reencoded	REF[]
 
 # Built-in IDs: tables in partition 1, attributes in partition 0, the bootstrap tx in partition 2
 query II

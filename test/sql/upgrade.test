@@ -1,0 +1,155 @@
+# name: test/sql/upgrade.test
+# description: A database created before sys.schemas / sys.types (commit f456677) opens, and a read-write attach writes the missing built-in datoms once
+# group: [sql]
+
+require mnemonicdb
+
+# The fixture is the RocksDB directory written by f456677: a person table
+# (5 transactions, one commit assertion). The sqllogictest runner can only
+# gunzip single files into existing directories, so a partitioned COPY makes
+# the directory first; RocksDB ignores the stray CSV file.
+statement ok
+COPY (SELECT 'legacy.mnemonic' AS dir, 1 AS x) TO '{TEST_DIR}/upgrade' (FORMAT csv, PARTITION_BY (dir))
+
+unzip test/data/legacy_f456677/CURRENT.gz {TEST_DIR}/upgrade/dir=legacy.mnemonic/CURRENT
+
+unzip test/data/legacy_f456677/IDENTITY.gz {TEST_DIR}/upgrade/dir=legacy.mnemonic/IDENTITY
+
+unzip test/data/legacy_f456677/MANIFEST-000005.gz {TEST_DIR}/upgrade/dir=legacy.mnemonic/MANIFEST-000005
+
+unzip test/data/legacy_f456677/OPTIONS-000007.gz {TEST_DIR}/upgrade/dir=legacy.mnemonic/OPTIONS-000007
+
+unzip test/data/legacy_f456677/000004.log.gz {TEST_DIR}/upgrade/dir=legacy.mnemonic/000004.log
+
+# Read-only: built-ins come from code; nothing is written
+statement ok
+ATTACH '{TEST_DIR}/upgrade/dir=legacy.mnemonic' AS d (TYPE mnemonicdb, READ_ONLY)
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+5
+
+query T
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'd' ORDER BY ALL
+----
+main
+sys
+
+query I
+SELECT count(*) FROM d.sys.schemas
+----
+0
+
+query TIT
+SELECT name, age, mood FROM d.person ORDER BY name
+----
+Alice	31	happy
+Bob	40	sad
+
+statement ok
+DETACH d
+
+# Read-write: one upgrade transaction adds the missing datoms
+statement ok
+ATTACH '{TEST_DIR}/upgrade/dir=legacy.mnemonic' AS d (TYPE mnemonicdb)
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+6
+
+query TII
+SELECT name, mnemonicdb_id_partition(id), mnemonicdb_id_local(id) FROM d.sys.schemas ORDER BY id
+----
+main	4	1
+sys	4	2
+
+query TT
+SELECT schema, name FROM d.sys.tables ORDER BY id
+----
+sys	tables
+sys	attributes
+sys	tx
+sys	assertions
+sys	schemas
+sys	types
+main	person
+
+query TTT
+SELECT t.name, a.name, mnemonicdb_id_local(a.id) FROM d.sys.attributes a JOIN d.sys.tables t ON a.table_id = t.id WHERE mnemonicdb_id_local(a.id) >= 15 AND t.schema = 'sys' ORDER BY a.id
+----
+schemas	name	15
+schemas	doc	16
+types	schema	17
+types	name	18
+types	definition	19
+types	doc	20
+tx	reencoded	21
+
+# Only the missing datoms were written
+query TTT
+SELECT DISTINCT table_name, column_name, added FROM mnemonicdb_history('d', since := 6) WHERE table_name <> 'tx' ORDER BY ALL
+----
+attributes	name	true
+attributes	table_id	true
+attributes	type	true
+attributes	uniqueness	true
+schemas	doc	true
+schemas	name	true
+tables	doc	true
+tables	name	true
+tables	schema	true
+
+query I
+SELECT count(*) FROM mnemonicdb_history('d', since := 6) WHERE table_name = 'person' OR value::VARCHAR IN ('person', 'assertions')
+----
+0
+
+# Data, history and the old assertion are intact
+query TIT
+SELECT name, age, mood FROM d.person ORDER BY name
+----
+Alice	31	happy
+Bob	40	sad
+
+query TI
+SELECT name, age FROM d.person AT (VERSION => 3) ORDER BY name
+----
+Alice	30
+Bob	40
+
+statement error
+INSERT INTO d.person (name, age) VALUES ('Kid', 5)
+----
+assertion "adult" failed
+
+# The new features work on the upgraded database
+statement ok
+CREATE SCHEMA d.core
+
+statement ok
+CREATE TYPE d.core.layer AS ENUM ('a', 'b')
+
+statement ok
+CREATE TABLE d.core.files (path VARCHAR, layer d.core.layer)
+
+statement ok
+INSERT INTO d.core.files (path, layer) VALUES ('x', 'b')
+
+statement ok
+DETACH d
+
+# A second read-write attach writes nothing
+statement ok
+ATTACH '{TEST_DIR}/upgrade/dir=legacy.mnemonic' AS d (TYPE mnemonicdb)
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+10
+
+query TT
+SELECT path, layer FROM d.core.files
+----
+x	b

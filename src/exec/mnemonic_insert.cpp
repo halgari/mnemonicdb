@@ -172,7 +172,9 @@ static void CheckSysEntity(MnemonicTransaction &transaction, const MnemonicTable
 	auto id = table.GetTableDef().id;
 	// sys.assertions rows are ordinary entities, like rows of user tables
 	if (table.GetTableDef().schema != "sys" || id == mnemonicdb::sys::ASSERTIONS) {
-		if (mnemonicdb::PartitionOf(entity) < mnemonicdb::partition::DB) {
+		auto part = mnemonicdb::PartitionOf(entity);
+		if (part < mnemonicdb::partition::DB ||
+		    (part >= mnemonicdb::partition::FIRST_RESERVED && part < mnemonicdb::partition::FIRST_USER)) {
 			throw InvalidInputException("MnemonicDB: entity %d is in a system partition", entity);
 		}
 		return;

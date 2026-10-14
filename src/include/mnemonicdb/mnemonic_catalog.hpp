@@ -121,9 +121,10 @@ private:
 private:
 	unique_ptr<mnemonicdb::Store> store;
 	shared_ptr<const mnemonicdb::Schema> initial_schema;
-	//! Every schema entry handed out so far, by name
+	//! Every schema entry handed out so far, by exact name: a schema dropped and
+	//! created again in different case gets an entry spelled the new way
 	mutex schema_entry_lock;
-	case_insensitive_map_t<unique_ptr<MnemonicSchemaEntry>> schema_entries;
+	unordered_map<string, unique_ptr<MnemonicSchemaEntry>> schema_entries;
 	mutex snapshot_lock;
 	mutex generation_lock;
 	shared_ptr<MnemonicCatalogGeneration> generation;

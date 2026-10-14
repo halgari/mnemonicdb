@@ -606,6 +606,29 @@ SELECT count(DISTINCT entity) FROM mnemonicdb_history('d', table_name := 'sys.sc
 statement ok
 CREATE TABLE d.kept.t (x INTEGER)
 
+# Schema names are case-insensitive; a schema created again in different case is spelled the new way
+statement ok
+CREATE SCHEMA d.Casey
+
+statement ok
+DROP SCHEMA d.CASEY
+
+statement ok
+CREATE SCHEMA d.CASEY
+
+query TT
+SELECT s.schema_name, (SELECT name FROM d.sys.schemas WHERE lower(name) = 'casey') FROM duckdb_schemas() s WHERE s.database_name = 'd' AND lower(s.schema_name) = 'casey'
+----
+CASEY	CASEY
+
+statement ok
+CREATE TABLE d.casey.t (x INTEGER)
+
+query TT
+SELECT schema, name FROM d.sys.tables WHERE name = 't' AND lower(schema) = 'casey'
+----
+CASEY	t
+
 #
 # Everything survives reopening
 #
@@ -619,6 +642,7 @@ ATTACH '{TEST_DIR}/schemas.mnemonic' AS d (TYPE mnemonicdb)
 query T
 SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'd' ORDER BY schema_name
 ----
+CASEY
 core
 empty
 kept
