@@ -5,6 +5,7 @@
 #include "duckdb/common/exception.hpp"
 
 #include "rocksdb/db.h"
+#include "rocksdb/env.h"
 #include "rocksdb/options.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/slice_transform.h"
@@ -142,11 +143,17 @@ Store::~Store() {
 	}
 }
 
-unique_ptr<Store> Store::Open(const string &path, bool read_only) {
+unique_ptr<Store> Store::Open(const string &path, bool read_only, const StoreOptions &options) {
 	auto store = unique_ptr<Store>(new Store(path, read_only));
 
 	rocksdb::DBOptions db_options;
 	db_options.create_if_missing = !read_only;
+	if (options.max_background_jobs >= 0) {
+		db_options.max_background_jobs = options.max_background_jobs;
+	}
+	if (options.max_file_opening_threads >= 0) {
+		db_options.max_file_opening_threads = options.max_file_opening_threads;
+	}
 	db_options.create_missing_column_families = false;
 
 	// An existing RocksDB directory must already be a MnemonicDB database
@@ -181,6 +188,16 @@ unique_ptr<Store> Store::Open(const string &path, bool read_only) {
 	}
 	CheckStatus(status, path);
 	store->db = unique_ptr<rocksdb::DB>(db.release());
+
+	// After the open: opening grows the pools to what max_background_jobs needs
+	// (one flush and one compaction thread at least). With no flush thread,
+	// RocksDB runs flushes in the compaction pool.
+	if (options.num_low_pri_threads >= 0) {
+		db_options.env->SetBackgroundThreads(options.num_low_pri_threads, rocksdb::Env::Priority::LOW);
+	}
+	if (options.num_high_pri_threads >= 0) {
+		db_options.env->SetBackgroundThreads(options.num_high_pri_threads, rocksdb::Env::Priority::HIGH);
+	}
 
 	// The default column family is unused; keep only ours, indexed by
 	// ColumnFamily

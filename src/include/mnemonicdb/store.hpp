@@ -27,13 +27,28 @@ using duckdb::vector;
 //! On-disk format version written to and checked against `meta`
 static constexpr uint32_t FORMAT_VERSION = 1;
 
+//! RocksDB threading settings, from the ATTACH options (see DESIGN.md §4).
+//! A negative value keeps RocksDB's default.
+struct StoreOptions {
+	//! DBOptions::max_background_jobs: concurrent flushes + compactions of this
+	//! database
+	int max_background_jobs = -1;
+	//! DBOptions::max_file_opening_threads: threads opening SST files at open
+	int max_file_opening_threads = -1;
+	//! Env::SetBackgroundThreads(n, LOW / HIGH): the compaction and flush thread
+	//! pools. These pools belong to RocksDB's default Env and are shared by every
+	//! RocksDB database in the process.
+	int num_low_pri_threads = -1;
+	int num_high_pri_threads = -1;
+};
+
 //! An open RocksDB database holding one MnemonicDB database
 class Store {
 public:
 	~Store();
 
 	//! Open (or create, unless read_only) the database at `path`
-	static unique_ptr<Store> Open(const string &path, bool read_only);
+	static unique_ptr<Store> Open(const string &path, bool read_only, const StoreOptions &options = StoreOptions());
 
 public:
 	rocksdb::DB &GetDB() {

@@ -3,7 +3,9 @@
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
 namespace duckdb {
 
@@ -73,13 +75,26 @@ static unique_ptr<GlobalTableFunctionState> MnemonicCompactInit(ClientContext &,
 	return make_uniq<MnemonicCompactState>();
 }
 
-static void MnemonicCompactFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+//! Compaction changes no datom, so it does not take the writer lock (writers
+//! keep going while it runs), but it is expensive: like a write, it needs a
+//! read-write transaction, with DuckDB's own read-only error. Checked when the
+//! function runs, as a prepared statement can run in a later transaction.
+static void CheckCompactAllowed(ClientContext &context, MnemonicCatalog &catalog) {
+	if (MetaTransaction::Get(context).IsReadOnly()) {
+		throw TransactionException("Cannot write to database \"%s\" - transaction is launched in read-only mode",
+		                           catalog.GetName().GetIdentifierName());
+	}
+}
+
+static void MnemonicCompactFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &state = input.global_state->Cast<MnemonicCompactState>();
 	if (state.done) {
 		return;
 	}
 	state.done = true;
-	auto &store = input.bind_data->Cast<MnemonicInfoBindData>().catalog.GetStore();
+	auto &catalog = input.bind_data->Cast<MnemonicInfoBindData>().catalog;
+	CheckCompactAllowed(context, catalog);
+	auto &store = catalog.GetStore();
 	auto before = store.ApproximateSize();
 	store.Compact();
 	output.data[0].Append(Value::UBIGINT(before));

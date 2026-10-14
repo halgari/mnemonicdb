@@ -1,0 +1,113 @@
+# name: test/sql/attach_options.test
+# description: ATTACH options capping RocksDB's background threads (MN-13); invalid values are rejected
+# group: [sql]
+
+require mnemonicdb
+
+# The minimum caps
+statement ok
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS 1, MAX_FILE_OPENING_THREADS 1, NUM_LOW_PRI_THREADS 1, NUM_HIGH_PRI_THREADS 0)
+
+statement ok
+CREATE TABLE d.t (x INTEGER)
+
+statement ok
+INSERT INTO d.t (x) SELECT range FROM range(1000)
+
+# Flushes run in the compaction pool when there is no flush thread
+query I
+SELECT size_after > 0 FROM mnemonicdb_compact('d')
+----
+true
+
+query I
+SELECT count(*) FROM d.t
+----
+1000
+
+statement ok
+DETACH d
+
+# Values given as strings or in lower case, and a read-only attach
+statement ok
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, READ_ONLY, max_background_jobs '4', num_high_pri_threads 1)
+
+query I
+SELECT count(*) FROM d.t
+----
+1000
+
+statement ok
+DETACH d
+
+# Back to the defaults
+statement ok
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS 2, NUM_LOW_PRI_THREADS 1, NUM_HIGH_PRI_THREADS 1)
+
+statement ok
+DETACH d
+
+# Invalid values
+statement error
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS 0)
+----
+ATTACH option MAX_BACKGROUND_JOBS must be between 1 and 1024, got 0
+
+statement error
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS -3)
+----
+must be between 1 and 1024
+
+statement error
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS 100000)
+----
+must be between 1 and 1024
+
+statement error
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_FILE_OPENING_THREADS 0)
+----
+ATTACH option MAX_FILE_OPENING_THREADS must be between 1 and 1024
+
+statement error
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, NUM_LOW_PRI_THREADS 0)
+----
+ATTACH option NUM_LOW_PRI_THREADS must be between 1 and 1024
+
+statement error
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, NUM_HIGH_PRI_THREADS -1)
+----
+ATTACH option NUM_HIGH_PRI_THREADS must be between 0 and 1024
+
+statement error
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS 'many')
+----
+ATTACH option MAX_BACKGROUND_JOBS must be an integer
+
+statement error
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS 1.5)
+----
+must be an integer
+
+statement error
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS NULL)
+----
+NULL is not supported
+
+statement error
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_THREADS 2)
+----
+unrecognized ATTACH option "max_background_threads"
+
+# A rejected ATTACH leaves nothing attached, and the database opens again
+statement error
+SELECT * FROM d.t
+----
+does not exist
+
+statement ok
+ATTACH '{TEST_DIR}/attach_options.mnemonic' AS d (TYPE mnemonicdb)
+
+query I
+SELECT count(*) FROM d.t
+----
+1000

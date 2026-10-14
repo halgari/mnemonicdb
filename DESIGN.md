@@ -188,6 +188,58 @@ One column family per index:
 - Excision and pruning later on are plain deletes of `_hist` and `txlog`
   ranges.
 
+### Threads and ATTACH options
+
+RocksDB runs flushes and compactions in the thread pools of its default
+`Env`. Those pools are **process-wide**: all RocksDB databases in the process
+share them, including every attached MnemonicDB database. MnemonicDB starts
+no threads of its own; scans run on DuckDB's scheduler.
+
+With the defaults, the process has three persistent RocksDB threads however
+many databases are attached: one compaction thread (`rocksdb:low`), one flush
+thread (`rocksdb:high`) and RocksDB's periodic-task timer. Opening a database
+also uses up to `max_file_opening_threads` (16) short-lived threads to load
+SST files. Most of an idle DuckDB process's threads are DuckDB's own: its
+worker threads (`threads` minus one) and its I/O threads (`async_threads`,
+64 by default).
+
+These ATTACH options cap the RocksDB threads. Each takes an integer and keeps
+RocksDB's default when omitted:
+
+| Option | RocksDB setting | Default | Range |
+|---|---|---|---|
+| `MAX_BACKGROUND_JOBS` | `DBOptions::max_background_jobs`: concurrent flushes + compactions of this database | 2 | 1–1024 |
+| `MAX_FILE_OPENING_THREADS` | `DBOptions::max_file_opening_threads`: threads that open SST files during ATTACH | 16 | 1–1024 |
+| `NUM_LOW_PRI_THREADS` | `Env::SetBackgroundThreads(n, LOW)`: the compaction pool | grown to what `MAX_BACKGROUND_JOBS` needs | 1–1024 |
+| `NUM_HIGH_PRI_THREADS` | `Env::SetBackgroundThreads(n, HIGH)`: the flush pool. With 0, flushes run in the compaction pool | grown to what `MAX_BACKGROUND_JOBS` needs | 0–1024 |
+
+```sql
+ATTACH 'app.mnemonic' AS d (TYPE mnemonicdb, MAX_BACKGROUND_JOBS 1,
+    MAX_FILE_OPENING_THREADS 1, NUM_LOW_PRI_THREADS 1, NUM_HIGH_PRI_THREADS 0);
+```
+
+- The two pool sizes are set after RocksDB opens the database, and they apply
+  to the whole process. The most recent ATTACH that sets one wins. An ATTACH
+  that doesn't set them only grows the pools to what its own
+  `MAX_BACKGROUND_JOBS` needs (one flush and one compaction thread).
+- The timer thread can't be turned off.
+- Unknown options, non-integers (including fractions) and out-of-range values
+  are rejected before the database is opened.
+
+Measured on a 16-vCPU VM, DuckDB started with `threads = 1` and
+`async_threads = 1`:
+
+| | Idle process | After ATTACH + write | Short-lived threads during ATTACH |
+|---|---|---|---|
+| Defaults | 2 | 5 | 15 |
+| Minimum caps above | 2 | 4 | 0 |
+
+With DuckDB's defaults on the same VM (`threads = 16`, `async_threads = 64`)
+the idle process has 80 threads, and 82 to 83 after an ATTACH.
+
+The flush thread exits asynchronously, within a few seconds of the ATTACH that
+sets `NUM_HIGH_PRI_THREADS 0`.
+
 ## 5. Reading
 
 ### As-of rule
@@ -416,6 +468,21 @@ commits nothing and gets no `sys.tx` row. "Changed" means at least one
   set: `CALL mnemonicdb_add('d.person', id, 'tags', 'x')` and
   `CALL mnemonicdb_retract('d.person', id, 'tags', 'x')`. Same redundancy and
   uniqueness rules as INSERT/UPDATE. They return whether anything changed.
+- **Side-effecting functions respect read-only transactions.**
+  `mnemonicdb_add` and `mnemonicdb_retract` declare their write while binding
+  (`RegisterDBModify`, like INSERT). DuckDB then calls
+  `MetaTransaction::ModifyDatabase` before the statement runs. In a
+  `BEGIN TRANSACTION READ ONLY` they fail with DuckDB's "transaction is
+  launched in read-only mode" error, and on a `READ_ONLY` attach with its
+  "attached in read-only mode" error. Either way they never take the writer
+  lock. This holds for `CALL` and for a table function in a `SELECT`.
+  `mnemonicdb_compact('db')` changes no datom and doesn't take the writer
+  lock, so writers continue while it runs. Because it's expensive, it fails
+  with the same read-only error in a read-only transaction. That check runs
+  when the function executes, so it also applies to a statement prepared
+  earlier. The other functions (`mnemonicdb_info`, `mnemonicdb_history`,
+  `mnemonicdb_tx_changes`, `current_tx`, `tempid` and the codec functions)
+  only read.
 
 ## 7. Schema: the `sys` schema
 

@@ -1,0 +1,308 @@
+# name: test/sql/read_only_functions.test
+# description: Side-effecting functions (mnemonicdb_add, mnemonicdb_retract, mnemonicdb_compact) refuse to run in a read-only transaction or on a read-only attach (MN-12); read functions keep working
+# group: [sql]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/read_only_functions.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.person (name VARCHAR, tags VARCHAR[])
+
+statement ok
+INSERT INTO d.person (id, name, tags) VALUES (tempid('a'), 'Alice', ['a'])
+
+statement ok
+SET VARIABLE alice = (SELECT id FROM d.person WHERE name = 'Alice')
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+3
+
+#
+# mnemonicdb_add / mnemonicdb_retract in a READ ONLY transaction: DuckDB's
+# read-only error, as CALL and as a table function in a SELECT
+#
+
+statement ok
+BEGIN TRANSACTION READ ONLY
+
+statement error
+CALL mnemonicdb_add('d.person', getvariable('alice'), 'tags', 'b')
+----
+transaction is launched in read-only mode
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN TRANSACTION READ ONLY
+
+statement error
+SELECT * FROM mnemonicdb_add('d.person', getvariable('alice'), 'tags', 'b')
+----
+transaction is launched in read-only mode
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN TRANSACTION READ ONLY
+
+statement error
+CALL mnemonicdb_retract('d.person', getvariable('alice'), 'tags', 'a')
+----
+transaction is launched in read-only mode
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN TRANSACTION READ ONLY
+
+statement error
+SELECT changed FROM mnemonicdb_retract('d.person', getvariable('alice'), 'tags', 'a') WHERE changed
+----
+transaction is launched in read-only mode
+
+statement ok
+ROLLBACK
+
+# Nothing was written
+query II
+SELECT tags, (SELECT last_tx FROM mnemonicdb_info('d')) FROM d.person
+----
+[a]	3
+
+#
+# A refused write does not take the writer lock: while con1's read-only
+# transaction is still open, con2 can write (a held lock would hang here)
+#
+
+statement ok con1
+SET VARIABLE alice = (SELECT id FROM d.person WHERE name = 'Alice')
+
+statement ok con1
+BEGIN TRANSACTION READ ONLY
+
+statement error con1
+SELECT * FROM mnemonicdb_add('d.person', getvariable('alice'), 'tags', 'c')
+----
+transaction is launched in read-only mode
+
+statement ok con2
+INSERT INTO d.person (name) VALUES ('Bob')
+
+statement ok con1
+ROLLBACK
+
+query I
+SELECT count(*) FROM d.person
+----
+2
+
+#
+# mnemonicdb_compact
+#
+
+statement ok
+BEGIN TRANSACTION READ ONLY
+
+statement error
+CALL mnemonicdb_compact('d')
+----
+transaction is launched in read-only mode
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN TRANSACTION READ ONLY
+
+statement error
+SELECT size_after FROM mnemonicdb_compact('d')
+----
+transaction is launched in read-only mode
+
+statement ok
+ROLLBACK
+
+# A statement prepared outside a read-only transaction is still refused when
+# executed inside one
+statement ok
+PREPARE compact_d AS SELECT size_after > 0 FROM mnemonicdb_compact('d')
+
+statement ok
+PREPARE add_tag AS SELECT * FROM mnemonicdb_add('d.person', getvariable('alice'), 'tags', 'p')
+
+statement ok
+BEGIN TRANSACTION READ ONLY
+
+statement error
+EXECUTE compact_d
+----
+transaction is launched in read-only mode
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN TRANSACTION READ ONLY
+
+statement error
+EXECUTE add_tag
+----
+transaction is launched in read-only mode
+
+statement ok
+ROLLBACK
+
+# ... and run normally outside one
+query I
+EXECUTE compact_d
+----
+true
+
+query I
+EXECUTE add_tag
+----
+true
+
+query I
+SELECT size_after > 0 FROM mnemonicdb_compact('d')
+----
+true
+
+query I
+CALL mnemonicdb_retract('d.person', getvariable('alice'), 'tags', 'p')
+----
+true
+
+#
+# Reads keep working in a READ ONLY transaction
+#
+
+statement ok
+BEGIN TRANSACTION READ ONLY
+
+query II
+SELECT last_tx, read_only FROM mnemonicdb_info('d')
+----
+6	false
+
+query I
+SELECT count(*) > 0 FROM mnemonicdb_history('d', table_name := 'person')
+----
+true
+
+query I
+SELECT count(*) FROM mnemonicdb_tx_changes('d')
+----
+0
+
+query I
+SELECT mnemonicdb_id_partition(tempid('x')) = mnemonicdb_id_partition(tempid('y'))
+----
+true
+
+query I
+SELECT mnemonicdb_decode(mnemonicdb_encode(42::INTEGER), 'INTEGER')
+----
+42
+
+statement error
+SELECT current_tx('d')
+----
+has not written
+
+statement ok
+ROLLBACK
+
+#
+# Read-write transactions: unchanged
+#
+
+statement ok
+BEGIN
+
+query I
+CALL mnemonicdb_add('d.person', getvariable('alice'), 'tags', 'b')
+----
+true
+
+query I
+SELECT * FROM mnemonicdb_add('d.person', getvariable('alice'), 'tags', 'c')
+----
+true
+
+query I
+SELECT * FROM mnemonicdb_retract('d.person', getvariable('alice'), 'tags', 'a')
+----
+true
+
+query I
+SELECT current_tx('d') IS NOT NULL
+----
+true
+
+statement ok
+COMMIT
+
+query II
+SELECT tags, (SELECT last_tx FROM mnemonicdb_info('d')) FROM d.person WHERE name = 'Alice'
+----
+[b, c]	7
+
+# A transaction can compact, then write
+statement ok
+BEGIN
+
+query I
+SELECT size_after > 0 FROM mnemonicdb_compact('d')
+----
+true
+
+query I
+CALL mnemonicdb_add('d.person', getvariable('alice'), 'tags', 'd')
+----
+true
+
+statement ok
+COMMIT
+
+query I
+SELECT tags FROM d.person WHERE name = 'Alice'
+----
+[b, c, d]
+
+#
+# Read-only attach: DuckDB's error for a read-only database
+#
+
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/read_only_functions.mnemonic' AS d (TYPE mnemonicdb, READ_ONLY)
+
+statement error
+CALL mnemonicdb_add('d.person', getvariable('alice'), 'tags', 'e')
+----
+attached in read-only mode
+
+statement error
+SELECT * FROM mnemonicdb_retract('d.person', getvariable('alice'), 'tags', 'b')
+----
+attached in read-only mode
+
+statement error
+CALL mnemonicdb_compact('d')
+----
+attached read-only
+
+query I
+SELECT tags FROM d.person WHERE name = 'Alice'
+----
+[b, c, d]

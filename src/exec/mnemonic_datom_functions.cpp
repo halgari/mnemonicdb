@@ -11,6 +11,7 @@
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 
@@ -28,6 +29,14 @@ struct DatomFunctionData : public TableFunctionData {
 struct DatomFunctionState : public GlobalTableFunctionState {
 	bool done = false;
 };
+
+static void RegisterDatabaseWrite(ClientContext &context, TableFunctionBindInput &input, Catalog &catalog,
+                                  const char *function_name, DatabaseModificationType modification) {
+	if (!input.binder) {
+		throw InternalException("%s: bound without a binder", function_name);
+	}
+	input.binder->GetStatementProperties().RegisterDBModify(catalog, context, modification);
+}
 
 template <bool ASSERT>
 static unique_ptr<FunctionData> DatomBind(ClientContext &context, TableFunctionBindInput &input,
@@ -74,11 +83,12 @@ static unique_ptr<FunctionData> DatomBind(ClientContext &context, TableFunctionB
 	}
 	value = value.DefaultCastAs(attr->value_type);
 
-	// Writing outside DML: take the writer the way a modifying statement would
-	auto &transaction = MnemonicTransaction::Get(context, table.catalog);
-	if (transaction.IsReadOnly()) {
-		transaction.SetReadWrite();
-	}
+	// Writing outside DML: declare the write like a modifying statement does.
+	// DuckDB then calls MetaTransaction::ModifyDatabase before execution, which
+	// refuses in a READ ONLY transaction or on a read-only attach, and otherwise
+	// calls SetReadWrite (taking the writer lock)
+	RegisterDatabaseWrite(context, input, table.catalog, function_name,
+	                      ASSERT ? DatabaseModificationType::INSERT_DATA : DatabaseModificationType::DELETE_DATA);
 	names = {Identifier("changed")};
 	return_types = {LogicalType::BOOLEAN};
 	return make_uniq<DatomFunctionData>(table, *attr, entity, std::move(value));

@@ -136,3 +136,12 @@ The alias survives into `BoundCreateTableInfo` column types, and
   statement.
 - Binding has already used the snapshot by then, so validate the basis after
   taking the lock.
+- A table function with side effects declares them while binding:
+  `input.binder->GetStatementProperties().RegisterDBModify(catalog, context,
+  modification)`. Before running the statement, DuckDB rejects a read-only
+  attach, and `MetaTransaction::ModifyDatabase` rejects a READ ONLY
+  transaction or calls `SetReadWrite()`. Never call `SetReadWrite()`
+  directly (MN-12).
+- Unrecognised ATTACH options reach the storage extension in
+  `AttachOptions::options`, with lower-case keys. DuckDB rejects a NULL
+  value itself.

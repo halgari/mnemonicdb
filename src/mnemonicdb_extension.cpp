@@ -10,6 +10,8 @@
 #include "mnemonicdb/mnemonicdb_info.hpp"
 #include "mnemonicdb/tx_writer.hpp"
 
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 
 #include "duckdb/main/attached_database.hpp"
@@ -17,6 +19,8 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/storage/storage_extension.hpp"
+
+#include <algorithm>
 
 namespace duckdb {
 
@@ -81,11 +85,65 @@ static void UpgradeBuiltins(mnemonicdb::Store &store) {
 	store.ReleaseWriter();
 }
 
+//! The MnemonicDB ATTACH options (beyond DuckDB's own TYPE, READ_ONLY, ...):
+//! RocksDB thread settings, named after the RocksDB options they set
+static mnemonicdb::StoreOptions ParseStoreOptions(const unordered_map<string, Value> &attach_options) {
+	struct ThreadOption {
+		const char *name;
+		int mnemonicdb::StoreOptions::*field;
+		int64_t min;
+	};
+	static constexpr int64_t MAX_THREADS = 1024;
+	static const ThreadOption THREAD_OPTIONS[] = {
+	    {"max_background_jobs", &mnemonicdb::StoreOptions::max_background_jobs, 1},
+	    {"max_file_opening_threads", &mnemonicdb::StoreOptions::max_file_opening_threads, 1},
+	    {"num_low_pri_threads", &mnemonicdb::StoreOptions::num_low_pri_threads, 1},
+	    {"num_high_pri_threads", &mnemonicdb::StoreOptions::num_high_pri_threads, 0},
+	};
+	mnemonicdb::StoreOptions result;
+	for (auto &entry : attach_options) {
+		auto key = StringUtil::Lower(entry.first);
+		const ThreadOption *option = nullptr;
+		for (auto &candidate : THREAD_OPTIONS) {
+			if (key == candidate.name) {
+				option = &candidate;
+			}
+		}
+		if (!option) {
+			throw BinderException("MnemonicDB: unrecognized ATTACH option \"%s\"", entry.first);
+		}
+		auto upper = StringUtil::Upper(key);
+		auto &input = entry.second;
+		// An integer, or a string of decimal digits; never a rounded fraction
+		bool integral = !input.IsNull() && input.type().IsIntegral();
+		if (!input.IsNull() && input.type().id() == LogicalTypeId::VARCHAR) {
+			auto text = StringValue::Get(input);
+			StringUtil::Trim(text);
+			auto digits = !text.empty() && text[0] == '-' ? text.substr(1) : text;
+			integral = !digits.empty() && digits.size() <= 18 &&
+			           std::all_of(digits.begin(), digits.end(), [](char c) { return c >= '0' && c <= '9'; });
+		}
+		auto value = integral ? input.DefaultTryCastAs(LogicalType::BIGINT) : optional<Value>();
+		if (!value || value->IsNull()) {
+			throw BinderException("MnemonicDB: ATTACH option %s must be an integer, got \"%s\"", upper,
+			                      input.ToString());
+		}
+		auto n = value->GetValue<int64_t>();
+		if (n < option->min || n > MAX_THREADS) {
+			throw BinderException("MnemonicDB: ATTACH option %s must be between %d and %d, got %d", upper, option->min,
+			                      MAX_THREADS, n);
+		}
+		result.*(option->field) = static_cast<int>(n);
+	}
+	return result;
+}
+
 static unique_ptr<Catalog> MnemonicAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
                                           AttachedDatabase &db, const string &, AttachInfo &info,
                                           AttachOptions &options) {
 	bool read_only = options.access_mode == AccessMode::READ_ONLY;
-	auto store = mnemonicdb::Store::Open(info.path, read_only);
+	auto store_options = ParseStoreOptions(options.options);
+	auto store = mnemonicdb::Store::Open(info.path, read_only, store_options);
 	if (store->WasCreated()) {
 		Bootstrap(*store);
 	} else if (!read_only) {
