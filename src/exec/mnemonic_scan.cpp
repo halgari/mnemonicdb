@@ -1093,8 +1093,13 @@ static void PlanTasks(ClientContext &context, const MnemonicScanBindData &bind_d
 		ScanTask task;
 		// A split point between partitions is not an encodable id: start at the
 		// next one that is
+		// span * n / task_count without a 128-bit product (MSVC has no __int128):
+		// with span = q * task_count + r it is q * n + r * n / task_count exactly,
+		// q * n <= span, and r * n < task_count^2 cannot overflow
 		auto split = [&](idx_t n) {
-			return min_entity + EntityId(static_cast<unsigned __int128>(span) * n / task_count);
+			auto q = span / task_count;
+			auto r = span % task_count;
+			return min_entity + EntityId(q * n + r * n / task_count);
 		};
 		task.start = WellFormedAtOrAfter(split(i));
 		task.end = i + 1 == task_count ? max_entity + 1 : split(i + 1);
