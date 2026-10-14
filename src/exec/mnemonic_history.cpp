@@ -8,6 +8,7 @@
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 
 #include "rocksdb/db.h"
 
@@ -34,6 +35,8 @@ struct HistoryBindData : public TableFunctionData {
 	TxId until = mnemonicdb::LOCAL_MASK;
 	//! mnemonicdb_tx_changes: only the reading transaction's pending datoms
 	bool tx_changes = false;
+	//! The planner's row estimate, computed once
+	mutable optional_idx estimate;
 };
 
 //! One assertion or retraction
@@ -177,6 +180,12 @@ static unique_ptr<FunctionData> HistoryBindInternal(ClientContext &context, Tabl
 	         Identifier("column_name"), Identifier("attribute"), Identifier("value"),       Identifier("added")};
 	return_types = {LogicalType::UBIGINT, mnemonicdb::RefType(), LogicalType::VARCHAR,   LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, mnemonicdb::RefType(), LogicalType::VARIANT(), LogicalType::BOOLEAN};
+	if (tx_changes) {
+		// Whether the entity was minted by this transaction (a tempid, or a new
+		// table or attribute): such entities had no state before it
+		names.emplace_back("minted");
+		return_types.push_back(LogicalType::BOOLEAN);
+	}
 	return std::move(result);
 }
 
@@ -326,6 +335,9 @@ static void HistoryFunction(ClientContext &context, TableFunctionInput &input, D
 		output.data[5].SetValue(count, Value::UBIGINT(mnemonicdb::AttrEntity(datom.a)));
 		output.data[6].SetValue(count, info.codec->DecodeValue(datom.v).DefaultCastAs(LogicalType::VARIANT()));
 		output.data[7].SetValue(count, Value::BOOLEAN(added));
+		if (data.tx_changes) {
+			output.data[8].SetValue(count, Value::BOOLEAN(transaction.MintedHere(datom.e)));
+		}
 		count++;
 	};
 
@@ -358,6 +370,71 @@ static void HistoryFunction(ClientContext &context, TableFunctionInput &input, D
 	output.SetChildCardinality(count);
 }
 
+//! Upper limit on the pending txlog entries counted for an estimate
+static constexpr idx_t TX_CHANGES_COUNT_LIMIT = 20000;
+
+//! The number of rows mnemonicdb_tx_changes will return: its pending txlog
+//! entries (those of the filtered attributes), counted up to a limit
+static idx_t EstimateTxChanges(ClientContext &context, const HistoryBindData &data) {
+	auto &transaction = MnemonicTransaction::Get(context, data.catalog);
+	auto tx = transaction.PendingTx();
+	if (tx == 0) {
+		return 0;
+	}
+	auto prefix = mnemonicdb::TxlogPrefix(tx);
+	auto it = transaction.GetReadView().NewIterator(ColumnFamily::TXLOG, prefix);
+	unordered_set<AttrId> filter(data.attributes.begin(), data.attributes.end());
+	idx_t scanned = 0;
+	idx_t matched = 0;
+	for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
+		if (++scanned > TX_CHANGES_COUNT_LIMIT) {
+			// A large transaction: what was seen, scaled up as if the batch were
+			// ten times larger (only the order of magnitude matters to the planner)
+			return MaxValue<idx_t>(matched, 1) * 10;
+		}
+		if (!data.filtered) {
+			matched++;
+			continue;
+		}
+		// txlog keys are T5 E6 A2 V
+		auto key = it->key();
+		auto attr = mnemonicdb::GetAttrId(key.data() + mnemonicdb::PACKED_TX_SIZE + mnemonicdb::PACKED_ID_SIZE);
+		matched += filter.count(attr);
+	}
+	return matched;
+}
+
+static idx_t EstimateHistory(const HistoryBindData &data) {
+	auto &store = data.catalog.GetStore();
+	if (data.filtered && data.attributes.empty()) {
+		return 0;
+	}
+	if (data.entity.IsValid()) {
+		// One entity's datoms: a few per attribute
+		return data.filtered ? 2 * data.attributes.size() : 32;
+	}
+	// Current datoms (each asserted once), plus as many again for history
+	idx_t current = 0;
+	if (data.filtered) {
+		for (auto attr : data.attributes) {
+			current += store.GetAttributeCount(attr);
+		}
+	} else {
+		current = store.GetTotalCount();
+	}
+	return 2 * current;
+}
+
+static unique_ptr<NodeStatistics> HistoryCardinality(ClientContext &context, const FunctionData *bind_data) {
+	auto &data = bind_data->Cast<HistoryBindData>();
+	if (!data.estimate.IsValid()) {
+		data.estimate = data.tx_changes ? EstimateTxChanges(context, data) : EstimateHistory(data);
+	}
+	// Never 0: some planner arithmetic divides by estimates
+	auto rows = MaxValue<idx_t>(data.estimate.GetIndex(), 1);
+	return make_uniq<NodeStatistics>(rows, rows);
+}
+
 } // namespace
 
 void RegisterHistoryFunction(ExtensionLoader &loader) {
@@ -368,6 +445,7 @@ void RegisterHistoryFunction(ExtensionLoader &loader) {
 	function.named_parameters["entity"] = LogicalType::UBIGINT;
 	function.named_parameters["since"] = LogicalType::UBIGINT;
 	function.named_parameters["until"] = LogicalType::UBIGINT;
+	function.cardinality = HistoryCardinality;
 	loader.RegisterFunction(function);
 
 	// mnemonicdb_tx_changes([db], table_name :=, column_name :=): the datoms the
@@ -379,6 +457,7 @@ void RegisterHistoryFunction(ExtensionLoader &loader) {
 		overload.named_parameters["schema_name"] = LogicalType::VARCHAR;
 		overload.named_parameters["table_name"] = LogicalType::VARCHAR;
 		overload.named_parameters["column_name"] = LogicalType::VARCHAR;
+		overload.cardinality = HistoryCardinality;
 		tx_changes.AddFunction(overload);
 	}
 	loader.RegisterFunction(tx_changes);

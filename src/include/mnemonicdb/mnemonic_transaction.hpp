@@ -116,6 +116,11 @@ public:
 	//! The tx number of this transaction's pending writes: its own writer's tx,
 	//! else (when borrowed) its parent's, else 0 (nothing pending)
 	mnemonicdb::TxId PendingTx() const;
+	//! Whether `e` was minted by this transaction's pending writes: its id was
+	//! allocated after the transaction took the writer (a tempid, or a new table
+	//! or attribute), or it is the pending tx entity itself. Borrowed
+	//! transactions answer for their parent.
+	bool MintedHere(mnemonicdb::EntityId e) const;
 	//! Whether this transaction borrows a committing transaction's state
 	bool IsBorrowed() const {
 		return parent != nullptr;

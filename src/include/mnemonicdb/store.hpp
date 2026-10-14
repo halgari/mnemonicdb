@@ -116,6 +116,8 @@ public:
 	//! Number of current datoms of an attribute, as of the last commit (a planner
 	//! estimate)
 	uint64_t GetAttributeCount(AttrId attr) const;
+	//! Number of current datoms of every attribute (a planner estimate)
+	uint64_t GetTotalCount() const;
 	//! Flush all column families to disk
 	void Flush();
 	//! Compact every column family down to the bottommost level (after large

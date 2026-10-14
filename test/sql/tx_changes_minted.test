@@ -1,0 +1,106 @@
+# name: test/sql/tx_changes_minted.test
+# description: mnemonicdb_tx_changes says whether each entity was minted (its id allocated) by the transaction, also inside commit assertions
+# group: [sql]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/tx_changes_minted.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.node (label VARCHAR PRIMARY KEY, parent REF)
+
+statement ok
+INSERT INTO d.node (label) VALUES ('old1'), ('old2')
+
+statement ok
+BEGIN
+
+# An existing entity, a new one from a tempid, and a new one without a tempid
+statement ok
+UPDATE d.node SET parent = (SELECT id FROM d.node WHERE label = 'old2') WHERE label = 'old1'
+
+statement ok
+INSERT INTO d.node (id, label, parent) VALUES (tempid('n'), 'new1', (SELECT id FROM d.node WHERE label = 'old1'))
+
+statement ok
+INSERT INTO d.node (label) VALUES ('new2')
+
+# An existing entity given an explicit id is not minted
+statement ok
+INSERT INTO d.node (id, label) VALUES ((SELECT id FROM d.node WHERE label = 'old2'), 'old2') ON CONFLICT (label) DO NOTHING
+
+query TTT
+SELECT n.label, c.column_name, c.minted
+FROM mnemonicdb_tx_changes('d', table_name := 'node') c JOIN d.node n ON n.id = c.entity
+ORDER BY 1, 2
+----
+new1	label	true
+new1	parent	true
+new2	label	true
+old1	parent	false
+
+# The column is the last one
+query T
+SELECT list(column_name) FROM (DESCRIBE SELECT * FROM mnemonicdb_tx_changes('d'))
+----
+[tx, entity, schema_name, table_name, column_name, attribute, value, added, minted]
+
+statement ok
+COMMIT
+
+# mnemonicdb_history has no such column
+statement error
+SELECT minted FROM mnemonicdb_history('d')
+----
+minted
+
+query T
+SELECT parent IS NOT NULL FROM d.node WHERE label = 'old1'
+----
+true
+
+# After the commit, nothing is pending
+query I
+SELECT count(*) FROM mnemonicdb_tx_changes('d')
+----
+0
+
+# Inside a commit assertion it describes the committing transaction: here,
+# every changed entity must be new
+statement ok
+INSERT INTO d.sys.assertions (name, query) VALUES ('only_new',
+    'SELECT DISTINCT c.entity FROM mnemonicdb_tx_changes(table_name := ''node'') c WHERE NOT c.minted')
+
+statement ok
+INSERT INTO d.node (label) VALUES ('new3'), ('new4')
+
+statement error
+UPDATE d.node SET parent = NULL WHERE label = 'old1'
+----
+assertion "only_new" failed (1 row)
+
+# A transaction that rolls back gives its ids back; the next one mints them
+# again
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.node (label) VALUES ('gone')
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.node (label) VALUES ('again')
+
+query T
+SELECT DISTINCT minted FROM mnemonicdb_tx_changes('d')
+----
+true
+
+statement ok
+COMMIT

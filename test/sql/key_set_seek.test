@@ -1,0 +1,397 @@
+# name: test/sql/key_set_seek.test
+# description: Key sets from IN lists and joins (exact, optional and dynamic filters) become seeks on id, AVET and VAET, now and under AT, and give the same answers as plain scans
+# group: [sql]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/key_set_seek.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TABLE d.grp (name VARCHAR)
+
+# bucket: AVET (CREATE INDEX); owner: REF with AVET; parent: REF, VAET only
+statement ok
+CREATE TABLE d.item (k INTEGER, bucket INTEGER, parent REF, owner REF, tags VARCHAR[])
+
+statement ok
+CREATE INDEX item_bucket ON d.item (bucket)
+
+statement ok
+CREATE INDEX item_owner ON d.item (owner)
+
+statement ok
+INSERT INTO d.grp (name) SELECT 'g' || i FROM range(50) t(i)
+
+statement ok
+INSERT INTO d.item (k, bucket, parent, owner, tags)
+SELECT i, i % 97, g.id, g.id, ['t' || (i % 3)]
+FROM range(3000) t(i) JOIN (SELECT id, row_number() OVER (ORDER BY id) - 1 AS n FROM d.grp) g ON g.n = i % 50
+
+# The state after that insert is the version read under AT below
+query I
+SELECT max(id::UBIGINT & 1099511627775) FROM d.sys.tx
+----
+7
+
+statement ok
+CREATE TABLE ref_then AS SELECT * FROM d.item
+
+statement ok
+CREATE TABLE groups AS SELECT id, name FROM d.grp
+
+# Change and remove some rows, so current state and history differ
+statement ok
+UPDATE d.item SET k = k + 100000, bucket = bucket + 1000,
+    parent = (SELECT id FROM groups WHERE name = 'g0'), owner = (SELECT id FROM groups WHERE name = 'g1')
+WHERE k % 10 = 0
+
+statement ok
+DELETE FROM d.item WHERE k % 10 = 1
+
+statement ok
+CREATE TABLE ref_now AS SELECT * FROM d.item
+
+# Key sets: ids of rows by their original k
+statement ok
+SET VARIABLE k0 = (SELECT list(id) FROM ref_then WHERE false)
+
+statement ok
+SET VARIABLE k1 = (SELECT list(id) FROM ref_then WHERE k = 1234)
+
+statement ok
+SET VARIABLE k2 = (SELECT list(id) FROM ref_then WHERE k IN (5, 2500))
+
+# 2 keys, one of them deleted since, one changed since
+statement ok
+SET VARIABLE k2changed = (SELECT list(id) FROM ref_then WHERE k IN (11, 20))
+
+statement ok
+SET VARIABLE k30 = (SELECT list(id) FROM ref_then WHERE k % 100 = 7)
+
+statement ok
+SET VARIABLE k200 = (SELECT list(id) FROM ref_then WHERE k % 15 = 4)
+
+statement ok
+SET VARIABLE k200dense = (SELECT list(id) FROM ref_then WHERE k BETWEEN 1000 AND 1199)
+
+statement ok
+SET VARIABLE kmany = (SELECT list(id) FROM ref_then WHERE k % 2 = 0)
+
+# Duplicates, NULLs, ids that are no item (a group, a tx entity, an id never
+# allocated, an id with bits set between partition and local number)
+statement ok
+SET VARIABLE kodd = (SELECT list(id) || list(id) || [NULL::REF, (SELECT min(id) FROM groups),
+    (SELECT max(id) FROM d.sys.tx), (SELECT max(id) FROM ref_then) + 1000000, 35184372088832::REF]
+    FROM ref_then WHERE k IN (3, 33))
+
+#----------------------------------------------------------------------
+# Join-driven key sets on id (the build side is small; the scan gets the key
+# set as a dynamic filter: one value, an IN list, min/max or a key bitmap)
+#----------------------------------------------------------------------
+foreach keys k0 k1 k2 k2changed k30 k200 k200dense kmany kodd
+
+query I
+SELECT (SELECT list((k, bucket, parent, owner, tags) ORDER BY k) FROM d.item WHERE id IN (SELECT unnest(getvariable('{keys}'))))
+    IS NOT DISTINCT FROM (SELECT list((k, bucket, parent, owner, tags) ORDER BY k) FROM ref_now WHERE id IN (SELECT unnest(getvariable('{keys}'))))
+----
+true
+
+query I
+SELECT (SELECT list((k, bucket) ORDER BY k) FROM d.item AT (VERSION => 7) WHERE id IN (SELECT unnest(getvariable('{keys}'))))
+    IS NOT DISTINCT FROM (SELECT list((k, bucket) ORDER BY k) FROM ref_then WHERE id IN (SELECT unnest(getvariable('{keys}'))))
+----
+true
+
+# An inner join with the key set as a table
+query I
+SELECT (SELECT list(i.k ORDER BY i.k) FROM (SELECT DISTINCT unnest(getvariable('{keys}')) AS id) s JOIN d.item i ON i.id = s.id)
+    IS NOT DISTINCT FROM (SELECT list(i.k ORDER BY i.k) FROM (SELECT DISTINCT unnest(getvariable('{keys}')) AS id) s JOIN ref_now i ON i.id = s.id)
+----
+true
+
+# Fused: the key set reaches a scan of two tables joined on id
+query I
+SELECT (SELECT list(i.k ORDER BY i.k) FROM (SELECT DISTINCT unnest(getvariable('{keys}')) AS id) s
+        JOIN d.item i ON i.id = s.id JOIN d.item j ON j.id = i.id)
+    IS NOT DISTINCT FROM (SELECT list(i.k ORDER BY i.k) FROM (SELECT DISTINCT unnest(getvariable('{keys}')) AS id) s JOIN ref_now i ON i.id = s.id)
+----
+true
+
+# REF values as the key set: VAET (parent) and AVET (owner)
+query I
+SELECT (SELECT list(k ORDER BY k) FROM d.item WHERE parent IN (SELECT unnest(getvariable('{keys}'))))
+    IS NOT DISTINCT FROM (SELECT list(k ORDER BY k) FROM ref_now WHERE parent IN (SELECT unnest(getvariable('{keys}'))))
+----
+true
+
+endloop
+
+# Without IN lists from joins, the scan sees only min/max (or a key bitmap)
+statement ok
+SET dynamic_or_filter_threshold = 0
+
+foreach keys k2 k30 k200 k200dense kodd
+
+query I
+SELECT (SELECT list(k ORDER BY k) FROM d.item WHERE id IN (SELECT unnest(getvariable('{keys}'))))
+    IS NOT DISTINCT FROM (SELECT list(k ORDER BY k) FROM ref_now WHERE id IN (SELECT unnest(getvariable('{keys}'))))
+----
+true
+
+query I
+SELECT (SELECT list(k ORDER BY k) FROM d.item AT (VERSION => 7) WHERE id IN (SELECT unnest(getvariable('{keys}'))))
+    IS NOT DISTINCT FROM (SELECT list(k ORDER BY k) FROM ref_then WHERE id IN (SELECT unnest(getvariable('{keys}'))))
+----
+true
+
+endloop
+
+statement ok
+RESET dynamic_or_filter_threshold
+
+#----------------------------------------------------------------------
+# Groups as the key set: REF columns (VAET for parent, AVET for owner)
+#----------------------------------------------------------------------
+statement ok
+SET VARIABLE g2 = (SELECT list(id) FROM groups WHERE name IN ('g0', 'g7'))
+
+statement ok
+SET VARIABLE g20 = (SELECT list(id) FROM groups WHERE name LIKE 'g1%' OR name LIKE 'g2%')
+
+foreach keys g2 g20
+
+foreach column parent owner
+
+query I
+SELECT (SELECT list(k ORDER BY k) FROM d.item WHERE {column} IN (SELECT unnest(getvariable('{keys}'))))
+    IS NOT DISTINCT FROM (SELECT list(k ORDER BY k) FROM ref_now WHERE {column} IN (SELECT unnest(getvariable('{keys}'))))
+----
+true
+
+query I
+SELECT (SELECT list(k ORDER BY k) FROM d.item AT (VERSION => 7) WHERE {column} IN (SELECT unnest(getvariable('{keys}'))))
+    IS NOT DISTINCT FROM (SELECT list(k ORDER BY k) FROM ref_then WHERE {column} IN (SELECT unnest(getvariable('{keys}'))))
+----
+true
+
+# Exact IN lists of constants
+query I
+SELECT (SELECT list(k ORDER BY k) FROM d.item WHERE {column} IN (getvariable('{keys}')[1], getvariable('{keys}')[2], getvariable('{keys}')[2]))
+    IS NOT DISTINCT FROM (SELECT list(k ORDER BY k) FROM ref_now WHERE {column} IN (getvariable('{keys}')[1], getvariable('{keys}')[2]))
+----
+true
+
+endloop
+
+endloop
+
+query I
+SELECT count(*) FROM d.item WHERE parent IN (SELECT unnest(getvariable('g2')))
+----
+360
+
+#----------------------------------------------------------------------
+# AVET on a plain column: IN lists of 0, 1, 2 and many values, from joins and
+# as constants, now and under AT
+#----------------------------------------------------------------------
+foreach values [] [42] [42,1042] [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,1001,1002,1003,1004,1005,1006,1007,1008,1009,1010,1011,1012,1013,1014,1015,1016,1017,1018,1019,1020,1021,1022,1023,1024,1025,1026,1027,1028,1029,1030,1031,1032,1033,1034,1035,1036,1037,1038,1039,1040,1041,1042,1043,1044,1045,1046,1047,1048,1049,1050,1051,1052,1053,1054,1055,1056,1057,1058,1059,1060,96] [5,5,NULL,96]
+
+query I
+SELECT (SELECT list(k ORDER BY k) FROM d.item WHERE bucket IN (SELECT unnest({values}::INTEGER[])))
+    IS NOT DISTINCT FROM (SELECT list(k ORDER BY k) FROM ref_now WHERE bucket IN (SELECT unnest({values}::INTEGER[])))
+----
+true
+
+query I
+SELECT (SELECT list(k ORDER BY k) FROM d.item AT (VERSION => 7) WHERE bucket IN (SELECT unnest({values}::INTEGER[])))
+    IS NOT DISTINCT FROM (SELECT list(k ORDER BY k) FROM ref_then WHERE bucket IN (SELECT unnest({values}::INTEGER[])))
+----
+true
+
+endloop
+
+query I
+SELECT count(*) FROM d.item WHERE bucket IN (42, 1042, 42, NULL)
+----
+28
+
+query I
+SELECT count(*) FROM d.item AT (VERSION => 7) WHERE bucket IN (42, 1042, NULL)
+----
+31
+
+#----------------------------------------------------------------------
+# Exact filters on id: IN lists, contradictions, bounds
+#----------------------------------------------------------------------
+query I
+SELECT count(*) FROM d.item WHERE id IN (getvariable('k2')[1], getvariable('k2')[2], getvariable('k2')[1], NULL)
+----
+2
+
+query I
+SELECT count(*) FROM d.item WHERE id = getvariable('k2')[1] AND id = getvariable('k2')[2]
+----
+0
+
+query I
+SELECT count(*) FROM d.item WHERE id IN (getvariable('k2')[1], getvariable('k2')[2]) AND id > getvariable('k2')[1]
+----
+1
+
+query I
+SELECT count(*) FROM d.item WHERE id > getvariable('k200dense')[1] AND id <= getvariable('k200dense')[200]
+----
+179
+
+query I
+SELECT count(*) FROM d.item AT (VERSION => 7) WHERE id > getvariable('k200dense')[1] AND id <= getvariable('k200dense')[200]
+----
+199
+
+query I
+SELECT count(*) FROM d.item WHERE id < getvariable('k200dense')[1] AND id > getvariable('k200dense')[200]
+----
+0
+
+query I
+SELECT count(*) FROM d.item WHERE id = NULL
+----
+0
+
+# Bounds between partitions are not ids; they still bound the scan
+query I
+SELECT count(*) FROM d.item WHERE id > 216172782113783807::REF AND id < 216207966485872640::REF
+----
+2700
+
+#----------------------------------------------------------------------
+# mnemonicdb_tx_changes as the key set: the commit assertion shape
+#----------------------------------------------------------------------
+statement ok
+BEGIN
+
+statement ok
+UPDATE d.item SET bucket = bucket + 1 WHERE id IN (SELECT unnest(getvariable('k30')))
+
+query II
+SELECT count(*), count(DISTINCT entity) FROM mnemonicdb_tx_changes('d', table_name := 'item')
+----
+60	30
+
+# Pending writes are visible to the seeks
+query I
+SELECT (SELECT list((k, bucket) ORDER BY k) FROM d.item WHERE id IN
+        (SELECT unnest(list(k)) FROM (SELECT DISTINCT entity FROM mnemonicdb_tx_changes('d', table_name := 'item')) s(k)))
+    = (SELECT list((k, bucket + 1) ORDER BY k) FROM ref_now WHERE id IN (SELECT unnest(getvariable('k30'))))
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT entity AS id FROM mnemonicdb_tx_changes('d')) c JOIN d.item i ON i.id = c.id
+----
+30
+
+# An empty key set
+query I
+SELECT count(*) FROM d.item WHERE id IN
+    (SELECT unnest(list(k)) FROM (SELECT entity FROM mnemonicdb_tx_changes('d', table_name := 'grp')) s(k))
+----
+0
+
+statement ok
+ROLLBACK
+
+#----------------------------------------------------------------------
+# Empty key sets: a join whose build side is empty (or all NULL) gives the scan
+# nothing to seek, and the scan reads nothing; joins that keep unmatched probe
+# rows, or whose keys need a cast, still read everything they must
+#----------------------------------------------------------------------
+# The commit assertion shape: materialized CTEs, a filter pushed in from outside
+query I
+WITH ch AS MATERIALIZED (SELECT id, parent FROM d.item WHERE parent IN (SELECT unnest(getvariable('k0')))),
+p AS MATERIALIZED (SELECT id, k FROM d.item WHERE id IN (SELECT unnest(list(x)) FROM (SELECT parent FROM ch) s(x)))
+SELECT count(*) FROM ch JOIN p ON p.id = ch.parent WHERE p.k IS NULL
+----
+0
+
+query I
+SELECT count(*) FROM d.item WHERE id IN (SELECT unnest([NULL, NULL]::REF[]))
+----
+0
+
+query I
+SELECT count(*) FROM d.item i JOIN (SELECT unnest([NULL]::REF[]) AS id) s ON s.id = i.id
+----
+0
+
+# Unmatched probe rows are kept: LEFT and anti joins read everything
+query I
+SELECT count(*) FROM d.item i LEFT JOIN (SELECT unnest(getvariable('k0')) AS id) s ON s.id = i.id
+----
+2700
+
+query I
+SELECT count(*) FROM d.item WHERE id NOT IN (SELECT unnest(getvariable('k0')))
+----
+2700
+
+# Keys of another type (cast in the join) still find their rows
+query I
+SELECT count(*) FROM d.item i JOIN (SELECT unnest(getvariable('k2'))::BIGINT AS id) s ON s.id = i.id
+----
+2
+
+query I
+SELECT count(*) FROM d.item i JOIN (SELECT unnest(getvariable('k2'))::HUGEINT - 1 + 1 AS id) s ON s.id = i.id
+----
+2
+
+# Inside a recursive CTE every step has its own key set, some of them empty
+query I
+WITH RECURSIVE walk(id, depth) AS (
+    SELECT unnest(getvariable('k2')), 0
+  UNION ALL
+    SELECT i.parent, w.depth + 1 FROM walk w JOIN d.item i ON i.id = w.id WHERE w.depth < 3
+)
+SELECT count(*) FROM walk
+----
+4
+
+#----------------------------------------------------------------------
+# Estimates: mnemonicdb_tx_changes and mnemonicdb_history report their sizes,
+# so joins build their hash tables on the small side
+#----------------------------------------------------------------------
+statement ok
+BEGIN
+
+statement ok
+UPDATE d.item SET k = k + 1 WHERE id IN (SELECT unnest(getvariable('k2')))
+
+query II
+EXPLAIN SELECT * FROM mnemonicdb_tx_changes('d')
+----
+physical_plan	<REGEX>:.*MNEMONICDB_TX_CHANGES.*~4 rows.*
+
+query II
+EXPLAIN SELECT * FROM mnemonicdb_tx_changes('d', table_name := 'grp')
+----
+physical_plan	<REGEX>:.*MNEMONICDB_TX_CHANGES.*~1 row.*
+
+statement ok
+ROLLBACK
+
+query II
+EXPLAIN SELECT * FROM mnemonicdb_tx_changes('d')
+----
+physical_plan	<REGEX>:.*MNEMONICDB_TX_CHANGES.*~1 row.*
+
+query II
+EXPLAIN SELECT * FROM mnemonicdb_history('d', table_name := 'item', column_name := 'k')
+----
+physical_plan	<REGEX>:.*MNEMONICDB_HISTORY.*~5,400 rows.*
+
+query II
+EXPLAIN SELECT * FROM mnemonicdb_history('d', table_name := 'grp')
+----
+physical_plan	<REGEX>:.*MNEMONICDB_HISTORY.*~100 rows.*

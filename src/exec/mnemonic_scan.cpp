@@ -10,6 +10,7 @@
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
+#include "duckdb/main/profiler/profiling_node.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -17,6 +18,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/planner/tableref/bound_at_clause.hpp"
 
@@ -33,6 +35,7 @@ unique_ptr<FunctionData> MnemonicScanBindData::Copy() const {
 	result->tables = tables;
 	result->fused = fused;
 	result->as_of = as_of;
+	result->join_key_filters = join_key_filters;
 	return std::move(result);
 }
 
@@ -289,6 +292,10 @@ struct MnemonicScanState : public GlobalTableFunctionState {
 	//! each task's entity range
 	bool lookup_mode = false;
 	vector<EntityId> candidates;
+	//! Only entities in [range_lower, range_upper] can qualify (from filters on
+	//! the id); empty when range_lower > range_upper
+	EntityId range_lower = 0;
+	EntityId range_upper = UINT64_MAX;
 
 	//! Work handed out to threads
 	mutex task_lock;
@@ -316,8 +323,110 @@ struct MnemonicScanLocalState : public LocalTableFunctionState {
 	//! Per attribute; null for attributes the scan does not read
 	vector<unique_ptr<AttributeCursor>> cursors;
 	bool active = false;
+	//! Entities this thread read (merged or looked up), reported as the
+	//! operator's rows_scanned
+	idx_t entities_read = 0;
 	ScanTask task;
 	idx_t next_candidate = 0;
+};
+
+//! What the pushed filters on one column say about its values: rows whose value
+//! is outside the key set can be skipped. Exact filters are applied to every
+//! row anyway; optional and dynamic ones (how a join passes its key set: an IN
+//! list, min/max bounds or a key bitmap) are hints, but a row they reject is one
+//! the join drops too, so they may narrow what the scan reads.
+static bool ValueLess(const Value &a, const Value &b) {
+	return a < b;
+}
+
+static void SortUnique(vector<Value> &values) {
+	std::sort(values.begin(), values.end(), ValueLess);
+	values.erase(std::unique(values.begin(), values.end(), [](const Value &a, const Value &b) { return a == b; }),
+	             values.end());
+}
+
+struct KeySet {
+	//! The value is one of `points` (cast to the column type, no NULLs)
+	bool has_points = false;
+	vector<Value> points;
+	bool has_lower = false;
+	bool lower_inclusive = true;
+	Value lower;
+	bool has_upper = false;
+	bool upper_inclusive = true;
+	Value upper;
+	//! The value is a key of each of these join key bitmaps
+	vector<reference<const PrefixRangeFunctionData>> key_filters;
+	//! Whether some part comes from a filter that is not optional (written by
+	//! the user, so worth following however many keys it has)
+	bool exact = false;
+
+	bool Constrains() const {
+		return has_points || has_lower || has_upper || !key_filters.empty();
+	}
+	bool InBounds(const Value &value) const {
+		if (has_lower && (value < lower || (!lower_inclusive && value == lower))) {
+			return false;
+		}
+		if (has_upper && (value > upper || (!upper_inclusive && value == upper))) {
+			return false;
+		}
+		return true;
+	}
+	void SetLower(Value value, bool inclusive) {
+		if (!has_lower || value > lower || (value == lower && !inclusive)) {
+			lower = std::move(value);
+			lower_inclusive = inclusive;
+			has_lower = true;
+		}
+	}
+	void SetUpper(Value value, bool inclusive) {
+		if (!has_upper || value < upper || (value == upper && !inclusive)) {
+			upper = std::move(value);
+			upper_inclusive = inclusive;
+			has_upper = true;
+		}
+	}
+	//! Both this and `other` hold
+	void Intersect(KeySet &other) {
+		if (other.has_points) {
+			if (!has_points) {
+				points = std::move(other.points);
+				has_points = true;
+			} else {
+				SortUnique(points);
+				SortUnique(other.points);
+				vector<Value> both;
+				std::set_intersection(points.begin(), points.end(), other.points.begin(), other.points.end(),
+				                      std::back_inserter(both), ValueLess);
+				points = std::move(both);
+			}
+		}
+		if (other.has_lower) {
+			SetLower(std::move(other.lower), other.lower_inclusive);
+		}
+		if (other.has_upper) {
+			SetUpper(std::move(other.upper), other.upper_inclusive);
+		}
+		for (auto &filter : other.key_filters) {
+			key_filters.push_back(filter);
+		}
+		exact = exact || other.exact;
+	}
+	//! Drop points outside the bounds, and duplicates
+	void Normalize() {
+		if (!has_points) {
+			return;
+		}
+		vector<Value> result;
+		for (auto &point : points) {
+			if (InBounds(point)) {
+				result.push_back(point);
+			}
+		}
+		SortUnique(result);
+		points = std::move(result);
+	}
 };
 
 static optional_ptr<const Expression> ColumnSide(const Expression &left, const Expression &right,
@@ -335,107 +444,105 @@ static optional_ptr<const Expression> ColumnSide(const Expression &left, const E
 	return nullptr;
 }
 
-//! Value constants the filter compares the column to, if the filter is an
-//! equality or IN list (optionally under OR)
-static bool ExtractPoints(const Expression &expr, vector<Value> &points) {
-	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_OR) {
-		for (auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
-			if (!ExtractPoints(*child, points)) {
+//! A filter constant as a value of the column's type
+static bool CastConstant(const Expression &constant, const LogicalType &type, Value &result) {
+	auto cast = constant.Cast<BoundConstantExpression>().GetValue().DefaultTryCastAs(type);
+	if (!cast) {
+		return false;
+	}
+	result = std::move(*cast);
+	return true;
+}
+
+//! Fill `keys` with what `expr`, a filter over BoundReference(0) of type `type`,
+//! says about the column's values; false when it says nothing usable. Under
+//! `optional` the filter is a hint (see KeySet).
+static bool AnalyzeFilter(const Expression &expr, const LogicalType &type, KeySet &keys, bool optional) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION && !BoundComparisonExpression::IsComparison(expr) &&
+	    expr.GetExpressionType() != ExpressionType::COMPARE_BETWEEN) {
+		auto &function = expr.Cast<BoundFunctionExpression>();
+		auto &name = function.Function().GetName();
+		if (name == OptionalFilterScalarFun::NAME && function.BindInfo()) {
+			auto &child = function.BindInfo()->Cast<OptionalFilterFunctionData>().child_filter_expr;
+			return child && AnalyzeFilter(*child, type, keys, true);
+		}
+		if (name == SelectivityOptionalFilterScalarFun::NAME && function.BindInfo()) {
+			auto &child = function.BindInfo()->Cast<SelectivityOptionalFilterFunctionData>().child_filter_expr;
+			return child && AnalyzeFilter(*child, type, keys, true);
+		}
+		if (name == PrefixRangeScalarFun::NAME && function.BindInfo()) {
+			// A join's key bitmap: only over the raw column, for 64-bit unsigned keys
+			// (ids and REFs), which can be enumerated
+			auto &data = function.BindInfo()->Cast<PrefixRangeFunctionData>();
+			if (function.GetChildren().empty() ||
+			    function.GetChildren()[0]->GetExpressionType() != ExpressionType::BOUND_REF || !data.filter ||
+			    !data.filter->IsInitialized() || data.key_type.InternalType() != PhysicalType::UINT64 ||
+			    type.InternalType() != PhysicalType::UINT64) {
 				return false;
 			}
+			keys.key_filters.push_back(data);
+			return true;
 		}
+		return false;
+	}
+	switch (expr.GetExpressionType()) {
+	case ExpressionType::CONJUNCTION_AND: {
+		bool any = false;
+		for (auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
+			KeySet child_keys;
+			if (AnalyzeFilter(*child, type, child_keys, optional)) {
+				keys.Intersect(child_keys);
+				any = true;
+			}
+		}
+		return any;
+	}
+	case ExpressionType::CONJUNCTION_OR: {
+		// A union of point sets only
+		vector<Value> points;
+		bool exact = false;
+		for (auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
+			KeySet child_keys;
+			if (!AnalyzeFilter(*child, type, child_keys, optional) || !child_keys.has_points ||
+			    !child_keys.key_filters.empty()) {
+				return false;
+			}
+			child_keys.Normalize();
+			points.insert(points.end(), child_keys.points.begin(), child_keys.points.end());
+			exact = exact || child_keys.exact;
+		}
+		keys.has_points = true;
+		keys.points = std::move(points);
+		keys.exact = exact;
 		return true;
 	}
-	if (expr.GetExpressionType() == ExpressionType::COMPARE_IN) {
+	case ExpressionType::COMPARE_IN: {
 		auto &children = expr.Cast<BoundOperatorExpression>().GetChildren();
 		if (children.empty() || children[0]->GetExpressionType() != ExpressionType::BOUND_REF) {
 			return false;
 		}
+		vector<Value> points;
 		for (idx_t i = 1; i < children.size(); i++) {
 			if (children[i]->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
 				return false;
 			}
-			points.push_back(children[i]->Cast<BoundConstantExpression>().GetValue());
+			Value value;
+			if (!CastConstant(*children[i], type, value)) {
+				return false;
+			}
+			if (!value.IsNull()) {
+				points.push_back(std::move(value));
+			}
 		}
+		keys.has_points = true;
+		keys.points = std::move(points);
+		keys.exact = !optional;
 		return true;
 	}
-	if (expr.GetExpressionType() == ExpressionType::COMPARE_EQUAL && BoundComparisonExpression::IsComparison(expr)) {
-		auto &function = expr.Cast<BoundFunctionExpression>();
-		optional_ptr<const Expression> constant;
-		if (!ColumnSide(BoundComparisonExpression::Left(function), BoundComparisonExpression::Right(function),
-		                constant)) {
+	case ExpressionType::COMPARE_BETWEEN: {
+		if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
 			return false;
 		}
-		points.push_back(constant->Cast<BoundConstantExpression>().GetValue());
-		return true;
-	}
-	return false;
-}
-
-static vector<ValueRange> IntersectRanges(const vector<ValueRange> &left, const vector<ValueRange> &right) {
-	vector<ValueRange> result;
-	for (auto &a : left) {
-		for (auto &b : right) {
-			ValueRange range = a;
-			if (b.has_lower &&
-			    (!range.has_lower || b.lower > range.lower || (b.lower == range.lower && !b.lower_inclusive))) {
-				range.lower = b.lower;
-				range.lower_inclusive = b.lower_inclusive;
-				range.has_lower = true;
-			}
-			if (b.has_upper &&
-			    (!range.has_upper || b.upper < range.upper || (b.upper == range.upper && !b.upper_inclusive))) {
-				range.upper = b.upper;
-				range.upper_inclusive = b.upper_inclusive;
-				range.has_upper = true;
-			}
-			if (range.has_lower && range.has_upper &&
-			    (range.lower > range.upper ||
-			     (range.lower == range.upper && !(range.lower_inclusive && range.upper_inclusive)))) {
-				continue;
-			}
-			result.push_back(std::move(range));
-		}
-	}
-	return result;
-}
-
-//! Value ranges the filter restricts the column to, if it is made of
-//! comparisons with constants
-static bool ExtractRanges(const Expression &expr, const mnemonicdb::ValueCodec &codec, vector<ValueRange> &ranges) {
-	vector<Value> points;
-	if (ExtractPoints(expr, points)) {
-		for (auto &point : points) {
-			if (point.IsNull()) {
-				continue;
-			}
-			ValueRange range;
-			range.lower = range.upper = codec.EncodeValue(point);
-			range.has_lower = range.has_upper = true;
-			ranges.push_back(std::move(range));
-		}
-		return true;
-	}
-	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
-		// Intersect the ranges of every conjunct that has them; the full filter is
-		// still applied to every row
-		bool any = false;
-		vector<ValueRange> result;
-		for (auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
-			vector<ValueRange> child_ranges;
-			if (!ExtractRanges(*child, codec, child_ranges)) {
-				continue;
-			}
-			result = any ? IntersectRanges(result, child_ranges) : std::move(child_ranges);
-			any = true;
-		}
-		if (any) {
-			ranges.insert(ranges.end(), result.begin(), result.end());
-		}
-		return any;
-	}
-	if (expr.GetExpressionType() == ExpressionType::COMPARE_BETWEEN &&
-	    expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 		auto &between = expr.Cast<BoundFunctionExpression>();
 		if (!BoundBetweenExpression::HasValidBindData(between) ||
 		    BoundBetweenExpression::Input(between).GetExpressionType() != ExpressionType::BOUND_REF ||
@@ -443,69 +550,293 @@ static bool ExtractRanges(const Expression &expr, const mnemonicdb::ValueCodec &
 		    BoundBetweenExpression::UpperBound(between).GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
 			return false;
 		}
-		auto &lower = BoundBetweenExpression::LowerBound(between).Cast<BoundConstantExpression>().GetValue();
-		auto &upper = BoundBetweenExpression::UpperBound(between).Cast<BoundConstantExpression>().GetValue();
+		Value lower, upper;
+		if (!CastConstant(BoundBetweenExpression::LowerBound(between), type, lower) ||
+		    !CastConstant(BoundBetweenExpression::UpperBound(between), type, upper)) {
+			return false;
+		}
+		keys.exact = !optional;
 		if (lower.IsNull() || upper.IsNull()) {
+			// Never true
+			keys.has_points = true;
 			return true;
 		}
-		ValueRange range;
-		range.lower = codec.EncodeValue(lower);
-		range.has_lower = true;
-		range.lower_inclusive = BoundBetweenExpression::LowerInclusive(between);
-		range.upper = codec.EncodeValue(upper);
-		range.has_upper = true;
-		range.upper_inclusive = BoundBetweenExpression::UpperInclusive(between);
-		ranges.push_back(std::move(range));
+		keys.SetLower(std::move(lower), BoundBetweenExpression::LowerInclusive(between));
+		keys.SetUpper(std::move(upper), BoundBetweenExpression::UpperInclusive(between));
 		return true;
+	}
+	default:
+		break;
 	}
 	if (!BoundComparisonExpression::IsComparison(expr)) {
 		return false;
 	}
 	auto &function = expr.Cast<BoundFunctionExpression>();
 	auto &left = BoundComparisonExpression::Left(function);
-	auto type = expr.GetExpressionType();
+	auto comparison = expr.GetExpressionType();
 	optional_ptr<const Expression> constant;
 	auto column = ColumnSide(left, BoundComparisonExpression::Right(function), constant);
 	if (!column) {
 		return false;
 	}
 	if (column.get() != &left) {
-		type = FlipComparisonExpression(type);
+		comparison = FlipComparisonExpression(comparison);
 	}
-	auto &value = constant->Cast<BoundConstantExpression>().GetValue();
-	if (value.IsNull()) {
-		return true;
+	Value value;
+	if (!CastConstant(*constant, type, value)) {
+		return false;
 	}
-	ValueRange range;
-	switch (type) {
+	switch (comparison) {
+	case ExpressionType::COMPARE_EQUAL:
 	case ExpressionType::COMPARE_LESSTHAN:
 	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-		range.upper = codec.EncodeValue(value);
-		range.has_upper = true;
-		range.upper_inclusive = type == ExpressionType::COMPARE_LESSTHANOREQUALTO;
-		break;
 	case ExpressionType::COMPARE_GREATERTHAN:
 	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-		range.lower = codec.EncodeValue(value);
-		range.has_lower = true;
-		range.lower_inclusive = type == ExpressionType::COMPARE_GREATERTHANOREQUALTO;
 		break;
 	default:
 		return false;
+	}
+	keys.exact = !optional;
+	if (value.IsNull()) {
+		// Never true
+		keys.has_points = true;
+		return true;
+	}
+	switch (comparison) {
+	case ExpressionType::COMPARE_EQUAL:
+		keys.has_points = true;
+		keys.points.push_back(std::move(value));
+		break;
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		keys.SetUpper(std::move(value), comparison == ExpressionType::COMPARE_LESSTHANOREQUALTO);
+		break;
+	default:
+		keys.SetLower(std::move(value), comparison == ExpressionType::COMPARE_GREATERTHANOREQUALTO);
+		break;
+	}
+	return true;
+}
+
+//! The smallest well-formed entity id >= id (UINT64_MAX if none)
+static EntityId WellFormedAtOrAfter(EntityId id) {
+	if (mnemonicdb::IsWellFormed(id)) {
+		return id;
+	}
+	auto part = mnemonicdb::PartitionOf(id);
+	return part == UINT8_MAX ? UINT64_MAX : mnemonicdb::MakeEntityId(part + 1, 0);
+}
+
+//! The largest well-formed entity id <= id
+static EntityId WellFormedAtOrBefore(EntityId id) {
+	if (mnemonicdb::IsWellFormed(id)) {
+		return id;
+	}
+	return mnemonicdb::MakeEntityId(mnemonicdb::PartitionOf(id), mnemonicdb::LOCAL_MASK);
+}
+
+//! A key set over entity ids (the id column, or a REF value): explicit points,
+//! or an inclusive range [lower, upper], possibly with key bitmaps
+struct EntityKeys {
+	bool has_points = false;
+	vector<EntityId> points;
+	EntityId lower = 0;
+	EntityId upper = UINT64_MAX;
+	vector<reference<const PrefixRangeFunctionData>> key_filters;
+	bool exact = false;
+
+	bool Empty() const {
+		return lower > upper || (has_points && points.empty());
+	}
+	bool Bounded() const {
+		return lower > 0 || upper < UINT64_MAX;
+	}
+	bool Contains(EntityId id) const {
+		return id >= lower && id <= upper;
+	}
+};
+
+static EntityKeys ToEntityKeys(const KeySet &keys) {
+	EntityKeys result;
+	result.exact = keys.exact;
+	result.key_filters = keys.key_filters;
+	if (keys.has_lower) {
+		auto lower = keys.lower.GetValue<uint64_t>();
+		if (!keys.lower_inclusive) {
+			if (lower == UINT64_MAX) {
+				result.lower = 1;
+				result.upper = 0;
+				return result;
+			}
+			lower++;
+		}
+		result.lower = WellFormedAtOrAfter(lower);
+	}
+	if (keys.has_upper) {
+		auto upper = keys.upper.GetValue<uint64_t>();
+		if (!keys.upper_inclusive) {
+			if (upper == 0) {
+				result.lower = 1;
+				result.upper = 0;
+				return result;
+			}
+			upper--;
+		}
+		result.upper = WellFormedAtOrBefore(upper);
+	}
+	if (keys.has_points) {
+		result.has_points = true;
+		for (auto &point : keys.points) {
+			auto id = point.GetValue<uint64_t>();
+			if (mnemonicdb::IsWellFormed(id) && result.Contains(id)) {
+				result.points.push_back(id);
+			}
+		}
+	}
+	return result;
+}
+
+//! Both hold
+static void IntersectEntityKeys(EntityKeys &keys, EntityKeys &other) {
+	keys.lower = MaxValue(keys.lower, other.lower);
+	keys.upper = MinValue(keys.upper, other.upper);
+	if (other.has_points) {
+		if (keys.has_points) {
+			std::sort(other.points.begin(), other.points.end());
+			vector<EntityId> both;
+			for (auto id : keys.points) {
+				if (std::binary_search(other.points.begin(), other.points.end(), id)) {
+					both.push_back(id);
+				}
+			}
+			keys.points = std::move(both);
+		} else {
+			keys.points = std::move(other.points);
+			keys.has_points = true;
+		}
+	}
+	for (auto &filter : other.key_filters) {
+		keys.key_filters.push_back(filter);
+	}
+	keys.exact = keys.exact || other.exact;
+	if (keys.has_points) {
+		vector<EntityId> kept;
+		for (auto id : keys.points) {
+			if (keys.Contains(id)) {
+				kept.push_back(id);
+			}
+		}
+		keys.points = std::move(kept);
+	}
+}
+
+//! Whether some key of every bitmap may lie in [lower, upper]
+static bool KeysMayExist(const vector<reference<const PrefixRangeFunctionData>> &filters, EntityId lower,
+                         EntityId upper) {
+	for (auto &filter : filters) {
+		if (filter.get().filter->LookupRange(Value::UBIGINT(lower), Value::UBIGINT(upper)) ==
+		    FilterPropagateResult::FILTER_ALWAYS_FALSE) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! List the keys of the bitmaps in [lower, upper] by bisection. Returns false
+//! if there are more than `limit` (a bitmap that is not exact covers whole
+//! buckets of keys).
+static bool EnumerateKeys(const vector<reference<const PrefixRangeFunctionData>> &filters, EntityId lower,
+                          EntityId upper, idx_t limit, vector<EntityId> &result) {
+	if (lower > upper || !KeysMayExist(filters, lower, upper)) {
+		return true;
+	}
+	if (lower == upper) {
+		if (mnemonicdb::IsWellFormed(lower)) {
+			result.push_back(lower);
+		}
+		return result.size() <= limit;
+	}
+	auto middle = lower + (upper - lower) / 2;
+	return EnumerateKeys(filters, lower, middle, limit, result) &&
+	       EnumerateKeys(filters, middle + 1, upper, limit, result);
+}
+
+//! Resolve the key bitmaps of `keys` into points, if there are at most `limit`
+static void ResolveKeyFilters(EntityKeys &keys, idx_t limit) {
+	if (keys.has_points || keys.key_filters.empty() || keys.Empty()) {
+		return;
+	}
+	vector<EntityId> points;
+	if (EnumerateKeys(keys.key_filters, keys.lower, keys.upper, limit, points)) {
+		keys.points = std::move(points);
+		keys.has_points = true;
+	}
+}
+
+//! Encoded value ranges of an AVET-indexed attribute for a key set; false if
+//! the key set says nothing about the value
+static bool EncodedRanges(const AttributeDef &attr, const KeySet &keys, vector<ValueRange> &ranges) {
+	if (keys.has_points) {
+		for (auto &point : keys.points) {
+			if (attr.is_ref && !mnemonicdb::IsWellFormed(point.GetValue<uint64_t>())) {
+				continue;
+			}
+			ValueRange range;
+			range.lower = range.upper = attr.codec.EncodeValue(point);
+			range.has_lower = range.has_upper = true;
+			ranges.push_back(std::move(range));
+		}
+		return true;
+	}
+	if (!keys.has_lower && !keys.has_upper) {
+		return false;
+	}
+	ValueRange range;
+	if (attr.is_ref) {
+		auto bounds = ToEntityKeys(keys);
+		if (bounds.Empty()) {
+			return true;
+		}
+		range.lower = attr.codec.EncodeValue(Value::UBIGINT(bounds.lower));
+		range.has_lower = true;
+		if (bounds.upper != UINT64_MAX) {
+			range.upper = attr.codec.EncodeValue(Value::UBIGINT(WellFormedAtOrBefore(bounds.upper)));
+			range.has_upper = true;
+		}
+		ranges.push_back(std::move(range));
+		return true;
+	}
+	if (keys.has_lower) {
+		range.lower = attr.codec.EncodeValue(keys.lower);
+		range.has_lower = true;
+		range.lower_inclusive = keys.lower_inclusive;
+	}
+	if (keys.has_upper) {
+		range.upper = attr.codec.EncodeValue(keys.upper);
+		range.has_upper = true;
+		range.upper_inclusive = keys.upper_inclusive;
+	}
+	if (range.has_lower && range.has_upper &&
+	    (range.lower > range.upper ||
+	     (range.lower == range.upper && !(range.lower_inclusive && range.upper_inclusive)))) {
+		return true;
 	}
 	ranges.push_back(std::move(range));
 	return true;
 }
 
-//! Entities with a visible AVET entry for `attr` inside one of `ranges`
-static vector<EntityId> EntitiesInRanges(mnemonicdb::ReadView &view, const AttributeDef &attr,
-                                         const vector<ValueRange> &ranges, optional_idx as_of) {
-	vector<EntityId> result;
+//! Entities with a visible AVET entry for `attr` inside one of `ranges`; false
+//! once there are more than `limit`
+static bool EntitiesInRanges(mnemonicdb::ReadView &view, const AttributeDef &attr, const vector<ValueRange> &ranges,
+                             optional_idx as_of, optional_idx limit, vector<EntityId> &result) {
 	constexpr size_t tail = mnemonicdb::PACKED_ID_SIZE + mnemonicdb::PACKED_TX_SIZE;
 	auto prefix = mnemonicdb::AvetPrefix(attr.Local());
 	for (auto &range : ranges) {
 		auto scan = [&](ColumnFamily family, bool is_history) {
-			auto it = view.NewIterator(family, prefix);
+			// A point range covers one whole A+V prefix: let RocksDB use its bounds
+			auto point = range.has_lower && range.has_upper && range.lower == range.upper && range.lower_inclusive &&
+			             range.upper_inclusive;
+			auto it = view.NewIterator(family, point ? prefix + range.lower : prefix);
 			it->Seek(range.has_lower ? prefix + range.lower : prefix);
 			for (; it->Valid() && it->key().starts_with(prefix); it->Next()) {
 				std::string_view key(it->key().data(), it->key().size());
@@ -522,18 +853,41 @@ static vector<EntityId> EntitiesInRanges(mnemonicdb::ReadView &view, const Attri
 				auto value = it->value();
 				if (VisibleAsOf(as_of, key, is_history ? &value : nullptr)) {
 					result.push_back(mnemonicdb::GetEntityId(key.data() + key.size() - tail));
+					if (limit.IsValid() && result.size() > limit.GetIndex()) {
+						return false;
+					}
 				}
 			}
 			if (!it->status().ok()) {
 				throw IOException("MnemonicDB: RocksDB error: %s", it->status().ToString());
 			}
+			return true;
 		};
-		scan(ColumnFamily::AVET, false);
-		if (as_of.IsValid()) {
-			scan(ColumnFamily::AVET_HIST, true);
+		if (!scan(ColumnFamily::AVET, false)) {
+			return false;
+		}
+		if (as_of.IsValid() && !scan(ColumnFamily::AVET_HIST, true)) {
+			return false;
 		}
 	}
-	return result;
+	return true;
+}
+
+//! Entities whose REF attribute `attr` has a visible value among `targets`,
+//! from VAET (V6 A2 E6 T5); false once there are more than `limit`
+static bool EntitiesReferencing(mnemonicdb::ReadView &view, const AttributeDef &attr,
+                                const vector<EntityId> &targets, optional_idx as_of, optional_idx limit,
+                                vector<EntityId> &result) {
+	mnemonicdb::PrefixReader reader(view);
+	constexpr size_t head = mnemonicdb::PACKED_ID_SIZE + mnemonicdb::PACKED_ATTR_SIZE;
+	for (auto target : targets) {
+		ForEachVisible(reader, ColumnFamily::VAET, ColumnFamily::VAET_HIST, mnemonicdb::VaetPrefix(target, attr.Local()),
+		               as_of, [&](std::string_view key) { result.push_back(mnemonicdb::GetEntityId(key.data() + head)); });
+		if (limit.IsValid() && result.size() > limit.GetIndex()) {
+			return false;
+		}
+	}
+	return true;
 }
 
 //! Resolve a column id of the scan to a table and column
@@ -629,6 +983,11 @@ static bool IsNullRejecting(const Expression &expr) {
 	}
 }
 
+//! Point lookups for candidates from optional (join) filters are used while
+//! there are at most rows / ROWS_PER_HINT_KEY of them (and at least
+//! MIN_HINT_KEYS); beyond that a merge scan is cheaper
+static constexpr idx_t ROWS_PER_HINT_KEY = 64;
+static constexpr idx_t MIN_HINT_KEYS = 1024;
 //! Below this many estimated rows a scan runs as a single task
 static constexpr idx_t PARALLEL_SCAN_THRESHOLD = 100000;
 //! Rough number of rows per task in a parallel scan
@@ -689,8 +1048,17 @@ static void PlanTasks(ClientContext &context, const MnemonicScanBindData &bind_d
 	}
 	EntityId min_entity = 0;
 	EntityId max_entity = 0;
+	if (state.range_lower > state.range_upper) {
+		// An empty key set: read nothing
+		return;
+	}
 	if (!EntityBounds(view, state, bind_data.as_of.IsValid(), min_entity, max_entity)) {
 		state.tasks.push_back(ScanTask {});
+		return;
+	}
+	min_entity = MaxValue(min_entity, state.range_lower);
+	max_entity = MinValue(max_entity, state.range_upper);
+	if (min_entity > max_entity) {
 		return;
 	}
 	// Work is proportional to what the scan reads, not what it returns: size
@@ -709,8 +1077,13 @@ static void PlanTasks(ClientContext &context, const MnemonicScanBindData &bind_d
 	task_count = MinValue<idx_t>(task_count, span);
 	for (idx_t i = 0; i < task_count; i++) {
 		ScanTask task;
-		task.start = min_entity + EntityId(span * i / task_count);
-		task.end = i + 1 == task_count ? max_entity + 1 : min_entity + EntityId(span * (i + 1) / task_count);
+		// A split point between partitions is not an encodable id: start at the
+		// next one that is
+		auto split = [&](idx_t n) {
+			return min_entity + EntityId(static_cast<unsigned __int128>(span) * n / task_count);
+		};
+		task.start = WellFormedAtOrAfter(split(i));
+		task.end = i + 1 == task_count ? max_entity + 1 : split(i + 1);
 		state.tasks.push_back(task);
 	}
 }
@@ -753,51 +1126,145 @@ static unique_ptr<GlobalTableFunctionState> MnemonicScanInit(ClientContext &cont
 	}
 	state->projection_ids = input.projection_ids;
 
-	// Every pushed filter is accepted and applied exactly to each row. Filters on
-	// an id or on an AVET-indexed column may also narrow the scan to candidate
-	// entities.
-	optional_idx id_points_filter;
-	vector<EntityId> id_points;
-	optional_idx range_filter;
-	vector<ValueRange> ranges;
+	// Every pushed filter that is not purely optional is applied exactly to each
+	// row. Filters of every kind (exact, optional, dynamic join filters) may also
+	// narrow the scan: to candidate entities (lookup mode) or to a range of
+	// entities (merge mode).
+	EntityKeys id_keys;
+	bool id_constrained = false;
+	struct AttributeKeys {
+		idx_t attribute;
+		KeySet keys;
+	};
+	vector<AttributeKeys> attribute_keys;
 	if (input.filters) {
 		for (auto &entry : *input.filters) {
 			auto &filter = entry.Filter();
-			if (ExpressionFilter::IsOptionalFilter(filter)) {
-				continue;
-			}
 			auto &expression_filter = ExpressionFilter::GetExpressionFilter(filter, "mnemonicdb scan");
 			auto column = entry.GetIndex().GetIndex();
-			state->filters.push_back(ScanFilter {column, expression_filter});
-			auto &scan_column = state->columns[column];
-			if (scan_column.kind == ScanColumn::Kind::ID && !id_points_filter.IsValid()) {
-				vector<Value> points;
-				if (ExtractPoints(*expression_filter.expr, points)) {
-					id_points_filter = column;
-					for (auto &point : points) {
-						if (!point.IsNull()) {
-							id_points.push_back(point.DefaultCastAs(LogicalType::UBIGINT).GetValue<uint64_t>());
-						}
-					}
-				}
-			} else if (scan_column.kind == ScanColumn::Kind::ATTRIBUTE && !range_filter.IsValid()) {
-				auto &attr = state->attributes[scan_column.attribute].attr.get();
-				vector<ValueRange> attr_ranges;
-				if (attr.HasAvet() && !attr.many && ExtractRanges(*expression_filter.expr, attr.codec, attr_ranges)) {
-					range_filter = column;
-					ranges = std::move(attr_ranges);
-				}
+			if (!ExpressionFilter::IsOptionalFilter(filter)) {
+				state->filters.push_back(ScanFilter {column, expression_filter});
 			}
+			auto &scan_column = state->columns[column];
+			if (scan_column.kind == ScanColumn::Kind::EMPTY) {
+				continue;
+			}
+			KeySet keys;
+			if (!AnalyzeFilter(*expression_filter.expr, state->column_types[column], keys, false) ||
+			    !keys.Constrains()) {
+				continue;
+			}
+			keys.Normalize();
+			if (scan_column.kind == ScanColumn::Kind::ID) {
+				// Every id column of a (fused) scan holds the same entity, or NULL,
+				// which no key set contains
+				auto entity_keys = ToEntityKeys(keys);
+				if (id_constrained) {
+					IntersectEntityKeys(id_keys, entity_keys);
+				} else {
+					id_keys = std::move(entity_keys);
+					id_constrained = true;
+				}
+				continue;
+			}
+			auto &attr = state->attributes[scan_column.attribute].attr.get();
+			if (attr.many || (!attr.HasAvet() && !attr.is_ref)) {
+				continue;
+			}
+			attribute_keys.push_back(AttributeKeys {scan_column.attribute, std::move(keys)});
 		}
 	}
 
-	if (id_points_filter.IsValid()) {
+	// Candidates found through hints (not exact filters) are only worth point
+	// lookups when they are few compared to the table
+	idx_t rows = 0;
+	for (auto &table : bind_data.tables) {
+		rows = MaxValue(rows, EstimateTableRows(table.table.get()));
+	}
+	idx_t hint_limit = MaxValue<idx_t>(MIN_HINT_KEYS, rows / ROWS_PER_HINT_KEY);
+	if (bind_data.join_key_filters && !bind_data.join_key_filters->HasFilters()) {
+		// The join feeding this scan its key set has an empty build side: no row
+		// can match
 		state->lookup_mode = true;
-		state->candidates = std::move(id_points);
-	} else if (range_filter.IsValid()) {
-		state->lookup_mode = true;
-		auto &attr = state->attributes[state->columns[range_filter.GetIndex()].attribute].attr.get();
-		state->candidates = EntitiesInRanges(view, attr, ranges, bind_data.as_of);
+	} else if (id_constrained) {
+		if (id_keys.Empty()) {
+			state->lookup_mode = true;
+		} else {
+			if (!id_keys.has_points && !id_keys.key_filters.empty()) {
+				// Enumerate a join's key bitmap within the entities the scan could see
+				EntityId min_entity = 0;
+				EntityId max_entity = 0;
+				if (EntityBounds(view, *state, bind_data.as_of.IsValid(), min_entity, max_entity)) {
+					id_keys.lower = MaxValue(id_keys.lower, min_entity);
+					id_keys.upper = MinValue(id_keys.upper, max_entity);
+					ResolveKeyFilters(id_keys, hint_limit);
+				} else {
+					id_keys.has_points = true;
+				}
+			}
+			if (id_keys.has_points && !id_keys.exact && id_keys.points.size() > hint_limit) {
+				// A long hint (dynamic_or_filter_threshold raised): its bounds still help
+				auto bounds = std::minmax_element(id_keys.points.begin(), id_keys.points.end());
+				id_keys.lower = MaxValue(id_keys.lower, *bounds.first);
+				id_keys.upper = MinValue(id_keys.upper, *bounds.second);
+				id_keys.has_points = false;
+			}
+			if (id_keys.has_points) {
+				state->lookup_mode = true;
+				state->candidates = std::move(id_keys.points);
+			}
+		}
+		state->range_lower = id_keys.lower;
+		state->range_upper = id_keys.upper;
+	}
+	if (!state->lookup_mode) {
+		// Exact filters first: they were written for this
+		std::stable_sort(attribute_keys.begin(), attribute_keys.end(),
+		                 [](const AttributeKeys &a, const AttributeKeys &b) { return a.keys.exact > b.keys.exact; });
+		for (auto &entry : attribute_keys) {
+			auto &attr = state->attributes[entry.attribute].attr.get();
+			auto limit = entry.keys.exact ? optional_idx() : optional_idx(hint_limit);
+			vector<EntityId> candidates;
+			bool found = false;
+			if (attr.HasAvet()) {
+				KeySet keys = entry.keys;
+				if (attr.is_ref && !keys.has_points && !keys.key_filters.empty()) {
+					auto values = ToEntityKeys(keys);
+					ResolveKeyFilters(values, hint_limit);
+					if (values.has_points) {
+						keys.has_points = true;
+						for (auto id : values.points) {
+							keys.points.push_back(Value::UBIGINT(id));
+						}
+					}
+				}
+				vector<ValueRange> ranges;
+				found = EncodedRanges(attr, keys, ranges) &&
+				        EntitiesInRanges(view, attr, ranges, bind_data.as_of, limit, candidates);
+			} else {
+				// A REF without AVET: point lookups in VAET
+				auto values = ToEntityKeys(entry.keys);
+				ResolveKeyFilters(values, hint_limit);
+				found = values.has_points &&
+				        EntitiesReferencing(view, attr, values.points, bind_data.as_of, limit, candidates);
+			}
+			if (found) {
+				state->lookup_mode = true;
+				state->candidates = std::move(candidates);
+				break;
+			}
+		}
+		if (state->lookup_mode && state->range_lower <= state->range_upper) {
+			vector<EntityId> kept;
+			for (auto id : state->candidates) {
+				if (id >= state->range_lower && id <= state->range_upper) {
+					kept.push_back(id);
+				}
+			}
+			state->candidates = std::move(kept);
+		} else if (state->lookup_mode) {
+			state->candidates.clear();
+		}
 	}
 	// Choose which attributes to read
 	auto table_count = bind_data.tables.size();
@@ -992,6 +1459,7 @@ static bool NextMergedRow(MnemonicScanState &state, MnemonicScanLocalState &loca
 	if (!NextRequiredEntity(state, local, entity)) {
 		return false;
 	}
+	local.entities_read++;
 	auto table_count = state.table_required.size();
 	// Bring every other cursor (projected, filtered, optional tables) up to the
 	// entity
@@ -1066,6 +1534,7 @@ static bool NextCandidate(MnemonicScanState &state, MnemonicScanLocalState &loca
 	constexpr size_t head = mnemonicdb::PACKED_ID_SIZE + mnemonicdb::PACKED_ATTR_SIZE;
 	while (local.next_candidate < local.task.candidate_end) {
 		entity = state.candidates[local.next_candidate++];
+		local.entities_read++;
 		if (!mnemonicdb::IsWellFormed(entity)) {
 			continue;
 		}
@@ -1267,6 +1736,41 @@ idx_t EstimateScanRows(const MnemonicScanBindData &bind_data) {
 	return required_rows.IsValid() ? required_rows.GetIndex() : any_rows;
 }
 
+//! Column statistics for the planner: only distinct counts (the id is unique,
+//! and so are UNIQUE / PRIMARY KEY columns), never min/max, which DuckDB would
+//! trust to prune filters
+static unique_ptr<BaseStatistics> MnemonicScanStatistics(ClientContext &, const FunctionData *bind_data_p,
+                                                         column_t column_id) {
+	auto &bind_data = bind_data_p->Cast<MnemonicScanBindData>();
+	if (bind_data.fused) {
+		return nullptr;
+	}
+	auto &table = bind_data.tables[0].table.get();
+	if (column_id == MNEMONIC_ROWID_COLUMN || column_id == MNEMONIC_ID_COLUMN_INDEX) {
+		auto stats = BaseStatistics::CreateUnknown(mnemonicdb::RefType());
+		stats.SetDistinctCount(MaxValue<idx_t>(EstimateTableRows(table), 1));
+		return stats.ToUnique();
+	}
+	if (column_id == COLUMN_IDENTIFIER_EMPTY || column_id >= VIRTUAL_COLUMN_START ||
+	    column_id > table.GetTableDef().attributes.size()) {
+		return nullptr;
+	}
+	auto &attr = table.GetAttribute(column_id);
+	if (attr.unique == mnemonicdb::Uniqueness::NONE || attr.many) {
+		return nullptr;
+	}
+	auto &store = table.catalog.Cast<MnemonicCatalog>().GetStore();
+	auto stats = BaseStatistics::CreateUnknown(attr.type);
+	stats.SetDistinctCount(MaxValue<idx_t>(store.GetAttributeCount(attr.Local()), 1));
+	return stats.ToUnique();
+}
+
+static void MnemonicScanMetrics(TableFunctionGetMetricsInput &input) {
+	if (input.local_state) {
+		input.operator_metrics.rows_scanned = input.local_state->Cast<MnemonicScanLocalState>().entities_read;
+	}
+}
+
 static unique_ptr<NodeStatistics> MnemonicScanCardinality(ClientContext &, const FunctionData *bind_data) {
 	return make_uniq<NodeStatistics>(EstimateScanRows(bind_data->Cast<MnemonicScanBindData>()));
 }
@@ -1277,6 +1781,8 @@ static TableFunction BaseScanFunction() {
 	function.filter_pushdown = true;
 	function.filter_prune = true;
 	function.cardinality = MnemonicScanCardinality;
+	function.statistics = MnemonicScanStatistics;
+	function.get_metrics = MnemonicScanMetrics;
 	return function;
 }
 

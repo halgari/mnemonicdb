@@ -320,6 +320,15 @@ uint64_t Store::GetAttributeCount(AttrId attr) const {
 	return entry == attribute_counts.end() ? 0 : entry->second;
 }
 
+uint64_t Store::GetTotalCount() const {
+	std::lock_guard<std::mutex> guard(count_lock);
+	uint64_t total = 0;
+	for (auto &entry : attribute_counts) {
+		total += entry.second;
+	}
+	return total;
+}
+
 void Store::AcquireWriter(const std::function<void()> &check_interrupt) {
 	if (read_only) {
 		throw duckdb::InvalidInputException("MnemonicDB: database \"%s\" is attached read-only", path);

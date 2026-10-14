@@ -293,16 +293,38 @@ attributes of `t`, keyed on E (all of them, because membership is "any
 attribute"). Only projected columns are decoded. Cardinality-many columns
 collect consecutive V's for the same E into a LIST. Output is sorted by E.
 
-Filter pushdown: the scan accepts every filter DuckDB pushes and applies it
-exactly to each row, in batches. Two kinds of filter also choose the
-driving mode:
-- equality or IN on `id`, which becomes a set of candidate entities;
-- comparisons, BETWEEN, IN, AND (ranges intersected) or OR on an
-  AVET-indexed cardinality-one column, which becomes encoded value ranges,
-  then candidate entities from AVET (plus `avet_hist` under `AT`).
+Filter pushdown: the scan accepts every filter DuckDB pushes and applies every
+one that is not optional exactly to each row, in batches. Filters of every
+kind also say which entities can qualify: exact filters, and the optional and
+dynamic ones through which a join hands its key set to the probe-side scan at
+runtime (an `IN` list of up to `dynamic_or_filter_threshold` keys, min/max
+bounds, or a key bitmap). An optional filter is only a hint, but a row it
+rejects is one the join drops too, so it may narrow what the scan reads. Each
+filter is reduced to a key set for its column (points, bounds and key bitmaps,
+intersected through AND and optional wrappers, united through OR of points),
+which chooses the driving mode:
+- points on `id` (equality, `IN`, a join's key list, or a key bitmap
+  enumerated by bisection over the table's entity range) become candidate
+  entities;
+- otherwise points or ranges on an AVET-indexed cardinality-one column become
+  encoded value ranges, then candidate entities from AVET (plus `avet_hist`
+  under `AT`); points on a REF column without AVET become VAET lookups (plus
+  `vaet_hist`).
 
-Candidates are filled in by EAVT point lookups. Every other query merges the
-AEVT ranges.
+Candidates are filled in by EAVT point lookups (plus `eavt_hist` under `AT`).
+Candidates from hints are used only while there are at most
+max(1024, rows / 64) of them; past that a merge is cheaper. Every other query
+merges the AEVT ranges, bounded by any range on `id` (a join's min/max). A key
+set that is empty (contradictory filters, only NULLs, bounds that cross) reads
+nothing.
+
+A join whose build side is empty pushes no filter at all. The optimizer pass
+therefore marks scans that an equality hash join feeds in the same pipeline
+(only projections and filters in between; INNER, SEMI, RIGHT or RIGHT_SEMI;
+key and column of the same type; not in a recursive CTE). Such a join pushes a
+filter whenever its build side has a non-NULL key, so a marked scan that
+receives none reads nothing. DuckDB normally skips the probe pipeline itself
+in that case, but not always (for example inside a streamed CTE).
 
 **Reading fewer attributes.** Membership normally needs every attribute of a
 table. But when a pushed filter on an attribute is NULL-rejecting
@@ -340,7 +362,9 @@ DuckDB's own optimizers and fuses joins on entity id into a single scan.
   Joins fuse one at a time, bottom-up, so chains of three or more tables
   collapse into one scan.
 - **Filters** from both sides move into the fused scan, so an indexed
-  filter on either table still drives it from AVET.
+  filter on either table still drives it from AVET. Key sets that parent
+  joins push at runtime into either side are redirected to the fused scan,
+  shifted to its column positions.
 - **Not fused:** plans containing DML (UPDATE ... FROM needs a single
   table's row ids), joins on other columns or with extra conditions, joins
   across different `AT` versions, and joins with non-MnemonicDB tables.
@@ -621,7 +645,12 @@ INSERT INTO d.sys.assertions (name, query, doc) VALUES
   same columns as `mnemonicdb_history`: one row per assertion or retraction,
   read from the txlog entries of the transaction's own tx. Outside a writing
   transaction it returns nothing. Without a database name it reads the
-  default database. Writes that cancel out leave no row. Inside an
+  default database. Writes that cancel out leave no row. A ninth column,
+  `minted` (BOOLEAN, only in this function), is true when the entity was
+  minted by the transaction: its id was allocated after the transaction took
+  the writer lock (a tempid, a new table or attribute), or it is the
+  transaction's own tx entity. Such an entity had no state before, so checks
+  of what it used to be (children it had, a value it replaced) can skip it. Inside an
   assertion it returns the committing transaction's changes, so a check can
   start from what changed, e.g. walk `parent` up only from entities whose
   `parent` was asserted.
@@ -666,6 +695,13 @@ INSERT INTO d.sys.assertions (name, query, doc) VALUES
   Other connections are unaffected: the registry is keyed by
   `ClientContext`. The assertion connection uses default settings, not the
   committing session's.
+- **Estimates.** `mnemonicdb_tx_changes` reports its row count to the planner
+  (its pending txlog entries for the filtered attributes, counted up to
+  20,000), so a join builds its hash table on the changes rather than on a
+  large table. `mnemonicdb_history` estimates twice the current datoms of the
+  attributes it reads. Table scans report distinct counts for `id` and for
+  UNIQUE / PRIMARY KEY columns (never min/max, which DuckDB would trust for
+  pruning).
 - **Cost.** One connection per checked commit plus three statements per
   assertion. In a reldebug build, an autocommit single-row INSERT took about
   0.5 ms with no assertions and about 1.4 ms more per simple

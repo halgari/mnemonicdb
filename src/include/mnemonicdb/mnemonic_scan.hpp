@@ -6,6 +6,7 @@ namespace duckdb {
 
 class MnemonicTableEntry;
 class BoundAtClause;
+class DynamicTableFilterSet;
 
 //! One table read by a scan. A fused scan (several tables joined on their
 //! entity id) reads several; an entity is produced when it is a member of every
@@ -25,6 +26,10 @@ struct MnemonicScanBindData : public TableFunctionData {
 	bool fused = false;
 	//! The transaction to read as of (AT clause); unset reads the current state
 	optional_idx as_of;
+	//! Set by the optimizer when a hash join in the scan's pipeline will push its
+	//! key set into these filters at runtime, and pushes nothing only when its
+	//! build side has no key: the scan then reads nothing
+	shared_ptr<DynamicTableFilterSet> join_key_filters;
 
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;

@@ -156,6 +156,23 @@ mnemonicdb::TxId MnemonicTransaction::PendingTx() const {
 	return parent ? parent->PendingTx() : 0;
 }
 
+bool MnemonicTransaction::MintedHere(mnemonicdb::EntityId e) const {
+	if (!writer) {
+		return parent ? parent->MintedHere(e) : false;
+	}
+	if (!mnemonicdb::IsWellFormed(e)) {
+		return false;
+	}
+	auto part = mnemonicdb::PartitionOf(e);
+	if (part == mnemonicdb::partition::TX) {
+		return mnemonicdb::LocalOf(e) == writer->GetTx();
+	}
+	// IDs are allocated in increasing order per partition, and explicit ids must
+	// already be allocated, so everything at or past the counter the transaction
+	// started from is its own
+	return mnemonicdb::LocalOf(e) >= counters_at_start.next_local[part];
+}
+
 mnemonicdb::TxWriter &MnemonicTransaction::GetWriter() {
 	if (!writer) {
 		throw InternalException("MnemonicDB: writing in a read-only transaction");

@@ -67,6 +67,40 @@ relative to `duckdb/`. Re-verify after bumping the submodule.
   - `filters` (`TableFilterSet`) is keyed by index into `column_ids`. Filters
     are `ExpressionFilter`s over `BoundReferenceExpression(0)`. Skip optional
     ones with `ExpressionFilter::IsOptionalFilter`.
+- **Join key sets arrive as filters** (`physical_hash_join.cpp`,
+  `JoinFilterPushdownInfo::FinalizeFilters`). After a hash join's build side
+  is finalized it pushes, per probe column, into the probe scan's
+  `LogicalGet::dynamic_filters` (`DynamicTableFilterSet`).
+  `PhysicalTableScan::GetGlobalSourceState` merges them into
+  `TableFunctionInitInput::filters`, so `init_global` sees them; it runs after
+  the build pipeline. What arrives:
+  - one distinct key: a plain `col = v` (not optional);
+  - 2 to `dynamic_or_filter_threshold` (50) keys that are neither dense nor
+    contain NULL: `__internal_tablefilter_optional(col)` whose
+    `OptionalFilterFunctionData::child_filter_expr` is `col IN (...)`;
+  - otherwise optional `col >= min`, `col <= max` (selectivity-optional for
+    non-equality joins), and/or a prefix-range key bitmap
+    (`__internal_tablefilter_prefix_range`, `PrefixRangeFunctionData::filter`,
+    exact while the key span is under 2^26; `LookupRange(lo, hi)` answers
+    whether a key may lie in a range), or a Bloom filter;
+  - several filters on one column are ANDed into one `ExpressionFilter`.
+  - an empty (or all-NULL) build side pushes nothing. The executor skips the
+    probe pipeline when the join's sink is `NO_OUTPUT_POSSIBLE`, but each
+    thread may already pull a chunk, and streamed CTE pipelines are not
+    skipped.
+  `ExpressionFilter::IsOptionalFilter` is true when the whole tree is
+  optional. Optional functions evaluate to true, so executing an AND that
+  mixes them is still exact.
+- **Join filter targets are fixed before extension optimizers run.**
+  `JoinFilterPushdownOptimizer` records `ColumnBinding`s of the target
+  `LogicalGet` in `LogicalComparisonJoin::filter_pushdown->probe_info`; a pass
+  that replaces the get must move `dynamic_filters` and remap those columns.
+- **Estimates:** `TableFunction::cardinality` gets only the bind data.
+  `statistics` (per column) feeds the join order optimizer's distinct counts;
+  a SEMI join is still estimated at 20% of its probe side whatever the build
+  side's size.
+- `get_metrics` fills `OperatorMetrics::rows_scanned` per local state (JSON
+  profiling only; the text `EXPLAIN ANALYZE` does not show it).
 - For `count(*)` with no columns, `LogicalGet::GetAnyColumn` picks
   `COLUMN_IDENTIFIER_EMPTY` if it's in the virtual map, else ROW_ID.
 
