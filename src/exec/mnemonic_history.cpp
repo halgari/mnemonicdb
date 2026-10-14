@@ -19,6 +19,8 @@ using mnemonicdb::Datom;
 using mnemonicdb::EntityId;
 using mnemonicdb::TxId;
 
+namespace {
+
 struct HistoryBindData : public TableFunctionData {
 	explicit HistoryBindData(MnemonicCatalog &catalog) : catalog(catalog) {
 	}
@@ -355,6 +357,8 @@ static void HistoryFunction(ClientContext &context, TableFunctionInput &input, D
 	}
 	output.SetChildCardinality(count);
 }
+
+} // namespace
 
 void RegisterHistoryFunction(ExtensionLoader &loader) {
 	TableFunction function("mnemonicdb_history", {LogicalType::VARCHAR}, HistoryFunction, HistoryBind, HistoryInit);

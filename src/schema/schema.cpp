@@ -74,6 +74,8 @@ AttributeDef::AttributeDef(EntityId id_p, EntityId table_p, string name_p, Logic
 //===--------------------------------------------------------------------===//
 // Built-in definitions
 //===--------------------------------------------------------------------===//
+namespace {
+
 struct BuiltinAttribute {
 	AttrId local;
 	EntityId table;
@@ -82,6 +84,8 @@ struct BuiltinAttribute {
 	Uniqueness unique;
 	bool indexed;
 };
+
+} // namespace
 
 static vector<BuiltinAttribute> BuiltinAttributes() {
 	auto varchar = LogicalType(LogicalTypeId::VARCHAR);

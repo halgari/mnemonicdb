@@ -15,6 +15,8 @@
 
 namespace duckdb {
 
+namespace {
+
 struct DatomFunctionData : public TableFunctionData {
 	DatomFunctionData(MnemonicTableEntry &table, const mnemonicdb::AttributeDef &attr, mnemonicdb::EntityId entity,
 	                  Value value)
@@ -149,6 +151,8 @@ static void CurrentTxFunction(DataChunk &args, ExpressionState &state, Vector &r
 		return transaction.CurrentTxEntity();
 	});
 }
+
+} // namespace
 
 void RegisterDatomFunctions(ExtensionLoader &loader) {
 	ScalarFunction current_tx("current_tx", {LogicalType::VARCHAR}, mnemonicdb::RefType(), CurrentTxFunction);

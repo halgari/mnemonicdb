@@ -14,6 +14,8 @@ namespace duckdb {
 using mnemonicdb::AttributeDef;
 using mnemonicdb::EntityId;
 
+namespace {
+
 class MnemonicInsert : public PhysicalOperator {
 public:
 	MnemonicInsert(PhysicalPlan &physical_plan, vector<LogicalType> types, MnemonicTableEntry &table,
@@ -328,6 +330,8 @@ SourceResultType MnemonicInsert::GetDataInternal(ExecutionContext &context, Data
 	chunk.data[0].Append(Value::BIGINT(NumericCast<int64_t>(state.count)));
 	return SourceResultType::FINISHED;
 }
+
+} // namespace
 
 PhysicalOperator &PlanMnemonicInsert(ClientContext &, PhysicalPlanGenerator &planner, LogicalInsert &op,
                                      optional_ptr<PhysicalOperator> plan) {

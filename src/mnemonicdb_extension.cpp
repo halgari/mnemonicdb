@@ -164,6 +164,8 @@ static unique_ptr<TransactionManager> MnemonicCreateTransactionManager(optional_
 	return make_uniq<MnemonicTransactionManager>(db, catalog.Cast<MnemonicCatalog>());
 }
 
+namespace {
+
 class MnemonicStorageExtension : public StorageExtension {
 public:
 	MnemonicStorageExtension() {
@@ -171,6 +173,8 @@ public:
 		create_transaction_manager = MnemonicCreateTransactionManager;
 	}
 };
+
+} // namespace
 
 static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());

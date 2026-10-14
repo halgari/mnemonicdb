@@ -136,6 +136,8 @@ static string PrefixSuccessor(const string &prefix) {
 	return result;
 }
 
+namespace {
+
 //! A RocksDB iterator that owns the upper bound its read options point to
 class BoundedIterator : public rocksdb::Iterator {
 public:
@@ -184,6 +186,8 @@ private:
 	rocksdb::Slice upper_slice;
 	std::unique_ptr<rocksdb::Iterator> inner;
 };
+
+} // namespace
 
 std::unique_ptr<rocksdb::Iterator> ReadView::NewIterator(ColumnFamily cf, const string &prefix) {
 	rocksdb::ReadOptions options;

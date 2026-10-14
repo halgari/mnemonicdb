@@ -61,6 +61,8 @@ column_t FusedRowIdColumn(idx_t index) {
 	return VIRTUAL_COLUMN_START + 1 + index;
 }
 
+namespace {
+
 //! Iterates the datoms of one attribute in AEVT order. Reading the current
 //! state uses the current index only; reading as of transaction T merges in the
 //! history index and keeps datoms with Tassert <= T < Tretract.
@@ -1249,6 +1251,8 @@ static idx_t EstimateTableRows(MnemonicTableEntry &table) {
 	}
 	return single > 0 ? single : many;
 }
+
+} // namespace
 
 idx_t EstimateScanRows(const MnemonicScanBindData &bind_data) {
 	optional_idx required_rows;

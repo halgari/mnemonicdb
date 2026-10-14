@@ -836,6 +836,17 @@ test/sql/                 sqllogictest files
 test/unit/                codec round-trip tests
 ```
 
+### Symbol hygiene
+
+- File-local types go in an anonymous namespace. A struct or class that lives only in one `.cpp` must not sit
+  directly in `namespace duckdb` (or `mnemonicdb`): its name, and the mangled names of every template instantiated
+  on it (`std::vector<duckdb::ScanFilter>`, destructors, `_Destroy_range`), can collide with a same-named type in
+  DuckDB. The linker (MSVC in particular) then keeps one COMDAT, and objects get destroyed by the wrong type's code.
+- Compile definitions on vendored libraries (lz4, zstd, RocksDB) are `PRIVATE`, never `PUBLIC`, so they cannot leak
+  into RocksDB or the extension through `target_link_libraries`.
+- `scripts/check_duplicate_symbols.sh` (run by the `check_duplicate_symbols` target) fails on any strong symbol
+  defined in two objects across the bundled archives.
+
 ## 9. Milestones
 
 1. **Skeleton.** Builds against pinned DuckDB `main`; `ATTACH ... (TYPE mnemonicdb)`

@@ -10,6 +10,8 @@
 
 namespace duckdb {
 
+namespace {
+
 struct MnemonicInfoBindData : public TableFunctionData {
 	explicit MnemonicInfoBindData(MnemonicCatalog &catalog) : catalog(catalog) {
 	}
@@ -120,6 +122,8 @@ static void MnemonicCompactFunction(ClientContext &context, TableFunctionInput &
 	output.data[0].Append(Value::UBIGINT(before));
 	output.data[1].Append(Value::UBIGINT(store.ApproximateSize()));
 }
+
+} // namespace
 
 TableFunction MnemonicCompactTableFunction() {
 	return TableFunction("mnemonicdb_compact", {LogicalType::VARCHAR}, MnemonicCompactFunction, MnemonicCompactBind,

@@ -39,6 +39,8 @@ unique_ptr<CreateIndexInfo> MakeIndexInfo(MnemonicTableEntry &table, const strin
 //===--------------------------------------------------------------------===//
 // CREATE INDEX operators
 //===--------------------------------------------------------------------===//
+namespace {
+
 class PhysicalMnemonicCreateIndex : public PhysicalOperator {
 public:
 	PhysicalMnemonicCreateIndex(PhysicalPlan &physical_plan, MnemonicTableEntry &table, string index_name,
@@ -90,6 +92,8 @@ protected:
 	void ResolveTypes() override {
 	}
 };
+
+} // namespace
 
 unique_ptr<LogicalOperator> BindMnemonicCreateIndex(MnemonicTableEntry &table, unique_ptr<CreateIndexInfo> info) {
 	if (info->constraint_type != IndexConstraintType::NONE) {

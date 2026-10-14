@@ -17,6 +17,8 @@ namespace duckdb {
 using mnemonicdb::AttributeDef;
 using mnemonicdb::EntityId;
 
+namespace {
+
 //! A sink that changes rows identified by their row id and reports how many it
 //! changed
 class MnemonicModify : public PhysicalOperator {
@@ -163,6 +165,8 @@ protected:
 	}
 };
 
+} // namespace
+
 PhysicalOperator &PlanMnemonicDelete(ClientContext &, PhysicalPlanGenerator &planner, LogicalDelete &op,
                                      PhysicalOperator &plan) {
 	if (op.return_chunk) {
@@ -183,6 +187,8 @@ PhysicalOperator &PlanMnemonicDelete(ClientContext &, PhysicalPlanGenerator &pla
 //===--------------------------------------------------------------------===//
 // UPDATE
 //===--------------------------------------------------------------------===//
+namespace {
+
 class MnemonicUpdate : public MnemonicModify {
 public:
 	MnemonicUpdate(PhysicalPlan &physical_plan, vector<LogicalType> types, MnemonicTableEntry &table,
@@ -282,6 +288,8 @@ private:
 		return attr.codec.EncodeValue(vector.GetValue(row));
 	}
 };
+
+} // namespace
 
 PhysicalOperator &PlanMnemonicUpdate(ClientContext &, PhysicalPlanGenerator &planner, LogicalUpdate &op,
                                      PhysicalOperator &plan) {

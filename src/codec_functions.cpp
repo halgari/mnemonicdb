@@ -17,6 +17,8 @@ namespace duckdb {
 
 using mnemonicdb::ValueCodec;
 
+namespace {
+
 struct CodecBindData : public FunctionData {
 	explicit CodecBindData(LogicalType type) : codec(std::move(type)) {
 	}
@@ -233,6 +235,8 @@ static void TempidPartitionFunction(DataChunk &args, ExpressionState &, Vector &
 		    return mnemonicdb::MakeTempid(label.GetString(), part);
 	    });
 }
+
+} // namespace
 
 void RegisterCodecFunctions(ExtensionLoader &loader) {
 	loader.RegisterType("REF", mnemonicdb::RefType());

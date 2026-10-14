@@ -33,8 +33,10 @@ set(MNEMONICDB_LZ4_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lib)
 add_library(mnemonicdb_lz4 STATIC ${MNEMONICDB_LZ4_DIR}/lz4.c ${MNEMONICDB_LZ4_DIR}/lz4hc.c
                                   ${MNEMONICDB_LZ4_DIR}/lz4frame.c ${MNEMONICDB_LZ4_DIR}/xxhash.c)
 target_include_directories(mnemonicdb_lz4 PUBLIC $<BUILD_INTERFACE:${MNEMONICDB_LZ4_DIR}>)
-# lz4's xxhash must not clash with other copies linked into DuckDB
-target_compile_definitions(mnemonicdb_lz4 PUBLIC XXH_NAMESPACE=MNEMONICDB_LZ4_)
+# lz4's bundled xxhash (v0.6.5) must not clash with other copies linked into DuckDB. This must stay PRIVATE: RocksDB
+# links this target, and a PUBLIC definition would also rename RocksDB's own xxhash (v0.8, ROCKSDB_ by default) onto
+# the same symbols, giving two incompatible definitions of every MNEMONICDB_LZ4_XXH* function in the merged archive.
+target_compile_definitions(mnemonicdb_lz4 PRIVATE XXH_NAMESPACE=MNEMONICDB_LZ4_)
 set(MNEMONICDB_ZSTD_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd/lib)
 file(GLOB MNEMONICDB_ZSTD_SOURCES ${MNEMONICDB_ZSTD_DIR}/common/*.c ${MNEMONICDB_ZSTD_DIR}/compress/*.c
      ${MNEMONICDB_ZSTD_DIR}/decompress/*.c ${MNEMONICDB_ZSTD_DIR}/dictBuilder/*.c)
@@ -94,6 +96,22 @@ set_target_properties(rocksdb ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME} PROPE
                                                                                 CXX_SCAN_FOR_MODULES OFF)
 target_link_libraries(${EXTENSION_NAME} rocksdb)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} rocksdb)
+
+# CI check: no global symbol may be defined in two objects across the archives the extension bundles
+# (build it with `cmake --build . --target check_duplicate_symbols`). DuckDB's own archive is included when it exists.
+if(NOT MSVC)
+  set(MNEMONICDB_DUP_CHECK_ARCHIVES $<TARGET_FILE:${EXTENSION_NAME}> $<TARGET_FILE:rocksdb> $<TARGET_FILE:mnemonicdb_lz4>
+                                    $<TARGET_FILE:mnemonicdb_zstd>)
+  if(TARGET duckdb_static)
+    list(APPEND MNEMONICDB_DUP_CHECK_ARCHIVES $<TARGET_FILE:duckdb_static>)
+  endif()
+  add_custom_target(
+    check_duplicate_symbols
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_duplicate_symbols.sh ${MNEMONICDB_DUP_CHECK_ARCHIVES}
+    DEPENDS ${EXTENSION_NAME} rocksdb mnemonicdb_lz4 mnemonicdb_zstd
+    COMMENT "Checking for duplicate global symbols across bundled archives"
+    VERBATIM)
+endif()
 
 install(
   TARGETS ${EXTENSION_NAME} rocksdb mnemonicdb_lz4 mnemonicdb_zstd
