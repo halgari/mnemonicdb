@@ -43,6 +43,26 @@ static void Bootstrap(mnemonicdb::Store &store) {
 //! datom that is already current is a no-op, so this rewrites nothing that is
 //! there; when nothing is missing no transaction is written.
 static void UpgradeBuiltins(mnemonicdb::Store &store) {
+	// The backfill writes the built-in schema entities in partition 4. No
+	// version let users write there, but refuse to merge into anything else
+	{
+		mnemonicdb::ReadView view(store, nullptr);
+		auto builtin = mnemonicdb::Schema::Builtin();
+		for (auto schema_def : builtin->AllSchemas()) {
+			for (auto &datom :
+			     view.ScanPrefix(mnemonicdb::ColumnFamily::EAVT, mnemonicdb::EavtPrefix(schema_def->id))) {
+				bool expected =
+				    datom.a == mnemonicdb::sys::SCHEMAS_DOC ||
+				    (datom.a == mnemonicdb::sys::SCHEMAS_NAME &&
+				     builtin->GetAttribute(datom.a).codec.DecodeValue(datom.v).ToString() == schema_def->name);
+				if (!expected) {
+					throw IOException("MnemonicDB: cannot upgrade \"%s\": entity %d, reserved for the built-in schema "
+					                  "\"%s\", already holds other data (attribute %d)",
+					                  store.GetPath(), schema_def->id, schema_def->name, datom.a);
+				}
+			}
+		}
+	}
 	store.AcquireWriter();
 	try {
 		auto tx = store.GetLastTx() + 1;

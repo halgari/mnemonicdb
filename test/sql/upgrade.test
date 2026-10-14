@@ -5,9 +5,15 @@
 require mnemonicdb
 
 # The fixture is the RocksDB directory written by f456677: a person table
-# (5 transactions, one commit assertion). The sqllogictest runner can only
-# gunzip single files into existing directories, so a partitioned COPY makes
-# the directory first; RocksDB ignores the stray CSV file.
+# (5 transactions, one commit assertion), stored as one gzipped file per
+# RocksDB file (LOCK and the LOG info file are not needed). The sqllogictest
+# runner's `unzip` only gunzips a single file, and only into a directory that
+# already exists, and SQL has no mkdir. A hive-partitioned COPY creates the
+# directory `<root>/dir=<value>/` (with a data_0.csv inside), which then
+# serves as the RocksDB directory. This depends on: COPY ... PARTITION_BY
+# creating key=value directories, RocksDB ignoring files whose names are not
+# its own (data_0.csv), and the fixture's file names matching what RocksDB
+# expects (CURRENT naming MANIFEST-000005, WAL 000004.log not yet flushed).
 statement ok
 COPY (SELECT 'legacy.mnemonic' AS dir, 1 AS x) TO '{TEST_DIR}/upgrade' (FORMAT csv, PARTITION_BY (dir))
 
@@ -153,3 +159,118 @@ query TT
 SELECT path, layer FROM d.core.files
 ----
 x	b
+
+#
+# A user column on sys.tx that collides with a built-in added later
+#
+
+# Written by f456677 after ALTER TABLE sys.tx ADD COLUMN reencoded VARCHAR,
+# with one transaction noting 'my own note'. Policy: the user column keeps the
+# name, and the built-in sys.tx.reencoded is shadowed (still written, hidden
+# from SQL) until the user column is renamed.
+statement ok
+COPY (SELECT 'legacy_tx.mnemonic' AS dir, 1 AS x) TO '{TEST_DIR}/upgrade_tx' (FORMAT csv, PARTITION_BY (dir))
+
+unzip test/data/legacy_tx_column/CURRENT.gz {TEST_DIR}/upgrade_tx/dir=legacy_tx.mnemonic/CURRENT
+
+unzip test/data/legacy_tx_column/IDENTITY.gz {TEST_DIR}/upgrade_tx/dir=legacy_tx.mnemonic/IDENTITY
+
+unzip test/data/legacy_tx_column/MANIFEST-000005.gz {TEST_DIR}/upgrade_tx/dir=legacy_tx.mnemonic/MANIFEST-000005
+
+unzip test/data/legacy_tx_column/OPTIONS-000007.gz {TEST_DIR}/upgrade_tx/dir=legacy_tx.mnemonic/OPTIONS-000007
+
+unzip test/data/legacy_tx_column/000004.log.gz {TEST_DIR}/upgrade_tx/dir=legacy_tx.mnemonic/000004.log
+
+statement ok
+ATTACH '{TEST_DIR}/upgrade_tx/dir=legacy_tx.mnemonic' AS t (TYPE mnemonicdb, READ_ONLY)
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 't' AND table_name = 'tx' ORDER BY column_index
+----
+id	REF
+instant	TIMESTAMP WITH TIME ZONE
+reencoded	VARCHAR
+
+query IT
+SELECT mnemonicdb_id_local(id), reencoded FROM t.sys.tx WHERE reencoded IS NOT NULL
+----
+4	my own note
+
+statement ok
+DETACH t
+
+statement ok
+ATTACH '{TEST_DIR}/upgrade_tx/dir=legacy_tx.mnemonic' AS t (TYPE mnemonicdb)
+
+query I
+SELECT last_tx FROM mnemonicdb_info('t')
+----
+5
+
+query IT
+SELECT mnemonicdb_id_local(id), reencoded FROM t.sys.tx WHERE reencoded IS NOT NULL
+----
+4	my own note
+
+# The shadowed built-in is still written: ALTER COLUMN TYPE records its rewrite
+statement ok
+ALTER TABLE t.person ADD COLUMN age INTEGER
+
+statement ok
+INSERT INTO t.person (name, age) VALUES ('Bob', 40)
+
+statement ok
+ALTER TABLE t.person ALTER COLUMN age TYPE BIGINT
+
+query I
+SELECT count(*) FROM mnemonicdb_history('t') WHERE mnemonicdb_id_local(attribute) = 21
+----
+1
+
+# The user column cannot be re-added under a built-in name, but can be renamed,
+# which un-shadows the built-in
+statement ok
+ALTER TABLE t.sys.tx RENAME COLUMN reencoded TO note
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 't' AND table_name = 'tx' ORDER BY column_index
+----
+id	REF
+instant	TIMESTAMP WITH TIME ZONE
+reencoded	REF[]
+note	VARCHAR
+
+query IT
+SELECT mnemonicdb_id_local(id), note FROM t.sys.tx WHERE note IS NOT NULL
+----
+4	my own note
+
+query I
+SELECT len(reencoded) FROM t.sys.tx WHERE reencoded IS NOT NULL
+----
+1
+
+statement error
+ALTER TABLE t.sys.tx ADD COLUMN reencoded VARCHAR
+----
+already has a column
+
+# Built-in sys.tx columns cannot be renamed
+statement error
+ALTER TABLE t.sys.tx RENAME COLUMN instant TO happened
+----
+sys tables cannot be altered
+
+statement ok
+DETACH t
+
+statement ok
+ATTACH '{TEST_DIR}/upgrade_tx/dir=legacy_tx.mnemonic' AS t (TYPE mnemonicdb)
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 't' AND table_name = 'tx' ORDER BY column_index
+----
+id	REF
+instant	TIMESTAMP WITH TIME ZONE
+reencoded	REF[]
+note	VARCHAR

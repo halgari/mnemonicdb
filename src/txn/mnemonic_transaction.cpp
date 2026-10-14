@@ -312,9 +312,14 @@ void MnemonicTransaction::AlterTable(const string &schema_name, AlterTableInfo &
 		throw CatalogException("MnemonicDB: table \"%s\" does not exist", table_name);
 	}
 	bool tx_add_column = table->id == mnemonicdb::sys::TX && info.alter_table_type == AlterTableType::ADD_COLUMN;
-	if (table->schema == "sys" && !tx_add_column) {
+	bool tx_rename_user_column = false;
+	if (table->id == mnemonicdb::sys::TX && info.alter_table_type == AlterTableType::RENAME_COLUMN) {
+		auto attr = schema.FindAttribute(*table, info.Cast<RenameColumnInfo>().old_name.GetIdentifierName());
+		tx_rename_user_column = attr && attr->Local() >= 64;
+	}
+	if (table->schema == "sys" && !tx_add_column && !tx_rename_user_column) {
 		throw NotImplementedException("MnemonicDB: sys tables cannot be altered, "
-		                              "except ADD COLUMN on sys.tx");
+		                              "except ADD COLUMN and RENAME COLUMN of a user column on sys.tx");
 	}
 	auto &writer = GetWriter();
 	MnemonicStatement statement(*this);
@@ -348,6 +353,16 @@ void MnemonicTransaction::AlterTable(const string &schema_name, AlterTableInfo &
 		}
 		auto &sys_name = schema.GetAttribute(mnemonicdb::sys::ATTRIBUTES_NAME);
 		writer.Assert(sys_name, attr.id, sys_name.codec.EncodeValue(Value(new_name)));
+		if (tx_rename_user_column) {
+			// Renaming a user column of sys.tx may un-shadow a built-in column of
+			// the same name: re-read the schema
+			auto client = context.lock();
+			if (!client) {
+				throw InternalException("MnemonicDB: no client context");
+			}
+			SetSchema(mnemonicdb::Schema::Load(writer.GetView(), *client));
+			break;
+		}
 		auto renamed = attr;
 		renamed.name = new_name;
 		SetSchema(schema.WithAttribute(std::move(renamed)));
@@ -459,6 +474,10 @@ void MnemonicTransaction::ReloadSchema(ClientContext &context) {
 		}
 	}
 	for (auto old_attr : old_schema.AllAttributes()) {
+		if (old_attr->Local() < 64) {
+			// Built-ins cannot change (and may be shadowed, see Schema::AddAttribute)
+			continue;
+		}
 		auto new_table = new_schema->FindTable(old_attr->table);
 		bool still_there = false;
 		if (new_table) {
@@ -850,7 +869,11 @@ void MnemonicTransaction::ReplaceType(const mnemonicdb::TypeDef &existing, const
 	MnemonicStatement statement(*this);
 	// Columns dropped earlier keep their values in history, decoded with the
 	// type they were declared with: they are re-encoded too
-	auto old_dropped = DroppedAttributes(old_schema, *client);
+	// Only a width change re-encodes anything, so only then are they read
+	vector<mnemonicdb::AttributeDef> old_dropped;
+	if (old_type.InternalType() != type.InternalType()) {
+		old_dropped = DroppedAttributes(old_schema, *client);
+	}
 	auto &sys_definition = old_schema.GetAttribute(mnemonicdb::sys::TYPES_DEFINITION);
 	writer.Assert(sys_definition, existing.id, sys_definition.codec.EncodeValue(Value(type.ToString())));
 	if (doc != existing.doc) {

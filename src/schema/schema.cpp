@@ -181,7 +181,7 @@ bool TypeReferences(const LogicalType &type, const string &alias) {
 static constexpr const char *DATABASE_PROPERTY = "mnemonicdb.database";
 
 string DatabaseTag(const Store &store) {
-	return std::to_string(reinterpret_cast<uintptr_t>(&store));
+	return store.GetTag();
 }
 
 LogicalType MakeNamedType(const LogicalType &type, const string &schema, const string &name,
@@ -430,7 +430,19 @@ void Schema::AddAttribute(AttributeDef attribute) {
 		throw InvalidInputException("MnemonicDB: attribute \"%s\" refers to unknown table %d", attribute.name,
 		                            attribute.table);
 	}
-	if (FindAttribute(table->second, attribute.name)) {
+	if (auto existing = FindAttribute(table->second, attribute.name)) {
+		if (existing->Local() < 64 && attribute.Local() >= 64) {
+			// A built-in column added by a newer version to a user-extensible sys
+			// table (sys.tx) collides with a user column of an older database: the
+			// user column keeps the name and the built-in is shadowed (hidden from
+			// SQL, still written) until the user column is renamed
+			auto &list = table->second.attributes;
+			list.erase(std::remove(list.begin(), list.end(), existing->Local()), list.end());
+			list.push_back(attribute.Local());
+			auto local = attribute.Local();
+			attributes.emplace(local, std::move(attribute));
+			return;
+		}
 		throw InvalidInputException("MnemonicDB: table \"%s\" has two attributes named \"%s\"", table->second.name,
 		                            attribute.name);
 	}

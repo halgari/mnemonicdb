@@ -48,6 +48,10 @@ public:
 	bool IsReadOnly() const {
 		return read_only;
 	}
+	//! A random token identifying this open of the database within the process
+	const string &GetTag() const {
+		return tag;
+	}
 	uint32_t GetFormatVersion() const {
 		return format_version;
 	}
@@ -113,6 +117,7 @@ private:
 private:
 	string path;
 	bool read_only;
+	string tag;
 	unique_ptr<rocksdb::DB> db;
 	vector<rocksdb::ColumnFamilyHandle *> handles;
 	bool created = false;

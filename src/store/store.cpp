@@ -1,3 +1,4 @@
+#include "duckdb/common/types/uuid.hpp"
 #include "mnemonicdb/store.hpp"
 #include "mnemonicdb/encoding.hpp"
 
@@ -127,7 +128,8 @@ static void CheckStatus(const rocksdb::Status &status, const string &path) {
 	}
 }
 
-Store::Store(string path_p, bool read_only_p) : path(std::move(path_p)), read_only(read_only_p) {
+Store::Store(string path_p, bool read_only_p)
+    : path(std::move(path_p)), read_only(read_only_p), tag(duckdb::UUID::ToString(duckdb::UUID::GenerateRandomUUID())) {
 }
 
 Store::~Store() {

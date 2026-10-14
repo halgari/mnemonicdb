@@ -596,8 +596,20 @@ USE d.core;  -- unqualified names now resolve in core
   `sys.tx.reencoded`) in one transaction. It re-asserts the whole bootstrap
   description, and since asserting a current datom is a no-op only the
   missing ones are written; if none are missing no transaction is written.
-  `test/data/legacy_f456677` is a database written by f456677, used by
-  `test/sql/upgrade.test`.
+  Before writing, it checks that the reserved built-in schema entities
+  (partition 4, locals 1–2) hold nothing else, and refuses to upgrade if they
+  do. `test/data/legacy_f456677` and `test/data/legacy_tx_column` are
+  databases written by f456677, used by `test/sql/upgrade.test`.
+- **New built-in columns on user-extensible sys tables.** Users may add
+  columns to `sys.tx`, so a built-in column added by a newer version (such as
+  `sys.tx.reencoded`) can collide with a user column of an older database.
+  Policy: the user column keeps its name and the built-in is **shadowed**:
+  still written and in history, but not a column of the table, until the user
+  renames their column (`ALTER TABLE sys.tx RENAME COLUMN reencoded TO
+  note`, allowed for user columns of `sys.tx`), which un-shadows it. A new
+  user column can never take a built-in's name. Built-in attributes sort
+  before user ones, so an upgrade that adds a built-in column to `sys.tx`
+  inserts it before the user's columns and changes `SELECT *` column order.
 - **Tables** keep referring to their schema by name (`sys.tables.schema`).
   A table's identity is its entity ID and its attributes are keyed by their
   own IDs, so the same table name in two schemas never collides: the codec
@@ -654,8 +666,9 @@ CREATE TABLE d.mods.plugins (name VARCHAR, layer d.core.layer, conds d.core.cond
   (which could find another catalog's type of the same name); a missing one
   is an error. A column can use types of any schema of the same database. A
   named type of another MnemonicDB database is refused even when its name and
-  definition match: our named types carry a tag of the database (store) they
-  belong to, and the tag must be this database's. A DuckDB type from another
+  definition match: our named types carry a tag of the database they belong
+  to (a random token per open of the store), and the tag must be this
+  database's. A DuckDB type from another
   catalog (e.g. `memory.main.colour`) has no identity here and is copied
   structurally.
 - **What DuckDB sees.** Internally a named type carries the alias
@@ -686,7 +699,8 @@ CREATE TABLE d.mods.plugins (name VARCHAR, layer d.core.layer, conds d.core.cond
   grows past 255 or 65,535 values. Every attribute ever declared with the
   type is re-encoded: live columns and **dropped** columns, whose values live
   on in history (found as attributes with a `sys.attributes.type` but no
-  table link).
+  table link). Dropped columns are only read when the width changes (and by
+  DROP TYPE), so an append that changes no width never touches them.
 - **Past revisions decode with the current definition.** `AT`, history and
   `mnemonicdb_tx_changes` always decode values with the type as it is now
   (§7, "History"). For named types that is safe: an ENUM only ever grows, so
