@@ -20,7 +20,14 @@
 #include <exception>
 #include <map>
 #include <set>
-#include <thread>
+#include <functional>
+
+#if defined(_WIN32)
+#include "duckdb/common/windows.hpp"
+#include <process.h>
+#else
+#include <pthread.h>
+#endif
 
 namespace duckdb {
 
@@ -32,6 +39,14 @@ static constexpr idx_t ASSERTION_ROWS_SHOWN = 5;
 //! The setting that says how many assertions are evaluated at once
 static constexpr const char *THREADS_SETTING = "mnemonicdb_assertion_threads";
 static constexpr int64_t DEFAULT_ASSERTION_THREADS = 4;
+static constexpr int64_t MAX_ASSERTION_THREADS = 64;
+//! Test hook: how many evaluating threads may be started before starting one
+//! fails as if the system refused (negative: no limit)
+static constexpr const char *THREAD_LIMIT_SETTING = "mnemonicdb_debug_assertion_thread_limit";
+//! Stack of an evaluating thread: a typical main-thread stack, since an
+//! assertion's query is planned recursively (macOS defaults threads to 512 KiB,
+//! Windows to 1 MiB)
+static constexpr idx_t ASSERTION_THREAD_STACK = 8 * 1024 * 1024;
 
 namespace {
 
@@ -57,6 +72,74 @@ public:
 private:
 	MnemonicCatalog &catalog;
 	ClientContext &context;
+};
+
+//! A thread with an explicit stack size, joined when destroyed. Start returns
+//! false when the thread could not be created.
+class WorkerThread {
+public:
+	WorkerThread() = default;
+	WorkerThread(const WorkerThread &) = delete;
+	WorkerThread &operator=(const WorkerThread &) = delete;
+	~WorkerThread() {
+		Join();
+	}
+
+	bool Start(std::function<void()> body_p) {
+		body = std::move(body_p);
+#if defined(_WIN32)
+		auto result = _beginthreadex(nullptr, static_cast<unsigned>(ASSERTION_THREAD_STACK), &WorkerThread::Run, this,
+		                             STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+		if (result == 0) {
+			return false;
+		}
+		handle = reinterpret_cast<HANDLE>(result);
+		started = true;
+#else
+		pthread_attr_t attr;
+		if (pthread_attr_init(&attr) != 0) {
+			return false;
+		}
+		bool ok = pthread_attr_setstacksize(&attr, ASSERTION_THREAD_STACK) == 0 &&
+		          pthread_create(&thread, &attr, &WorkerThread::Run, this) == 0;
+		pthread_attr_destroy(&attr);
+		if (!ok) {
+			return false;
+		}
+		started = true;
+#endif
+		return true;
+	}
+
+	void Join() {
+		if (!started) {
+			return;
+		}
+		started = false;
+#if defined(_WIN32)
+		WaitForSingleObject(handle, INFINITE);
+		CloseHandle(handle);
+#else
+		pthread_join(thread, nullptr);
+#endif
+	}
+
+private:
+#if defined(_WIN32)
+	static unsigned __stdcall Run(void *self) {
+		static_cast<WorkerThread *>(self)->body();
+		return 0;
+	}
+	HANDLE handle = nullptr;
+#else
+	static void *Run(void *self) {
+		static_cast<WorkerThread *>(self)->body();
+		return nullptr;
+	}
+	pthread_t thread;
+#endif
+	std::function<void()> body;
+	bool started = false;
 };
 
 //! One evaluation of the assertions: the work the evaluating connections share
@@ -86,15 +169,20 @@ AssertionStatementCache::AssertionStatementCache() {
 AssertionStatementCache::~AssertionStatementCache() {
 }
 
-unique_ptr<SQLStatement> AssertionStatementCache::Get(const string &key) {
+unique_ptr<SQLStatement> AssertionStatementCache::Get(const string &key,
+                                                     const shared_ptr<CompiledGrammar> &grammar) {
 	lock_guard<mutex> guard(lock);
 	auto entry = entries.find(key);
-	return entry == entries.end() ? nullptr : entry->second->Copy();
+	if (entry == entries.end() || entry->second.grammar.get() != grammar.get()) {
+		return nullptr;
+	}
+	return entry->second.statement->Copy();
 }
 
-void AssertionStatementCache::Put(const string &key, const SQLStatement &statement) {
+void AssertionStatementCache::Put(const string &key, const SQLStatement &statement,
+                                  shared_ptr<CompiledGrammar> grammar) {
 	lock_guard<mutex> guard(lock);
-	entries[key] = statement.Copy();
+	entries[key] = Entry {statement.Copy(), std::move(grammar)};
 }
 
 void AssertionStatementCache::Retain(const vector<string> &keys) {
@@ -147,10 +235,10 @@ static string RenderRow(DataChunk &chunk, idx_t row) {
 	return "(" + StringUtil::Join(values, ", ") + ")";
 }
 
-//! What parsing depends on besides the text: a parsed query is reused only
-//! under the same options
-static string ParserOptionsKey(ClientContext &context) {
-	auto options = context.GetParserOptions();
+//! What parsing depends on besides the text and the grammar: a parsed query is
+//! reused only under the same options. (The extension callback manager is the
+//! database's own, so only how many parser extensions it holds can change.)
+static string ParserOptionsKey(const ParserOptions &options) {
 	idx_t parser_extensions = 0;
 	if (options.extensions) {
 		for (auto &extension : options.extensions->ParserExtensions()) {
@@ -164,8 +252,6 @@ static string ParserOptionsKey(ClientContext &context) {
 	                      std::to_string(static_cast<int>(options.regex_match_operator_semantics)),
 	                      std::to_string(options.max_expression_depth),
 	                      std::to_string(static_cast<int>(options.parser_override_setting)),
-	                      std::to_string(reinterpret_cast<uintptr_t>(options.compiled_grammar.get())),
-	                      std::to_string(reinterpret_cast<uintptr_t>(options.extensions.get())),
 	                      std::to_string(parser_extensions)};
 	return StringUtil::Join(parts, " ");
 }
@@ -173,8 +259,9 @@ static string ParserOptionsKey(ClientContext &context) {
 //! The assertion's query as one SELECT statement: from the cache, or parsed
 //! (and then cached). Returns the reason it is invalid, or an empty string.
 static string ParseAssertion(Connection &con, AssertionStatementCache &cache, const string &key,
-                             const AssertionDef &assertion, unique_ptr<SQLStatement> &statement) {
-	statement = cache.Get(key);
+                             const shared_ptr<CompiledGrammar> &grammar, const AssertionDef &assertion,
+                             unique_ptr<SQLStatement> &statement) {
+	statement = cache.Get(key, grammar);
 	if (statement) {
 		return string();
 	}
@@ -187,7 +274,7 @@ static string ParseAssertion(Connection &con, AssertionStatementCache &cache, co
 	if (statements.size() != 1 || statements[0]->type != StatementType::SELECT_STATEMENT) {
 		return "its query must be a single SELECT statement";
 	}
-	cache.Put(key, *statements[0]);
+	cache.Put(key, *statements[0], grammar);
 	statement = std::move(statements[0]);
 	return string();
 }
@@ -203,6 +290,7 @@ static void RunStatement(Connection &con, const string &query) {
 //! the failure message, or an empty string if it passed. Sets `aborted` when
 //! the query failed, which leaves the transaction unusable.
 static string RunAssertion(Connection &con, AssertionStatementCache &cache, const string &key,
+                           const shared_ptr<CompiledGrammar> &grammar,
                            const AssertionDef &assertion, bool &aborted) {
 	auto quoted = "assertion \"" + assertion.name + "\"";
 	if (!assertion.has_name) {
@@ -212,7 +300,7 @@ static string RunAssertion(Connection &con, AssertionStatementCache &cache, cons
 		return quoted + " is invalid: it has no query";
 	}
 	unique_ptr<SQLStatement> statement;
-	auto invalid = ParseAssertion(con, cache, key, assertion, statement);
+	auto invalid = ParseAssertion(con, cache, key, grammar, assertion, statement);
 	if (!invalid.empty()) {
 		return quoted + " is invalid: " + invalid;
 	}
@@ -255,7 +343,8 @@ static void RunAssertions(AssertionRun &run) {
 	// Unqualified names in an assertion refer to this database, whatever it is
 	// attached as
 	RunStatement(con, "USE " + KeywordHelper::WriteOptionallyQuoted(run.catalog.GetName().GetIdentifierName()));
-	auto options_key = ParserOptionsKey(*con.context);
+	auto options = con.context->GetParserOptions();
+	auto options_key = ParserOptionsKey(options);
 	auto &cache = run.catalog.GetAssertionCache();
 	bool open = false;
 	for (idx_t i = run.next++; i < run.assertions.size(); i = run.next++) {
@@ -268,7 +357,7 @@ static void RunAssertions(AssertionRun &run) {
 			open = true;
 		}
 		bool aborted = false;
-		run.failures[i] = RunAssertion(con, cache, run.keys[i], assertion, aborted);
+		run.failures[i] = RunAssertion(con, cache, run.keys[i], options.compiled_grammar, assertion, aborted);
 		if (aborted) {
 			RunStatement(con, "ROLLBACK");
 			open = false;
@@ -279,13 +368,13 @@ static void RunAssertions(AssertionRun &run) {
 	}
 }
 
-//! How many connections evaluate assertions at once
-static idx_t AssertionThreads(ClientContext &context) {
+//! An integer setting of the committing connection, or `fallback`
+static int64_t IntSetting(ClientContext &context, const char *name, int64_t fallback) {
 	Value setting;
-	if (context.TryGetCurrentSetting(Identifier(THREADS_SETTING), setting) && !setting.IsNull()) {
-		return idx_t(MaxValue<int64_t>(setting.GetValue<int64_t>(), 1));
+	if (context.TryGetCurrentSetting(Identifier(name), setting) && !setting.IsNull()) {
+		return setting.GetValue<int64_t>();
 	}
-	return idx_t(DEFAULT_ASSERTION_THREADS);
+	return fallback;
 }
 
 void EvaluateAssertions(ClientContext &context, MnemonicTransaction &transaction) {
@@ -297,8 +386,11 @@ void EvaluateAssertions(ClientContext &context, MnemonicTransaction &transaction
 	auto &catalog = transaction.GetCatalog();
 	AssertionRun run(catalog, transaction, *context.db, assertions);
 	// Each connection evaluates whichever assertion is next; this thread is one
-	// of them
-	auto threads = MinValue<idx_t>(AssertionThreads(context), assertions.size());
+	// of them, so evaluation goes on with however many others could be started
+	auto setting = IntSetting(context, THREADS_SETTING, DEFAULT_ASSERTION_THREADS);
+	auto threads = MinValue<idx_t>(idx_t(MinValue(MaxValue<int64_t>(setting, 1), MAX_ASSERTION_THREADS)),
+	                               assertions.size());
+	auto thread_limit = IntSetting(context, THREAD_LIMIT_SETTING, -1);
 	vector<std::exception_ptr> errors(threads);
 	auto evaluate = [&run, &errors](idx_t worker) {
 		try {
@@ -307,13 +399,27 @@ void EvaluateAssertions(ClientContext &context, MnemonicTransaction &transaction
 			errors[worker] = std::current_exception();
 		}
 	};
-	vector<std::thread> workers;
-	for (idx_t worker = 1; worker < threads; worker++) {
-		workers.emplace_back(evaluate, worker);
-	}
-	evaluate(0);
-	for (auto &worker : workers) {
-		worker.join();
+	{
+		// Declared after `errors` and `run`: every started thread is joined
+		// before they go, on every path
+		vector<unique_ptr<WorkerThread>> workers;
+		for (idx_t worker = 1; worker < threads; worker++) {
+			if (thread_limit >= 0 && idx_t(thread_limit) < worker) {
+				break;
+			}
+			auto thread = make_uniq<WorkerThread>();
+			bool started = false;
+			try {
+				started = thread->Start([&evaluate, worker]() { evaluate(worker); });
+			} catch (...) {
+				// std::function or allocation failure: as if not started
+			}
+			if (!started) {
+				break;
+			}
+			workers.push_back(std::move(thread));
+		}
+		evaluate(0);
 	}
 	for (auto &error : errors) {
 		if (error) {
@@ -337,8 +443,12 @@ void EvaluateAssertions(ClientContext &context, MnemonicTransaction &transaction
 void RegisterAssertionSettings(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.AddExtensionOption(Identifier(THREADS_SETTING),
-	                          "How many commit assertions are evaluated at once, each on its own connection",
+	                          "How many commit assertions are evaluated at once, each on its own connection (1 to 64)",
 	                          LogicalType::BIGINT, Value::BIGINT(DEFAULT_ASSERTION_THREADS));
+	config.AddExtensionOption(Identifier(THREAD_LIMIT_SETTING),
+	                          "Testing only: how many threads may be started to evaluate commit assertions before "
+	                          "starting one fails as if the system refused (negative: no limit)",
+	                          LogicalType::BIGINT, Value::BIGINT(-1));
 }
 
 } // namespace duckdb

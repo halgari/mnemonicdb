@@ -30,7 +30,7 @@ SELECT current_setting('mnemonicdb_assertion_threads')
 # evaluate them; a query that fails at run time leaves its connection's
 # transaction unusable, and the assertions after it run in a new one
 #----------------------------------------------------------------------
-foreach threads 0 1 2 4 16
+foreach threads 0 1 2 4 16 1000
 
 statement ok
 SET mnemonicdb_assertion_threads = {threads}
@@ -56,7 +56,32 @@ endloop
 query I
 SELECT count(*) FROM d.person
 ----
-5
+6
+
+#----------------------------------------------------------------------
+# A thread that can't be started (simulated) leaves its share to the others:
+# the committing thread alone evaluates everything
+#----------------------------------------------------------------------
+foreach limit 0 1 3
+
+statement ok
+SET mnemonicdb_assertion_threads = 8
+
+statement ok
+SET mnemonicdb_debug_assertion_thread_limit = {limit}
+
+statement ok
+INSERT INTO d.person (name, age) VALUES ('Limit{limit}', 1)
+
+statement error
+INSERT INTO d.person (name, age) VALUES ('Boom', 1), ('Bad', -1)
+----
+<REGEX>:.*assertion "a_boom" could not run: [^;]*boom[^;]*; assertion "b_bad" failed \(1 row\): \(Bad\); assertion "d_bad_age" failed \(1 row\): \(Bad, -1\); assertion "f_negative" failed \(1 row\): \(\d+\).*
+
+endloop
+
+statement ok
+RESET mnemonicdb_debug_assertion_thread_limit
 
 statement ok
 RESET mnemonicdb_assertion_threads

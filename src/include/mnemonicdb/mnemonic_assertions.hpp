@@ -10,6 +10,7 @@ namespace duckdb {
 class ClientContext;
 class MnemonicTransaction;
 class SQLStatement;
+struct CompiledGrammar;
 
 //! Evaluate every assertion in sys.assertions against the pending state of a
 //! committing transaction (its own writes included). Throws a
@@ -29,16 +30,21 @@ public:
 	AssertionStatementCache();
 	~AssertionStatementCache();
 
-	//! A copy of the statement parsed for `key`, or nullptr
-	unique_ptr<SQLStatement> Get(const string &key);
-	//! Keep a copy of `statement` for `key`
-	void Put(const string &key, const SQLStatement &statement);
+	//! A copy of the statement parsed for `key` with `grammar`, or nullptr
+	unique_ptr<SQLStatement> Get(const string &key, const shared_ptr<CompiledGrammar> &grammar);
+	//! Keep a copy of `statement`, parsed with `grammar`, for `key`
+	void Put(const string &key, const SQLStatement &statement, shared_ptr<CompiledGrammar> grammar);
 	//! Drop every entry but those in `keys` (the assertions of the last commit)
 	void Retain(const vector<string> &keys);
 
 private:
 	mutex lock;
-	unordered_map<string, unique_ptr<SQLStatement>> entries;
+	struct Entry {
+		unique_ptr<SQLStatement> statement;
+		//! Held, so that comparing by address can't match a later grammar
+		shared_ptr<CompiledGrammar> grammar;
+	};
+	unordered_map<string, Entry> entries;
 };
 
 } // namespace duckdb

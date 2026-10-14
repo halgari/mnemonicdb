@@ -327,7 +327,8 @@ therefore marks scans that an equality hash join feeds in the same pipeline
 key and column of the same type; in the recursive step of a recursive CTE,
 only joins whose build side reads the working table, since DuckDB may build an
 invariant one once and reuse it; the anchor runs once and is marked like any
-other subplan). Such a join pushes a
+other subplan; never under a join directly over a USING KEY CTE's recurring
+table, which DuckDB may plan as a key join that pushes no filters). Such a join pushes a
 filter whenever its build side has a non-NULL key, so a marked scan that
 receives none reads nothing. The DuckDB behaviour this relies on is listed at
 `MarkJoinKeyScans` and pinned by `test/sql/key_set_push_paths.test`. DuckDB normally skips the probe pipeline itself
@@ -703,10 +704,14 @@ INSERT INTO d.sys.assertions (name, query, doc) VALUES
      connection runs; after a query fails at run time (which leaves a DuckDB
      transaction unusable) the connection rolls back and begins a new one.
      Failures are reported in name order whatever ran where. The setting is read
-     from the committing connection.
+     from the committing connection and clamped to 1–64. Worker threads get an
+     8 MiB stack (macOS defaults to 512 KiB, Windows to 1 MiB) and are joined
+     on every path; if one can't be created, evaluation goes on with those
+     already started (the committing thread alone suffices).
+     `mnemonicdb_debug_assertion_thread_limit` simulates that for tests.
   5. A query is parsed once and the statement kept on the catalog (keyed by its
      text and the parser options, which a fresh connection takes from the global
-     settings); each commit copies the cached statement. Entries for queries no
+     settings, and reused only with the same grammar, which the entry holds); each commit copies the cached statement. Entries for queries no
      longer in sys.assertions are dropped after each evaluation. Parsing is a
      large share of an assertion's cost: DuckDB's PEG parser takes about 3 µs
      per byte, so tens of milliseconds for a few kilobytes of SQL.

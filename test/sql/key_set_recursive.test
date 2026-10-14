@@ -137,3 +137,68 @@ SELECT count(*) FROM down
 0
 
 endloop
+
+#----------------------------------------------------------------------
+# USING KEY: a join directly over the recurring table may be planned as a
+# key join, which pushes no key set, so its probe-side scan is not marked
+#----------------------------------------------------------------------
+statement ok
+CREATE TABLE d.edge (src INTEGER, dst INTEGER)
+
+statement ok
+INSERT INTO d.edge (src, dst) SELECT i, CASE WHEN i < 60 THEN i + 1 ELSE i + 100000 END FROM range(20000) t(i)
+
+statement ok
+CREATE TABLE ref_edge AS SELECT src, dst FROM d.edge
+
+query I
+SELECT (SELECT count(*) || ',' || sum(node) FROM (WITH RECURSIVE r(node) USING KEY (node) AS (
+    SELECT 0
+  UNION
+    (SELECT e.dst FROM d.edge e WHERE e.src IN (SELECT node FROM recurring.r)))
+SELECT * FROM r))
+= (SELECT count(*) || ',' || sum(node) FROM (WITH RECURSIVE r(node) USING KEY (node) AS (
+    SELECT 0
+  UNION
+    (SELECT e.dst FROM ref_edge e WHERE e.src IN (SELECT node FROM recurring.r)))
+SELECT * FROM r))
+----
+true
+
+query I
+SELECT (SELECT count(*) || ',' || sum(node) FROM (WITH RECURSIVE r(node, v) USING KEY (node) AS (
+    SELECT 0, 0
+  UNION
+    (SELECT e.dst, 1 FROM d.edge e WHERE e.src IN (SELECT node FROM recurring.r WHERE v >= 0)))
+SELECT * FROM r))
+= (SELECT count(*) || ',' || sum(node) FROM (WITH RECURSIVE r(node, v) USING KEY (node) AS (
+    SELECT 0, 0
+  UNION
+    (SELECT e.dst, 1 FROM ref_edge e WHERE e.src IN (SELECT node FROM recurring.r WHERE v >= 0)))
+SELECT * FROM r))
+----
+true
+
+# An inner join straight onto the recurring table: planned as a key join
+query I
+SELECT (SELECT count(*) || ',' || sum(node) FROM (WITH RECURSIVE r(node) USING KEY (node) AS (
+    SELECT 0
+  UNION
+    (SELECT e.dst FROM d.edge e JOIN recurring.r rr ON e.src = rr.node))
+SELECT * FROM r))
+= (SELECT count(*) || ',' || sum(node) FROM (WITH RECURSIVE r(node) USING KEY (node) AS (
+    SELECT 0
+  UNION
+    (SELECT e.dst FROM ref_edge e JOIN recurring.r rr ON e.src = rr.node))
+SELECT * FROM r))
+----
+true
+
+query I
+SELECT count(*) FROM (WITH RECURSIVE r(node) USING KEY (node) AS (
+    SELECT 0
+  UNION
+    (SELECT e.dst FROM d.edge e JOIN recurring.r rr ON e.src = rr.node))
+SELECT * FROM r)
+----
+62

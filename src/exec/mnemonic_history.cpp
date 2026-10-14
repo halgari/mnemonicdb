@@ -389,12 +389,11 @@ static void HistoryFunction(ClientContext &context, TableFunctionInput &input, D
 		}
 	};
 	auto emit = [&](TxId tx, const Datom &datom, bool added) {
-		optional_ptr<AttributeInfo> info;
+		// Looked up whatever the columns read (cached per attribute): an attribute
+		// without a definition is an internal error even when no column shows it
+		auto &info = GetAttributeInfo(context, state, transaction, datom.a);
 		auto attribute = [&]() -> AttributeInfo & {
-			if (!info) {
-				info = &GetAttributeInfo(context, state, transaction, datom.a);
-			}
-			return *info;
+			return info;
 		};
 		for (idx_t k = 0; k < state.columns.size(); k++) {
 			auto &vector = output.data[k];

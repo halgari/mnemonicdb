@@ -347,7 +347,10 @@ static void FuseScansInternal(OptimizerExtensionInput &input, unique_ptr<Logical
 //!   once even when the anchor returns nothing, so without the mark its scan
 //!   would read a first chunk of its table for a join that can match nothing.
 //!   A filter left from an earlier iteration only makes the scan read keys the
-//!   join then drops.
+//!   join then drops;
+//! - not when either side of the join is directly a read of a USING KEY CTE's
+//!   recurring table: DuckDB may plan that join as a PhysicalRecursiveCTEKeyJoin,
+//!   which pushes no filters at all.
 //!
 //! DuckDB invariants this relies on (physical_hash_join.cpp, pinned at
 //! 2bb5316a8b5; tests in test/sql/key_set_seek.test, "Empty key sets" and
@@ -391,6 +394,23 @@ static bool ReadsWorkingTable(const LogicalOperator &op, TableIndex cte) {
 	return false;
 }
 
+//! Whether `op` is (through projections and filters only) a read of a USING KEY
+//! CTE's recurring table. A join directly over one may be planned as a
+//! PhysicalRecursiveCTEKeyJoin (plan_comparison_join.cpp), which probes the
+//! recurring state and never pushes dynamic filters: a scan it feeds can't rely
+//! on receiving its keys.
+static bool IsRecurringRead(const LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+	case LogicalOperatorType::LOGICAL_FILTER:
+		return op.children.size() == 1 && IsRecurringRead(*op.children[0]);
+	case LogicalOperatorType::LOGICAL_CTE_REF:
+		return op.Cast<LogicalCTERef>().is_recurring;
+	default:
+		return false;
+	}
+}
+
 //! `recursion` is the innermost recursive CTE whose recursive step contains `op`,
 //! if any
 static void MarkJoinKeyScans(LogicalOperator &op, optional_ptr<const LogicalRecursiveCTE> recursion,
@@ -407,6 +427,10 @@ static void MarkJoinKeyScans(LogicalOperator &op, optional_ptr<const LogicalRecu
 	// (DuckDB may build an invariant one once and reuse it)
 	bool rebuilt = !recursion || (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
 	                              op.children.size() == 2 && ReadsWorkingTable(*op.children[1], recursion->table_index));
+	if (rebuilt && op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN && op.children.size() == 2 &&
+	    (IsRecurringRead(*op.children[0]) || IsRecurringRead(*op.children[1]))) {
+		rebuilt = false;
+	}
 	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN && rebuilt) {
 		auto &join = op.Cast<LogicalComparisonJoin>();
 		auto join_type = join.join_type;
