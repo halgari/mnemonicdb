@@ -126,6 +126,22 @@ void MnemonicCatalog::SetGeneration(shared_ptr<MnemonicCatalogGeneration> new_ge
 	generation = std::move(new_generation);
 }
 
+void MnemonicCatalog::RegisterAssertionContext(ClientContext &context, MnemonicTransaction &parent) {
+	lock_guard<mutex> guard(assertion_lock);
+	assertion_contexts[&context] = &parent;
+}
+
+void MnemonicCatalog::UnregisterAssertionContext(ClientContext &context) {
+	lock_guard<mutex> guard(assertion_lock);
+	assertion_contexts.erase(&context);
+}
+
+optional_ptr<MnemonicTransaction> MnemonicCatalog::FindAssertionParent(ClientContext &context) {
+	lock_guard<mutex> guard(assertion_lock);
+	auto entry = assertion_contexts.find(&context);
+	return entry == assertion_contexts.end() ? nullptr : entry->second;
+}
+
 shared_ptr<MnemonicCatalogGeneration> MnemonicCatalog::GetGeneration(CatalogTransaction transaction) {
 	if (transaction.HasContext()) {
 		return MnemonicTransaction::Get(transaction.GetContext(), *this).GetGeneration();

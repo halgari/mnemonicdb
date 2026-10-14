@@ -27,6 +27,7 @@ sys
 query II
 SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'd' ORDER BY ALL
 ----
+sys	assertions
 sys	attributes
 sys	tables
 sys	tx

@@ -170,7 +170,8 @@ static uint8_t DefaultPartition(const MnemonicTableEntry &table) {
 //! current transaction)
 static void CheckSysEntity(MnemonicTransaction &transaction, const MnemonicTableEntry &table, EntityId entity) {
 	auto id = table.GetTableDef().id;
-	if (table.GetTableDef().schema != "sys") {
+	// sys.assertions rows are ordinary entities, like rows of user tables
+	if (table.GetTableDef().schema != "sys" || id == mnemonicdb::sys::ASSERTIONS) {
 		if (mnemonicdb::PartitionOf(entity) < mnemonicdb::partition::DB) {
 			throw InvalidInputException("MnemonicDB: entity %d is in a system partition", entity);
 		}
@@ -207,7 +208,8 @@ SinkFinalizeType MnemonicInsert::Finalize(Pipeline &, Event &, ClientContext &co
 	for (auto &chunk : state.rows.Chunks()) {
 		state.count += WriteChunk(context, chunk);
 	}
-	if (table.GetTableDef().schema == "sys" && table.GetTableDef().id != mnemonicdb::sys::TX) {
+	if (table.GetTableDef().schema == "sys" && table.GetTableDef().id != mnemonicdb::sys::TX &&
+	    table.GetTableDef().id != mnemonicdb::sys::ASSERTIONS) {
 		transaction.ReloadSchema(context);
 	}
 	statement.Commit();

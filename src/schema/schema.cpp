@@ -85,13 +85,17 @@ static vector<BuiltinAttribute> BuiltinAttributes() {
 	    {sys::ATTRIBUTES_DOC, sys::ATTRIBUTES, "doc", varchar, Uniqueness::NONE, false},
 	    {sys::TX_INSTANT, sys::TX, "instant", LogicalType(LogicalTypeId::TIMESTAMP_TZ), Uniqueness::NONE, true},
 	    {sys::ATTRIBUTES_INDEX, sys::ATTRIBUTES, "index", varchar, Uniqueness::NONE, false},
+	    {sys::ASSERTIONS_NAME, sys::ASSERTIONS, "name", varchar, Uniqueness::IDENTITY, false},
+	    {sys::ASSERTIONS_QUERY, sys::ASSERTIONS, "query", varchar, Uniqueness::NONE, false},
+	    {sys::ASSERTIONS_DOC, sys::ASSERTIONS, "doc", varchar, Uniqueness::NONE, false},
 	};
 }
 
 static vector<TableDef> BuiltinTables() {
 	return {{sys::TABLES, "sys", "tables", "Table definitions", {}},
 	        {sys::ATTRIBUTES, "sys", "attributes", "Attribute (column) definitions", {}},
-	        {sys::TX, "sys", "tx", "Transactions", {}}};
+	        {sys::TX, "sys", "tx", "Transactions", {}},
+	        {sys::ASSERTIONS, "sys", "assertions", "Commit assertions: queries that must return no rows", {}}};
 }
 
 shared_ptr<Schema> Schema::Builtin() {

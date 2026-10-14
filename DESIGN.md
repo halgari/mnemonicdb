@@ -330,7 +330,7 @@ returns one row per assertion or retraction, in transaction order:
    partition; `current_tx()` returns it from here on.
 3. **Statements.** Writes go into a `WriteBatchWithIndex`. Reads in the same
    transaction iterate the batch over the snapshot (read-your-writes).
-4. **Commit.** Add the tx entity's datoms (`sys.tx.instant`, plus any user
+4. **Commit.** Evaluate commit assertions (§7a). Add the tx entity's datoms (`sys.tx.instant`, plus any user
    columns written to `sys.tx`) and the `txlog` entries, update counters and
    last T in `meta`, write the batch atomically with WAL sync, release the
    mutex.
@@ -420,6 +420,7 @@ everything else. Each attached database has a `sys` schema:
 | `sys.tables`     | `schema`, `name`, `doc`                                        |
 | `sys.attributes` | `table_id REF`, `name`, `type` (DuckDB type string; a top-level LIST means cardinality-many), `uniqueness` (`value`/`identity`, NULL for none), `indexed`, `index` (index name), `doc` |
 | `sys.tx`         | `instant TIMESTAMPTZ`; users may `ALTER TABLE sys.tx ADD COLUMN` |
+| `sys.assertions` | `name` (unique identity), `query`, `doc`: commit assertions, see §7a |
 
 (`table` and `unique` are reserved words in DuckDB, hence `table_id` and
 `uniqueness`.)
@@ -467,6 +468,94 @@ everything else. Each attached database has a `sys` schema:
   name is stored on the attribute entity (`sys.attributes.index`), and
   `duckdb_indexes()` lists them. Unique attributes always have AVET, with or
   without an index. Indexes cover exactly one column and take no options.
+
+## 7a. Commit assertions
+
+An **assertion** is a named SQL query that must return no rows. Every
+assertion is evaluated when a write transaction commits, against the
+transaction's pending state. If any assertion returns rows, or cannot run,
+the commit fails and nothing is committed.
+
+```sql
+INSERT INTO d.sys.assertions (name, query, doc) VALUES
+    ('non_negative_age', 'SELECT name, age FROM person WHERE age < 0', 'Ages are never negative');
+```
+
+- **Storage.** `sys.assertions` (table local 4; attributes 12–14) is schema
+  as data, but its rows are ordinary entities in partition `db`, not schema
+  entities. INSERT, UPDATE, DELETE and `ON CONFLICT (name)` all work, and do
+  not reload the schema. History is visible through `AT` and
+  `mnemonicdb_history('d', table_name := 'sys.assertions')`.
+  `mnemonicdb_add`/`mnemonicdb_retract` still refuse sys tables.
+- **Old databases.** Databases created before sys.assertions existed get the
+  table from code (built-in tables are never loaded from data), but their
+  bootstrap transaction did not write its descriptive datoms, so it has no
+  `sys.tables` row and its attributes have no `sys.attributes` rows there.
+  It works normally otherwise.
+- **Scope.** Assertions run only when the committing transaction changed at
+  least one datom (the net-empty check in §6). Read-only transactions and
+  transactions whose writes cancel out evaluate none. A transaction that adds,
+  changes or removes an assertion is checked against the assertions as that
+  transaction leaves them: a new or changed assertion checks the commit that
+  writes it, and a removed one does not.
+- **Visibility.** An assertion sees exactly what the committing transaction
+  sees: its snapshot, its pending writes and its catalog generation (tables
+  it created included). Unqualified names resolve to the database being
+  committed, whatever it is attached as.
+- **Incremental checks.** `mnemonicdb_tx_changes([db], table_name :=,
+  column_name :=)` returns the reading transaction's pending datoms with the
+  same columns as `mnemonicdb_history`: one row per assertion or retraction,
+  read from the txlog entries of the transaction's own tx. Outside a writing
+  transaction it returns nothing. Without a database name it reads the
+  default database. Writes that cancel out leave no row. Inside an
+  assertion it returns the committing transaction's changes, so a check can
+  start from what changed, e.g. walk `parent` up only from entities whose
+  `parent` was asserted.
+- **Rules for the query.** It must parse to exactly one SELECT. It runs in a
+  `READ ONLY` transaction and cannot write to any database. Its rows are
+  streamed and counted, and only the first 5 are rendered. Assertions are
+  independent and callers must not depend on their order (they currently run
+  ordered by name).
+- **Failure.** All failing assertions are reported in one error, joined by
+  `"; "`:
+  ```
+  assertion "non_negative_age" failed (2 rows): (Dave, -5), (Eve, -6)
+  assertion "broken" could not run: Catalog Error: ...
+  assertion "broken" is invalid: its query must be a single SELECT statement
+  assertion "#<entity>" is invalid: it has no name
+  ```
+  The evaluator throws a `ConstraintException`, but DuckDB wraps every error
+  raised while committing, so the client sees `TransactionContext Error:
+  Failed to commit: assertion "..." failed ...`. The `assertion "<name>"`
+  text is the stable, parseable part. A failed commit behaves like a
+  rollback: the batch is dropped, allocated IDs are given back and the writer
+  lock is released.
+- **Mechanism.** DuckDB has no pre-commit hook, and the committing
+  `ClientContext` is locked for the whole commit, so no SQL can run on it.
+  `MnemonicTransaction::Commit(context)` therefore evaluates assertions after
+  the final statement check and the net-empty check, and before the tx entity
+  is written:
+  1. Load the assertions from the transaction's own view (two AEVT scans; this
+     is the only cost when there are none).
+  2. Open a fresh `Connection` on the same `DatabaseInstance` and register its
+     context on the `MnemonicCatalog` as an assertion context whose parent is
+     the committing transaction.
+  3. `MnemonicTransactionManager::StartTransaction` sees the registration and
+     builds a **borrowed** transaction: the parent's basis, snapshot (not
+     owned, never released) and catalog generation, and a read view overlaying
+     the parent's write batch. `SetReadWrite` throws, so it never takes the
+     writer lock and cannot deadlock against its parent.
+  4. `USE <this database>`, then for each assertion `BEGIN TRANSACTION READ
+     ONLY`, the query, `ROLLBACK`.
+  5. Unregister; throw if anything failed.
+
+  Other connections are unaffected: the registry is keyed by
+  `ClientContext`. The assertion connection uses default settings, not the
+  committing session's.
+- **Cost.** One connection per checked commit plus three statements per
+  assertion. In a reldebug build, an autocommit single-row INSERT took about
+  0.5 ms with no assertions and about 1.4 ms more per simple
+  `mnemonicdb_tx_changes`-driven assertion.
 
 ## 8. Code layout (planned)
 

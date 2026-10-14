@@ -6,6 +6,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/database_manager.hpp"
 
 #include "rocksdb/db.h"
 
@@ -26,6 +27,8 @@ struct HistoryBindData : public TableFunctionData {
 	optional_idx entity;
 	TxId since = 0;
 	TxId until = mnemonicdb::LOCAL_MASK;
+	//! mnemonicdb_tx_changes: only the reading transaction's pending datoms
+	bool tx_changes = false;
 };
 
 //! One assertion or retraction
@@ -55,6 +58,8 @@ struct HistoryState : public GlobalTableFunctionState {
 	idx_t next_event = 0;
 	//! Whole database or table history: the txlog, in transaction order
 	std::unique_ptr<rocksdb::Iterator> log;
+	//! The last tx returned
+	TxId until = mnemonicdb::LOCAL_MASK;
 	unordered_set<AttrId> attribute_filter;
 	unordered_map<AttrId, unique_ptr<AttributeInfo>> attributes;
 
@@ -63,18 +68,25 @@ struct HistoryState : public GlobalTableFunctionState {
 	}
 };
 
-static unique_ptr<FunctionData> HistoryBind(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
-	if (input.inputs[0].IsNull()) {
-		throw BinderException("mnemonicdb_history: the database name cannot be NULL");
+static unique_ptr<FunctionData> HistoryBindInternal(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names,
+                                                    const char *function_name, bool tx_changes) {
+	string name;
+	if (input.inputs.empty()) {
+		name = DatabaseManager::GetDefaultDatabase(context).GetIdentifierName();
+	} else {
+		if (input.inputs[0].IsNull()) {
+			throw BinderException("%s: the database name cannot be NULL", function_name);
+		}
+		name = input.inputs[0].GetValue<string>();
 	}
-	auto name = input.inputs[0].GetValue<string>();
 	auto &catalog = Catalog::GetCatalog(context, Identifier(name));
 	if (catalog.GetCatalogType() != MnemonicCatalog::CATALOG_TYPE) {
-		throw BinderException("mnemonicdb_history: \"%s\" is not a MnemonicDB database", name);
+		throw BinderException("%s: \"%s\" is not a MnemonicDB database", function_name, name);
 	}
 	auto &mnemonic_catalog = catalog.Cast<MnemonicCatalog>();
 	auto result = make_uniq<HistoryBindData>(mnemonic_catalog);
+	result->tx_changes = tx_changes;
 	auto &schema = MnemonicTransaction::Get(context, mnemonic_catalog).GetSchema();
 
 	string table_name;
@@ -98,7 +110,7 @@ static unique_ptr<FunctionData> HistoryBind(ClientContext &context, TableFunctio
 		}
 	}
 	if (!column_name.empty() && table_name.empty()) {
-		throw BinderException("mnemonicdb_history: column_name := needs table_name :=");
+		throw BinderException("%s: column_name := needs table_name :=", function_name);
 	}
 	if (!table_name.empty()) {
 		// "table" or "schema.table"
@@ -110,7 +122,7 @@ static unique_ptr<FunctionData> HistoryBind(ClientContext &context, TableFunctio
 		}
 		auto table = schema.FindTable(schema_name, table_name);
 		if (!table) {
-			throw BinderException("mnemonicdb_history: table \"%s.%s\" does not exist", schema_name, table_name);
+			throw BinderException("%s: table \"%s.%s\" does not exist", function_name, schema_name, table_name);
 		}
 		if (column_name.empty()) {
 			result->attributes = table->attributes;
@@ -129,7 +141,7 @@ static unique_ptr<FunctionData> HistoryBind(ClientContext &context, TableFunctio
 		} else {
 			auto attr = schema.FindAttribute(*table, column_name);
 			if (!attr) {
-				throw BinderException("mnemonicdb_history: table \"%s\" has no column \"%s\"", table_name, column_name);
+				throw BinderException("%s: table \"%s\" has no column \"%s\"", function_name, table_name, column_name);
 			}
 			result->attributes.push_back(attr->Local());
 		}
@@ -140,6 +152,16 @@ static unique_ptr<FunctionData> HistoryBind(ClientContext &context, TableFunctio
 	return_types = {LogicalType::UBIGINT, mnemonicdb::RefType(), LogicalType::VARCHAR,   LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, mnemonicdb::RefType(), LogicalType::VARIANT(), LogicalType::BOOLEAN};
 	return std::move(result);
+}
+
+static unique_ptr<FunctionData> HistoryBind(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
+	return HistoryBindInternal(context, input, return_types, names, "mnemonicdb_history", false);
+}
+
+static unique_ptr<FunctionData> TxChangesBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
+	return HistoryBindInternal(context, input, return_types, names, "mnemonicdb_tx_changes", true);
 }
 
 //! Collect the events of the datoms under `prefix` in a current index and its
@@ -171,7 +193,19 @@ static unique_ptr<GlobalTableFunctionState> HistoryInit(ClientContext &context, 
 	auto &view = transaction.GetReadView();
 	auto state = make_uniq<HistoryState>();
 	state->attribute_filter.insert(data.attributes.begin(), data.attributes.end());
+	state->until = data.until;
 
+	if (data.tx_changes) {
+		// The pending datoms are the txlog entries of the transaction's own tx,
+		// which exist only in its write batch
+		auto tx = transaction.PendingTx();
+		if (tx != 0) {
+			state->until = tx;
+			state->log = view.NewIterator(ColumnFamily::TXLOG);
+			state->log->Seek(mnemonicdb::TxlogPrefix(tx));
+		}
+		return std::move(state);
+	}
 	if (data.entity.IsValid()) {
 		auto entity = data.entity.GetIndex();
 		if (data.attributes.empty()) {
@@ -270,7 +304,7 @@ static void HistoryFunction(ClientContext &context, TableFunctionInput &input, D
 		for (; count < STANDARD_VECTOR_SIZE && it.Valid(); it.Next()) {
 			auto datom =
 			    mnemonicdb::DecodeKey(mnemonicdb::IndexKind::TXLOG, std::string_view(it.key().data(), it.key().size()));
-			if (datom.t > data.until) {
+			if (datom.t > state.until) {
 				break;
 			}
 			if (!state.attribute_filter.empty() && state.attribute_filter.count(datom.a) == 0) {
@@ -302,6 +336,18 @@ void RegisterHistoryFunction(ExtensionLoader &loader) {
 	function.named_parameters["since"] = LogicalType::UBIGINT;
 	function.named_parameters["until"] = LogicalType::UBIGINT;
 	loader.RegisterFunction(function);
+
+	// mnemonicdb_tx_changes([db], table_name :=, column_name :=): the datoms the
+	// reading transaction has written but not committed. Commit assertions use it
+	// to check only what changed.
+	TableFunctionSet tx_changes("mnemonicdb_tx_changes");
+	for (auto &arguments : {vector<LogicalType> {}, vector<LogicalType> {LogicalType::VARCHAR}}) {
+		TableFunction overload("mnemonicdb_tx_changes", arguments, HistoryFunction, TxChangesBind, HistoryInit);
+		overload.named_parameters["table_name"] = LogicalType::VARCHAR;
+		overload.named_parameters["column_name"] = LogicalType::VARCHAR;
+		tx_changes.AddFunction(overload);
+	}
+	loader.RegisterFunction(tx_changes);
 }
 
 } // namespace duckdb

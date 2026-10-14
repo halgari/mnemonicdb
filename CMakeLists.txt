@@ -69,6 +69,7 @@ set(EXTENSION_SOURCES
     src/catalog/mnemonic_schema_entry.cpp
     src/txn/mnemonic_transaction.cpp
     src/txn/mnemonic_transaction_manager.cpp
+    src/txn/mnemonic_assertions.cpp
     src/mnemonicdb_info.cpp
     src/codec_functions.cpp
     src/codec/keys.cpp

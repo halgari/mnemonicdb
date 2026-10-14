@@ -46,6 +46,11 @@ class MnemonicTransaction : public Transaction {
 
 public:
 	MnemonicTransaction(MnemonicTransactionManager &manager, ClientContext &context, MnemonicCatalog &catalog);
+	//! A borrowed, read-only transaction used to evaluate commit assertions: it
+	//! reads `parent`'s snapshot, pending writes and catalog generation, owns
+	//! none of them, and can never take the writer lock
+	MnemonicTransaction(MnemonicTransactionManager &manager, ClientContext &context, MnemonicCatalog &catalog,
+	                    MnemonicTransaction &parent);
 	~MnemonicTransaction() override;
 
 public:
@@ -100,8 +105,17 @@ public:
 	optional_ptr<const mnemonicdb::EntityId> FindTempid(mnemonicdb::EntityId placeholder) const;
 	void BindTempid(mnemonicdb::EntityId placeholder, mnemonicdb::EntityId id);
 
-	//! Write this transaction's changes; called by the transaction manager
-	void Commit();
+	//! The tx number of this transaction's pending writes: its own writer's tx,
+	//! else (when borrowed) its parent's, else 0 (nothing pending)
+	mnemonicdb::TxId PendingTx() const;
+	//! Whether this transaction borrows a committing transaction's state
+	bool IsBorrowed() const {
+		return parent != nullptr;
+	}
+
+	//! Evaluate commit assertions, then write this transaction's changes; called
+	//! by the transaction manager with the committing context
+	void Commit(ClientContext &context);
 
 	//! Serializes writers within this transaction: e.g. the actions of a MERGE
 	//! run as separate pipelines
@@ -135,6 +149,9 @@ private:
 	bool schema_changed = false;
 	unordered_map<mnemonicdb::EntityId, mnemonicdb::EntityId> tempids;
 	mutex write_lock;
+	//! Set for a borrowed transaction (assertion evaluation): the committing
+	//! transaction whose snapshot and batch `view` reads
+	MnemonicTransaction *parent = nullptr;
 };
 
 } // namespace duckdb

@@ -1,0 +1,633 @@
+# name: test/sql/assertions.test
+# description: Commit assertions: named queries in sys.assertions that must return no rows when a transaction commits
+# group: [sql]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/assertions.mnemonic' AS d (TYPE mnemonicdb)
+
+# Outside the database, so it can arm an assertion without writing to d
+statement ok
+ATTACH ':memory:' AS side
+
+statement ok
+CREATE TABLE side.trip (reason VARCHAR)
+
+statement ok
+CREATE TABLE d.person (name VARCHAR PRIMARY KEY, age INTEGER)
+
+statement ok
+CREATE TABLE d.account (owner REF, balance INTEGER)
+
+# sys.assertions is a built-in table
+query TTT
+SELECT column_name, data_type, (SELECT uniqueness FROM d.sys.attributes a JOIN d.sys.tables t ON a.table_id = t.id
+    WHERE t.name = 'assertions' AND a.name = column_name)
+FROM duckdb_columns() WHERE database_name = 'd' AND schema_name = 'sys' AND table_name = 'assertions' ORDER BY column_index
+----
+id	REF	NULL
+name	VARCHAR	identity
+query	VARCHAR	NULL
+doc	VARCHAR	NULL
+
+#----------------------------------------------------------------------
+# A passing assertion lets the commit through
+#----------------------------------------------------------------------
+statement ok
+INSERT INTO d.sys.assertions (name, query, doc) VALUES
+    ('non_negative_age', 'SELECT name, age FROM person WHERE age < 0', 'Ages are never negative')
+
+statement ok
+SET VARIABLE v_added = (SELECT max(tx) FROM mnemonicdb_history('d'))
+
+statement ok
+INSERT INTO d.person (name, age) VALUES ('Alice', 30), ('Bob', 40)
+
+query TI
+SELECT name, age FROM d.person ORDER BY name
+----
+Alice	30
+Bob	40
+
+#----------------------------------------------------------------------
+# A failing assertion rejects the commit with a named error, and nothing
+# from the transaction is visible afterwards
+#----------------------------------------------------------------------
+statement ok
+SET VARIABLE last_tx = (SELECT max(tx) FROM mnemonicdb_history('d'))
+
+# autocommit
+statement error
+INSERT INTO d.person (name, age) VALUES ('Carol', -1)
+----
+assertion "non_negative_age" failed (1 row): (Carol, -1)
+
+# explicit transaction: the error comes from COMMIT
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.person (name, age) VALUES ('Dave', -5), ('Eve', -6)
+
+statement ok
+UPDATE d.person SET age = 99 WHERE name = 'Alice'
+
+statement ok
+CREATE TABLE d.scratch (x INTEGER)
+
+# The transaction itself sees its writes before COMMIT
+query I
+SELECT count(*) FROM d.person WHERE age < 0
+----
+2
+
+statement error
+COMMIT
+----
+assertion "non_negative_age" failed (2 rows): (Dave, -5), (Eve, -6)
+
+query TI
+SELECT name, age FROM d.person ORDER BY name
+----
+Alice	30
+Bob	40
+
+statement error
+SELECT * FROM d.scratch
+----
+does not exist
+
+# No transaction was committed
+query I
+SELECT max(tx) = getvariable('last_tx') FROM mnemonicdb_history('d')
+----
+true
+
+# The evaluator throws a constraint error, but DuckDB wraps every commit-time
+# error as a TransactionContext error
+statement error
+UPDATE d.person SET age = -1 WHERE name = 'Bob'
+----
+TransactionContext Error: Failed to commit: assertion "non_negative_age" failed (1 row): (Bob, -1)
+
+# Only the first rows are quoted
+statement error
+INSERT INTO d.person (name, age) SELECT 'p' || i, -i FROM range(1, 8) t(i)
+----
+assertion "non_negative_age" failed (7 rows): (p1, -1), (p2, -2), (p3, -3), (p4, -4), (p5, -5), ...
+
+#----------------------------------------------------------------------
+# Assertions see the transaction's own pending writes
+#----------------------------------------------------------------------
+statement ok
+INSERT INTO d.sys.assertions (name, query) VALUES
+    ('account_has_owner', 'SELECT a.id FROM account a WHERE a.owner IS NULL OR a.owner NOT IN (SELECT id FROM person)')
+
+# the owner is created in the same transaction
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.person (id, name, age) VALUES (tempid('f'), 'Frank', 50)
+
+statement ok
+INSERT INTO d.account (owner, balance) VALUES (tempid('f'), 10)
+
+statement ok
+COMMIT
+
+# the owner is removed in the same transaction as the account is kept
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM d.person WHERE name = 'Frank'
+
+statement error
+COMMIT
+----
+assertion "account_has_owner" failed (1 row)
+
+query I
+SELECT count(*) FROM d.person WHERE name = 'Frank'
+----
+1
+
+# A table created by the transaction is visible to an assertion added by it
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE d.item (label VARCHAR)
+
+statement ok
+INSERT INTO d.sys.assertions (name, query) VALUES ('item_labelled', 'SELECT id FROM item WHERE label = ''''')
+
+statement ok
+INSERT INTO d.item (label) VALUES ('ok')
+
+statement ok
+COMMIT
+
+statement error
+INSERT INTO d.item (label) VALUES ('')
+----
+assertion "item_labelled" failed (1 row)
+
+# Several failing assertions are all reported in one error, joined by "; "
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.item (label) VALUES ('')
+
+statement ok
+INSERT INTO d.person (name, age) VALUES ('Gina', -3)
+
+statement error
+COMMIT
+----
+<REGEX>:.*assertion "item_labelled" failed \(1 row\): \(\d+\); assertion "non_negative_age" failed \(1 row\): \(Gina, -3\).*
+
+#----------------------------------------------------------------------
+# mnemonicdb_tx_changes lists exactly the pending datoms, including
+# retractions
+#----------------------------------------------------------------------
+# Nothing pending outside a writing transaction
+query I
+SELECT count(*) FROM mnemonicdb_tx_changes('d')
+----
+0
+
+statement ok
+BEGIN
+
+query I
+SELECT count(*) FROM mnemonicdb_tx_changes('d')
+----
+0
+
+statement ok
+UPDATE d.person SET age = 31 WHERE name = 'Alice'
+
+statement ok
+INSERT INTO d.person (name, age) VALUES ('Hank', 20)
+
+statement ok
+DELETE FROM d.person WHERE name = 'Bob'
+
+# A write that cancels out leaves no datom
+statement ok
+INSERT INTO d.item (id, label) VALUES (tempid('tmp'), 'temp')
+
+statement ok
+DELETE FROM d.item WHERE label = 'temp'
+
+query TTTTTT
+SELECT (SELECT name FROM d.person p WHERE p.id = c.entity), schema_name, table_name, column_name, value::VARCHAR, added
+FROM mnemonicdb_tx_changes('d') c
+WHERE c.table_name = 'person'
+ORDER BY 1, column_name, added
+----
+Alice	main	person	age	30	false
+Alice	main	person	age	31	true
+Hank	main	person	age	20	true
+Hank	main	person	name	Hank	true
+NULL	main	person	age	40	false
+NULL	main	person	name	Bob	false
+
+# Every pending datom is a person datom of this transaction
+query II
+SELECT count(*), count(DISTINCT tx) FROM mnemonicdb_tx_changes('d')
+----
+6	1
+
+query I
+SELECT DISTINCT tx = (SELECT max(tx) FROM mnemonicdb_history('d')) FROM mnemonicdb_tx_changes('d')
+----
+true
+
+# Without the database name it reads the default database
+statement ok
+USE d
+
+query I
+SELECT count(*) FROM mnemonicdb_tx_changes()
+----
+6
+
+query I
+SELECT count(*) FROM mnemonicdb_tx_changes(table_name := 'person', column_name := 'name')
+----
+2
+
+statement ok
+USE memory
+
+statement ok
+ROLLBACK
+
+#----------------------------------------------------------------------
+# An incremental cycle check over a parent REF attribute
+#----------------------------------------------------------------------
+statement ok
+CREATE TABLE d.node (label VARCHAR PRIMARY KEY, parent REF)
+
+statement ok
+INSERT INTO d.sys.assertions (name, query, doc) VALUES ('no_parent_cycles', '
+WITH RECURSIVE
+    changed AS (
+        SELECT DISTINCT entity AS start FROM mnemonicdb_tx_changes(table_name := ''node'', column_name := ''parent'')
+        WHERE added),
+    walk(start, cur, depth) AS (
+        SELECT start, start, 0 FROM changed
+        UNION ALL
+        SELECT w.start, n.parent, w.depth + 1
+        FROM walk w JOIN node n ON n.id = w.cur
+        WHERE n.parent IS NOT NULL AND n.parent <> w.start AND w.depth < 10000)
+SELECT n.label FROM walk w JOIN node n ON n.id = w.start JOIN node c ON c.id = w.cur
+WHERE c.parent = w.start
+', 'Following parent never returns to the start')
+
+statement ok
+INSERT INTO d.node (id, label, parent) VALUES
+    (tempid('a'), 'a', NULL), (tempid('b'), 'b', tempid('a')), (tempid('c'), 'c', tempid('b'))
+
+# a -> c closes a three-node cycle
+statement error
+UPDATE d.node SET parent = (SELECT id FROM d.node WHERE label = 'c') WHERE label = 'a'
+----
+assertion "no_parent_cycles" failed (1 row): (a)
+
+# self-parent
+statement error
+UPDATE d.node SET parent = id WHERE label = 'b'
+----
+assertion "no_parent_cycles" failed (1 row): (b)
+
+# a two-node cycle created in one statement reports both entities
+statement error
+INSERT INTO d.node (id, label, parent) VALUES (tempid('x'), 'x', tempid('y')), (tempid('y'), 'y', tempid('x'))
+----
+assertion "no_parent_cycles" failed (2 rows)
+
+# re-parenting without a cycle is fine
+statement ok
+UPDATE d.node SET parent = (SELECT id FROM d.node WHERE label = 'a') WHERE label = 'c'
+
+query TT
+SELECT n.label, p.label FROM d.node n LEFT JOIN d.node p ON p.id = n.parent ORDER BY n.label
+----
+a	NULL
+b	a
+c	a
+
+# writes elsewhere don't walk the tree
+statement ok
+INSERT INTO d.person (name, age) VALUES ('Ivy', 1)
+
+#----------------------------------------------------------------------
+# Adding, changing and removing an assertion, with history
+#----------------------------------------------------------------------
+statement ok
+INSERT INTO d.sys.assertions (name, query) VALUES ('small_balance', 'SELECT id FROM account WHERE balance > 100')
+
+statement ok
+SET VARIABLE v1 = (SELECT max(tx) FROM mnemonicdb_history('d'))
+
+statement error
+UPDATE d.account SET balance = 500
+----
+assertion "small_balance" failed
+
+# change it: the commit that changes it is checked with the new query
+statement ok
+UPDATE d.sys.assertions SET query = 'SELECT id FROM account WHERE balance > 1000' WHERE name = 'small_balance'
+
+statement ok
+SET VARIABLE v2 = (SELECT max(tx) FROM mnemonicdb_history('d'))
+
+statement ok
+UPDATE d.account SET balance = 500
+
+statement error
+UPDATE d.account SET balance = 5000
+----
+assertion "small_balance" failed
+
+# upsert on the name
+statement ok
+INSERT INTO d.sys.assertions (name, query) VALUES ('small_balance', 'SELECT id FROM account WHERE balance > 10000')
+ON CONFLICT (name) DO UPDATE SET query = excluded.query
+
+statement ok
+UPDATE d.account SET balance = 5000
+
+# remove it: the commit that removes it is not checked by it
+statement ok
+DELETE FROM d.sys.assertions WHERE name = 'small_balance'
+
+statement ok
+SET VARIABLE v3 = (SELECT max(tx) FROM mnemonicdb_history('d'))
+
+statement ok
+UPDATE d.account SET balance = 50000
+
+query T
+SELECT name FROM d.sys.assertions ORDER BY name
+----
+account_has_owner
+item_labelled
+no_parent_cycles
+non_negative_age
+
+query T
+SELECT query FROM d.sys.assertions AT (VERSION => getvariable('v1')) WHERE name = 'small_balance'
+----
+SELECT id FROM account WHERE balance > 100
+
+query T
+SELECT query FROM d.sys.assertions AT (VERSION => getvariable('v2')) WHERE name = 'small_balance'
+----
+SELECT id FROM account WHERE balance > 1000
+
+query I
+SELECT count(*) FROM d.sys.assertions AT (VERSION => getvariable('v3')) WHERE name = 'small_balance'
+----
+0
+
+query I
+SELECT count(*) FROM d.sys.assertions AT (VERSION => getvariable('v_added') - 1)
+----
+0
+
+query TT
+SELECT value::VARCHAR, added FROM mnemonicdb_history('d', table_name := 'sys.assertions', column_name := 'query')
+WHERE value::VARCHAR LIKE '%balance%' ORDER BY tx, added
+----
+SELECT id FROM account WHERE balance > 100	true
+SELECT id FROM account WHERE balance > 100	false
+SELECT id FROM account WHERE balance > 1000	true
+SELECT id FROM account WHERE balance > 1000	false
+SELECT id FROM account WHERE balance > 10000	true
+SELECT id FROM account WHERE balance > 10000	false
+
+# Names are unique
+statement error
+INSERT INTO d.sys.assertions (name, query) VALUES ('non_negative_age', 'SELECT 1 WHERE false')
+----
+Duplicate
+
+# Rows of sys.assertions are ordinary entities
+statement error
+INSERT INTO d.sys.assertions (id, name, query) VALUES (mnemonicdb_make_id(1, 1), 'bad_id', 'SELECT 1 WHERE false')
+----
+system partition
+
+#----------------------------------------------------------------------
+# An invalid assertion fails the commit that adds it
+#----------------------------------------------------------------------
+statement error
+INSERT INTO d.sys.assertions (name, query) VALUES ('broken', 'SELECT * FROM no_such_table')
+----
+assertion "broken" could not run: Catalog Error
+
+statement error
+INSERT INTO d.sys.assertions (name, query) VALUES ('broken', 'SELEKT 1')
+----
+assertion "broken" is invalid: Parser Error
+
+statement error
+INSERT INTO d.sys.assertions (name, query) VALUES ('broken', 'SELECT 1 WHERE false; SELECT 2 WHERE false')
+----
+assertion "broken" is invalid: its query must be a single SELECT statement
+
+statement error
+INSERT INTO d.sys.assertions (name, query) VALUES ('broken', 'DELETE FROM person')
+----
+assertion "broken" is invalid: its query must be a single SELECT statement
+
+statement error
+INSERT INTO d.sys.assertions (name, query) VALUES ('broken', 'SELECT error(''boom'')')
+----
+assertion "broken" could not run: Invalid Input Error: boom
+
+# an assertion cannot write, even through a table function
+statement error
+INSERT INTO d.sys.assertions (name, query) VALUES ('broken',
+    'SELECT * FROM mnemonicdb_add(''d.person'', (SELECT id FROM person WHERE name = ''Alice''), ''age'', 1) WHERE false')
+----
+assertion "broken" could not run
+
+statement error
+INSERT INTO d.sys.assertions (name) VALUES ('broken')
+----
+assertion "broken" is invalid: it has no query
+
+statement error
+INSERT INTO d.sys.assertions (query) VALUES ('SELECT 1 WHERE false')
+----
+is invalid: it has no name
+
+# An assertion that already fails on existing data cannot be added
+statement error
+INSERT INTO d.sys.assertions (name, query) VALUES ('nobody_named_alice', 'SELECT id FROM person WHERE name = ''Alice''')
+----
+assertion "nobody_named_alice" failed (1 row)
+
+query I
+SELECT count(*) FROM d.sys.assertions WHERE name IN ('broken', 'nobody_named_alice')
+----
+0
+
+#----------------------------------------------------------------------
+# Read-only transactions and transactions that cancel out don't evaluate
+# assertions
+#----------------------------------------------------------------------
+# This assertion errors while side.trip has a row, without d changing
+statement ok
+INSERT INTO d.sys.assertions (name, query) VALUES ('tripwire', 'SELECT error(''tripped: '' || reason) FROM side.trip')
+
+statement ok
+INSERT INTO side.trip VALUES ('armed')
+
+statement error
+INSERT INTO d.person (name, age) VALUES ('Jack', 1)
+----
+tripped: armed
+
+# read-only, autocommit and explicit
+query I
+SELECT count(*) FROM d.person WHERE name = 'Alice'
+----
+1
+
+statement ok
+BEGIN
+
+query I
+SELECT count(*) FROM d.person
+----
+4
+
+statement ok
+COMMIT
+
+# writes that cancel out: insert then delete, update and back
+statement ok
+SET VARIABLE last_tx = (SELECT max(tx) FROM mnemonicdb_history('d'))
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.person (name, age) VALUES ('Temp', 1)
+
+statement ok
+DELETE FROM d.person WHERE name = 'Temp'
+
+statement ok
+UPDATE d.person SET age = 1000 WHERE name = 'Alice'
+
+statement ok
+UPDATE d.person SET age = 30 WHERE name = 'Alice'
+
+statement ok
+COMMIT
+
+# an UPDATE that changes nothing
+statement ok
+UPDATE d.person SET age = age WHERE name = 'Alice'
+
+query I
+SELECT max(tx) = getvariable('last_tx') FROM mnemonicdb_history('d')
+----
+true
+
+statement ok
+DELETE FROM side.trip
+
+statement ok
+DELETE FROM d.sys.assertions WHERE name = 'tripwire'
+
+#----------------------------------------------------------------------
+# Writer lock and conflicts behave as before
+#----------------------------------------------------------------------
+# A failed commit releases the writer lock (a leak would hang con2)
+statement error con1
+INSERT INTO d.person (name, age) VALUES ('Kim', -1)
+----
+assertion "non_negative_age" failed
+
+statement ok con2
+INSERT INTO d.person (name, age) VALUES ('Kim', 1)
+
+statement ok con1
+BEGIN
+
+statement ok con1
+INSERT INTO d.person (name, age) VALUES ('Lee', -1)
+
+statement error con1
+COMMIT
+----
+assertion "non_negative_age" failed
+
+statement ok con2
+INSERT INTO d.person (name, age) VALUES ('Lee', 1)
+
+# A conflict is still reported at the first write, before any assertion runs
+statement ok con1
+BEGIN
+
+query I con1
+SELECT count(*) FROM d.person WHERE name = 'Kim'
+----
+1
+
+statement ok con2
+INSERT INTO d.person (name, age) VALUES ('Mia', 1)
+
+statement error con1
+INSERT INTO d.person (name, age) VALUES ('Ned', -1)
+----
+transaction conflict
+
+statement ok con1
+ROLLBACK
+
+# IDs of a rejected transaction are given back
+statement ok
+SET VARIABLE next_id = (SELECT max(id) FROM d.person)
+
+statement error
+INSERT INTO d.person (name, age) VALUES ('Oli', -1)
+----
+assertion "non_negative_age" failed
+
+statement ok
+INSERT INTO d.person (name, age) VALUES ('Oli', 1)
+
+query I
+SELECT mnemonicdb_id_local(id) - mnemonicdb_id_local(getvariable('next_id')) FROM d.person WHERE name = 'Oli'
+----
+1
+
+#----------------------------------------------------------------------
+# Assertions are stored in the database and survive a reattach under
+# another name
+#----------------------------------------------------------------------
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/assertions.mnemonic' AS other (TYPE mnemonicdb)
+
+statement error
+INSERT INTO other.person (name, age) VALUES ('Pat', -1)
+----
+assertion "non_negative_age" failed
+
+statement ok
+INSERT INTO other.person (name, age) VALUES ('Pat', 1)

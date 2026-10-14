@@ -77,7 +77,7 @@ public:
 			ModifyChunk(state, transaction, writer, chunk);
 		}
 		auto &def = table.GetTableDef();
-		if (def.schema == "sys" && def.id != mnemonicdb::sys::TX) {
+		if (def.schema == "sys" && def.id != mnemonicdb::sys::TX && def.id != mnemonicdb::sys::ASSERTIONS) {
 			transaction.ReloadSchema(context);
 		}
 		statement.Commit();
@@ -118,7 +118,7 @@ public:
 protected:
 	void CheckEntity(MnemonicTransaction &transaction, EntityId entity) const {
 		auto &def = table.GetTableDef();
-		if (def.schema != "sys") {
+		if (def.schema != "sys" || def.id == mnemonicdb::sys::ASSERTIONS) {
 			return;
 		}
 		if (def.id == mnemonicdb::sys::TX) {
@@ -169,7 +169,7 @@ PhysicalOperator &PlanMnemonicDelete(ClientContext &, PhysicalPlanGenerator &pla
 		throw NotImplementedException("MnemonicDB does not support DELETE ... RETURNING yet");
 	}
 	auto &table = op.table.Cast<MnemonicTableEntry>();
-	if (table.GetTableDef().schema != "main") {
+	if (table.GetTableDef().schema != "main" && table.GetTableDef().id != mnemonicdb::sys::ASSERTIONS) {
 		throw NotImplementedException("MnemonicDB: rows cannot be deleted from sys "
 		                              "tables; use DROP / ALTER TABLE");
 	}

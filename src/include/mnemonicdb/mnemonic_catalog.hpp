@@ -3,6 +3,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/mutex.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "mnemonicdb/schema.hpp"
 #include "mnemonicdb/store.hpp"
 
@@ -11,6 +12,7 @@ namespace duckdb {
 class MnemonicSchemaEntry;
 class MnemonicTableEntry;
 class MnemonicCatalog;
+class MnemonicTransaction;
 
 //! The catalog entries for one immutable Schema. Transactions hold on to the
 //! generation they read, so entries stay alive for as long as any transaction
@@ -94,6 +96,13 @@ public:
 	//! The generation a catalog transaction should read
 	shared_ptr<MnemonicCatalogGeneration> GetGeneration(CatalogTransaction transaction);
 
+	//! Commit assertions run on a separate connection. While registered, every
+	//! transaction that connection's context starts on this database borrows the
+	//! committing transaction `parent`'s pending state (see MnemonicTransaction).
+	void RegisterAssertionContext(ClientContext &context, MnemonicTransaction &parent);
+	void UnregisterAssertionContext(ClientContext &context);
+	optional_ptr<MnemonicTransaction> FindAssertionParent(ClientContext &context);
+
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 
@@ -106,6 +115,8 @@ private:
 	mutex snapshot_lock;
 	mutex generation_lock;
 	shared_ptr<MnemonicCatalogGeneration> generation;
+	mutex assertion_lock;
+	unordered_map<ClientContext *, MnemonicTransaction *> assertion_contexts;
 };
 
 } // namespace duckdb

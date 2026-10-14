@@ -124,6 +124,9 @@ namespace sys {
 static constexpr EntityId TABLES = (uint64_t(partition::TABLE) << PARTITION_SHIFT) | 1;
 static constexpr EntityId ATTRIBUTES = (uint64_t(partition::TABLE) << PARTITION_SHIFT) | 2;
 static constexpr EntityId TX = (uint64_t(partition::TABLE) << PARTITION_SHIFT) | 3;
+//! Commit assertions: named queries that must return no rows when a transaction
+//! commits. Rows are ordinary user entities (partition `db`), not schema.
+static constexpr EntityId ASSERTIONS = (uint64_t(partition::TABLE) << PARTITION_SHIFT) | 4;
 
 static constexpr AttrId TABLES_SCHEMA = 1;
 static constexpr AttrId TABLES_NAME = 2;
@@ -136,6 +139,9 @@ static constexpr AttrId ATTRIBUTES_INDEXED = 8;
 static constexpr AttrId ATTRIBUTES_DOC = 9;
 static constexpr AttrId TX_INSTANT = 10;
 static constexpr AttrId ATTRIBUTES_INDEX = 11;
+static constexpr AttrId ASSERTIONS_NAME = 12;
+static constexpr AttrId ASSERTIONS_QUERY = 13;
+static constexpr AttrId ASSERTIONS_DOC = 14;
 } // namespace sys
 
 } // namespace mnemonicdb

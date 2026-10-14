@@ -248,6 +248,7 @@ SELECT name FROM d.sys.tables AT (VERSION => 1) ORDER BY id
 tables
 attributes
 tx
+assertions
 
 query T
 SELECT name FROM d.sys.tables AT (VERSION => 2) WHERE schema = 'main' ORDER BY id

@@ -1,4 +1,5 @@
 #include "mnemonicdb/mnemonic_transaction.hpp"
+#include "mnemonicdb/mnemonic_assertions.hpp"
 #include "mnemonicdb/mnemonic_catalog.hpp"
 #include "mnemonicdb/mnemonic_schema_entry.hpp"
 #include "mnemonicdb/mnemonic_table_entry.hpp"
@@ -30,6 +31,14 @@ MnemonicTransaction::MnemonicTransaction(MnemonicTransactionManager &manager, Cl
     : Transaction(manager, context), catalog(catalog_p), store(catalog_p.GetStore()), basis_tx(0), snapshot(nullptr),
       view(store, nullptr) {
 	TakeSnapshot();
+}
+
+MnemonicTransaction::MnemonicTransaction(MnemonicTransactionManager &manager, ClientContext &context,
+                                         MnemonicCatalog &catalog_p, MnemonicTransaction &parent_p)
+    : Transaction(manager, context), catalog(catalog_p), store(catalog_p.GetStore()), basis_tx(parent_p.basis_tx),
+      snapshot(parent_p.snapshot),
+      view(store, parent_p.snapshot, parent_p.writer ? &parent_p.writer->GetBatch() : nullptr),
+      generation(parent_p.generation), parent(&parent_p) {
 }
 
 void MnemonicTransaction::TakeSnapshot() {
@@ -83,7 +92,10 @@ MnemonicTransaction::~MnemonicTransaction() {
 	writer.reset();
 	ReleaseWriter();
 	view.ClearCache();
-	store.GetDB().ReleaseSnapshot(snapshot);
+	if (!parent) {
+		// A borrowed transaction's snapshot belongs to its parent
+		store.GetDB().ReleaseSnapshot(snapshot);
+	}
 }
 
 MnemonicTransaction &MnemonicTransaction::Get(ClientContext &context, Catalog &catalog) {
@@ -98,6 +110,9 @@ void MnemonicTransaction::ReleaseWriter() {
 }
 
 void MnemonicTransaction::SetReadWrite() {
+	if (parent) {
+		throw TransactionException("MnemonicDB: commit assertions cannot write");
+	}
 	Transaction::SetReadWrite();
 	auto weak_context = context;
 	store.AcquireWriter([weak_context]() {
@@ -129,6 +144,13 @@ void MnemonicTransaction::SetReadWrite() {
 
 mnemonicdb::ReadView &MnemonicTransaction::GetReadView() {
 	return writer ? writer->GetView() : view;
+}
+
+mnemonicdb::TxId MnemonicTransaction::PendingTx() const {
+	if (writer) {
+		return writer->GetTx();
+	}
+	return parent ? parent->PendingTx() : 0;
 }
 
 mnemonicdb::TxWriter &MnemonicTransaction::GetWriter() {
@@ -534,11 +556,14 @@ void MnemonicTransaction::DropIndex(const string &index_name, bool if_exists) {
 //===--------------------------------------------------------------------===//
 // Commit
 //===--------------------------------------------------------------------===//
-void MnemonicTransaction::Commit() {
+void MnemonicTransaction::Commit(ClientContext &context) {
 	if (writer) {
 		writer->FinishStatement();
 	}
 	if (writer && writer->HasChanges()) {
+		// Throws if an assertion fails; the manager then discards the transaction,
+		// which drops the batch, gives back IDs and releases the writer
+		EvaluateAssertions(context, *this);
 		auto tx = writer->GetTx();
 		auto instant = MaxValue<int64_t>(Timestamp::GetCurrentTimestamp().value, store.GetLastInstant() + 1);
 		mnemonicdb::Schema::WriteTxEntity(*writer, GetSchema(), tx, instant);

@@ -8,17 +8,23 @@ MnemonicTransactionManager::MnemonicTransactionManager(AttachedDatabase &db, Mne
 }
 
 Transaction &MnemonicTransactionManager::StartTransaction(ClientContext &context) {
-	auto transaction = make_uniq<MnemonicTransaction>(*this, context, catalog);
+	unique_ptr<MnemonicTransaction> transaction;
+	auto parent = catalog.FindAssertionParent(context);
+	if (parent) {
+		transaction = make_uniq<MnemonicTransaction>(*this, context, catalog, *parent);
+	} else {
+		transaction = make_uniq<MnemonicTransaction>(*this, context, catalog);
+	}
 	auto &result = *transaction;
 	lock_guard<mutex> guard(transaction_lock);
 	transactions[result] = std::move(transaction);
 	return result;
 }
 
-ErrorData MnemonicTransactionManager::CommitTransaction(ClientContext &, Transaction &transaction) {
+ErrorData MnemonicTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
 	ErrorData error;
 	try {
-		transaction.Cast<MnemonicTransaction>().Commit();
+		transaction.Cast<MnemonicTransaction>().Commit(context);
 	} catch (std::exception &ex) {
 		error = ErrorData(ex);
 	}

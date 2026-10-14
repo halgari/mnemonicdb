@@ -95,6 +95,10 @@ public:
 	//! Whether the transaction changes any datom, after writes that cancel out
 	bool HasChanges();
 	rocksdb::WriteBatch &GetWriteBatch();
+	//! The indexed batch of pending writes, for views that overlay it
+	rocksdb::WriteBatchWithIndex &GetBatch() {
+		return *batch;
+	}
 
 	//! Current datoms of (e, a), including this transaction's writes
 	vector<Datom> CurrentDatoms(EntityId e, AttrId a);
