@@ -36,6 +36,7 @@ parser.add_argument("--rule", action="store_true",
 parser.add_argument("--minted", action="store_true",
                     help="--rule, plus the same assertions skipping minted entities (needs the minted column)")
 parser.add_argument("--only-commits", action="store_true", help="skip the query timings")
+parser.add_argument("--no-commits", action="store_true", help="skip the commit timings")
 args = parser.parse_args()
 
 N = args.rows
@@ -233,6 +234,25 @@ def install(n):
     ]
 
 
+def assertion_bench(path, assertions, suffix=""):
+    """The assertions' own cost: every assertion query, run in the open
+    transaction of each workload (what a commit evaluates), summed. Commits
+    themselves also wait for a synced WAL write, which is noisy on a busy disk."""
+    lines = [ATTACH.format(path=path)] + key_sets()
+    workloads = [("assertions_1_row", ["BEGIN;", change("k1")]),
+                 ("assertions_200_rows", ["BEGIN;", change("k200")]),
+                 ("assertions_install_1000", install(1000)[:-1])]
+    for label, setup in workloads:
+        lines += setup + [".timer on"]
+        for _ in range(args.repeat):
+            lines.append(f".print @@{label}{suffix}")
+            for query in assertions.values():
+                lines.append(" ".join(query.split()) + ";")
+            lines.append(".print @@-")
+        lines += [".timer off", "ROLLBACK;"]
+    return parse_times(run_script(lines))
+
+
 def commit_bench(path, assertions, suffix=""):
     def sql_str(s):
         return "'" + s.replace("'", "''") + "'"
@@ -271,11 +291,16 @@ def main():
         if not os.path.exists(path):
             build(path)
         results = {} if args.only_commits else timed_queries(path)
-        results.update(commit_bench(path, ASSERTIONS))
+        sets = [(ASSERTIONS, "")]
         if args.rule or args.minted:
-            results.update(commit_bench(path, RULE_ASSERTIONS, "_rule"))
+            sets.append((RULE_ASSERTIONS, "_rule"))
         if args.minted:
-            results.update(commit_bench(path, MINTED_ASSERTIONS, "_rule_minted"))
+            sets.append((MINTED_ASSERTIONS, "_rule_minted"))
+        for assertions, suffix in sets:
+            results.update(assertion_bench(path, assertions, suffix))
+        if not args.no_commits:
+            for assertions, suffix in sets:
+                results.update(commit_bench(path, assertions, suffix))
         print(f"rows={N} groups={GROUPS} repeat={args.repeat} commits={args.commits} ({args.stat} seconds)")
         for label, value in results.items():
             print(f"{label:32}{value:10.4f}")

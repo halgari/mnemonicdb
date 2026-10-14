@@ -1,5 +1,61 @@
 # Performance
 
+## Key sets: seeks from IN lists and join filters (MN-6, 2026-10-14)
+
+`bench/keyset_bench.py --rows 1000000`: 1M file items under 5,000 groups,
+with `files`, `sourced` and `content` rows for every file (indexes on
+`items.parent` and `files.path`). Each query runs inside a transaction that
+changed K items, the way commit assertions see it. Best of 7 runs per round,
+three rounds alternating the old and new builds (`reldebug`, which is `-O3`), on
+a shared 16-vCPU VM under load from other builds; milliseconds, lowest round.
+
+| query | before | after |
+|---|---:|---:|
+| semi join on `id` from `mnemonicdb_tx_changes`, 1 key | 2 | 2 |
+| same, 2 keys | 62 | 2 |
+| same, 50 keys (`IN` filter) | 65 | 3 |
+| same, 200 spread keys (key bitmap) | 67 | 6 |
+| same, 200 consecutive ids (min/max) | 69 | 5 |
+| inner join with `tx_changes` on `id`, 200 keys | 62 | 5 |
+| same semi join, empty key set | 3 | 1 |
+| `id IN (SELECT unnest(<2 ids>))` | 45 | 1 |
+| `id IN (<200 constants>)` (rewritten to a join) | 46 | 5 |
+| children of 2 groups (`parent IN`, AVET) | 83 | 3 |
+| 200 keys under `AT (VERSION => n)` | 74 | 6 |
+| full scan of `files` (reference) | 50 | 45 |
+
+The assertions' own cost (each assertion query run once in the open
+transaction, summed; best of 5, two rounds; ms). The "rule" set follows Mauvi's
+DEC-081 rule (large tables read only as `id IN (<small set>)`); the other set
+has one assertion that joins a fetched set straight to `items`, which DuckDB
+still plans with the hash table on a full scan of `items` (it estimates every
+semi join at 20% of its probe side).
+
+| workload | before | after | after, rule set | rule set, skipping `minted` |
+|---|---:|---:|---:|---:|
+| change 1 item | 144 | 130 | 20 (138 before) | 21 |
+| change 200 items | 834 | 218 | 35 (694 before) | 33 |
+| install 1,000 new files | 2,438 | 629 | 225 (2,087 before) | 229 |
+
+Whole commits add a new connection per commit, three statements per
+assertion and a synced WAL write. On this VM the synced write alone varied
+from 7 ms to 0.5 s between runs, so commit timings were too noisy to tabulate. In
+the quietest runs a single-row commit with the rule set took 39–53 ms after
+and at best 260 ms before; one changing 200 items 97 ms after and at best
+0.84 s before (with no assertions: 20 ms after, about 0.2 s before, since the
+`UPDATE ... WHERE id IN (...)` itself now seeks).
+
+What changed:
+1. Every pushed filter (exact, optional, dynamic) becomes a key set per
+   column; points on `id` are EAVT point lookups, points or ranges on AVET
+   columns AVET seeks, points on REF columns VAET lookups, and `id` ranges
+   bound the AEVT merge. Join key bitmaps are enumerated by bisection.
+2. A hash join with an empty build side in the scan's pipeline makes the scan
+   read nothing.
+3. `mnemonicdb_tx_changes` / `mnemonicdb_history` estimates; distinct counts
+   for `id` and unique columns.
+4. Fused scans keep the key sets parent joins push into either side.
+
 ## Projection pushdown, direct decoding, release build (2026-10-13)
 
 - **NULL-rejecting filters drive membership.** A pushed filter that is false
@@ -166,4 +222,5 @@ no compression. Data fits in the OS page cache.
 ```sh
 python3 bench/bench.py --rows 1000000            # MnemonicDB vs native
 bench/warm_writes.sh build/reldebug/duckdb /tmp/warm 1000000 2000
+python3 bench/keyset_bench.py --db DIR --minted --stat min   # key sets (MN-6); DIR keeps the 1M database
 ```
