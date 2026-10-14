@@ -136,7 +136,7 @@ unknown schema
 statement error
 INSERT INTO d.sys.tables (schema, name) VALUES ('sys', 'mine')
 ----
-must be in schema "main"
+schema "sys" is reserved
 
 # Failed schema writes leave the schema unchanged
 query I

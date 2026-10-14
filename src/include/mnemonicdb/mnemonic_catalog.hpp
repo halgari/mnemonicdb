@@ -29,11 +29,19 @@ public:
 	void ScanTables(const string &schema_name, const std::function<void(CatalogEntry &)> &callback) const;
 	optional_ptr<CatalogEntry> GetIndex(const string &schema_name, const string &index_name) const;
 	void ScanIndexes(const string &schema_name, const std::function<void(CatalogEntry &)> &callback) const;
+	optional_ptr<CatalogEntry> GetType(const string &schema_name, const string &type_name) const;
+	void ScanTypes(const string &schema_name, const std::function<void(CatalogEntry &)> &callback) const;
+	//! The schema entry, if the schema exists in this generation
+	optional_ptr<MnemonicSchemaEntry> GetSchemaEntry(const string &schema_name) const;
+	void ScanSchemas(const std::function<void(SchemaCatalogEntry &)> &callback) const;
 
 private:
 	shared_ptr<const mnemonicdb::Schema> schema;
+	//! Schema entries are owned by the catalog (see MnemonicCatalog::GetSchemaEntry)
+	vector<reference<MnemonicSchemaEntry>> schemas;
 	case_insensitive_map_t<case_insensitive_map_t<unique_ptr<MnemonicTableEntry>>> tables;
 	case_insensitive_map_t<case_insensitive_map_t<unique_ptr<CatalogEntry>>> indexes;
+	case_insensitive_map_t<case_insensitive_map_t<unique_ptr<CatalogEntry>>> types;
 };
 
 class MnemonicCatalog : public Catalog {
@@ -82,6 +90,10 @@ public:
 	mnemonicdb::Store &GetStore() {
 		return *store;
 	}
+	//! The entry for schema `name`, created on first use. Schema entries carry
+	//! only a name and read everything else from the transaction's generation, so
+	//! one entry per name serves every generation, and entries are never freed
+	//! (DuckDB may hold on to one across a schema change)
 	MnemonicSchemaEntry &GetSchemaEntry(const string &name);
 
 	//! Held while a transaction takes its basis, snapshot and generation, and
@@ -109,9 +121,9 @@ private:
 private:
 	unique_ptr<mnemonicdb::Store> store;
 	shared_ptr<const mnemonicdb::Schema> initial_schema;
-	//! The fixed schemas: `main` for user tables and `sys` for the schema-as-data
-	//! tables
-	vector<unique_ptr<MnemonicSchemaEntry>> schemas;
+	//! Every schema entry handed out so far, by name
+	mutex schema_entry_lock;
+	case_insensitive_map_t<unique_ptr<MnemonicSchemaEntry>> schema_entries;
 	mutex snapshot_lock;
 	mutex generation_lock;
 	shared_ptr<MnemonicCatalogGeneration> generation;

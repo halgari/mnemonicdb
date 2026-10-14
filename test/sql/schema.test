@@ -20,6 +20,8 @@ sys	tables
 sys	attributes
 sys	tx
 sys	assertions
+sys	schemas
+sys	types
 
 query III
 SELECT t.name, a.name, a.type FROM d.sys.attributes a JOIN d.sys.tables t ON a.table_id = t.id ORDER BY a.id
@@ -38,6 +40,12 @@ attributes	index	VARCHAR
 assertions	name	VARCHAR
 assertions	query	VARCHAR
 assertions	doc	VARCHAR
+schemas	name	VARCHAR
+schemas	doc	VARCHAR
+types	schema	VARCHAR
+types	name	VARCHAR
+types	definition	VARCHAR
+types	doc	VARCHAR
 
 # Built-in IDs: tables in partition 1, attributes in partition 0, the bootstrap tx in partition 2
 query II
@@ -47,6 +55,8 @@ SELECT mnemonicdb_id_partition(id), mnemonicdb_id_local(id) FROM d.sys.tables OR
 1	2
 1	3
 1	4
+1	5
+1	6
 
 query II
 SELECT mnemonicdb_id_partition(id), mnemonicdb_id_local(id) FROM d.sys.tx
@@ -137,7 +147,7 @@ multi-column
 statement error
 CREATE TABLE d.sys.mine (x INTEGER)
 ----
-can only be created in schema "main"
+schema "sys" is reserved
 
 # A rolled-back CREATE TABLE leaves nothing behind
 statement ok

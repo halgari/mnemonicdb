@@ -249,6 +249,8 @@ tables
 attributes
 tx
 assertions
+schemas
+types
 
 query T
 SELECT name FROM d.sys.tables AT (VERSION => 2) WHERE schema = 'main' ORDER BY id

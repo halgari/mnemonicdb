@@ -53,7 +53,7 @@ static unique_ptr<FunctionData> DatomBind(ClientContext &context, TableFunctionB
 		throw BinderException("%s: \"%s\" is not a MnemonicDB table", function_name, entry.name);
 	}
 	auto &table = entry.Cast<MnemonicTableEntry>();
-	if (table.GetTableDef().schema != "main") {
+	if (table.GetTableDef().schema == "sys") {
 		throw BinderException("%s: cannot write to sys tables", function_name);
 	}
 	auto entity = input.inputs[1].DefaultCastAs(LogicalType::UBIGINT).GetValue<uint64_t>();

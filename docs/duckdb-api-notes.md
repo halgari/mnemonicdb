@@ -20,8 +20,9 @@ relative to `duckdb/`. Re-verify after bumping the submodule.
    does not add an alias itself.
 6. **The `TableCatalogEntry` constructor moves `info.constraints` out**
    (`table_catalog_entry.cpp:32`).
-7. **Schema `LookupEntry` must return null for `TYPE_ENTRY`.** Type names in
-   CREATE TABLE are looked up in our catalog first.
+7. **Schema `LookupEntry` must return null for unknown `TYPE_ENTRY` names.**
+   Type names in CREATE TABLE are looked up in our catalog first. Our named
+   types are `TypeCatalogEntry`s per generation.
 8. **Override `BindCreateIndex`.** The default builds an ART index, and only
    DuckDB tables can plan that.
 9. **Pure virtuals:**
@@ -33,6 +34,18 @@ relative to `duckdb/`. Re-verify after bumping the submodule.
     - `Catalog::BindAlterAddIndex` (ALTER TABLE ADD UNIQUE/PK)
     - `CreateTrigger`/`DropTrigger`
     - `PlanMergeInto` with RETURNING
+11. **Named types have no alias in DuckDB.** `CREATE TYPE` stores a plain
+    type, and CREATE TABLE binds column types in place, so the catalog cannot
+    tell which named type a column used. We give our types the alias
+    `schema.name`, but must strip it from column types: an alias blocks
+    implicit casts (`cast_rules.cpp`, "if aliases are different") and so
+    generic functions like `struct_extract` / `union_tag` stop binding.
+12. **No `ALTER TYPE`.** The PEG grammar has `CREATE [OR REPLACE] TYPE` only
+    (`create_type.gram`); OR REPLACE arrives as `REPLACE_ON_CONFLICT`.
+13. **Type strings parse to one `UNBOUND` type** wrapping a `TypeExpression`
+    tree (STRUCT/LIST/MAP are type constructors with child expressions).
+    Literals carry no type, so a bound type cannot be spliced into the tree.
+14. **Nested schemas exist** (`CreateSchemaInfo::IsNested`, `QualifiedName::Path`).
 
 ## Table entries and scans
 

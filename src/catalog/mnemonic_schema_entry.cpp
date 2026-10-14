@@ -22,6 +22,8 @@ static void ScanGeneration(const MnemonicCatalogGeneration &generation, const st
 		generation.ScanTables(schema, callback);
 	} else if (type == CatalogType::INDEX_ENTRY) {
 		generation.ScanIndexes(schema, callback);
+	} else if (type == CatalogType::TYPE_ENTRY) {
+		generation.ScanTypes(schema, callback);
 	}
 }
 
@@ -79,30 +81,43 @@ optional_ptr<CatalogEntry> MnemonicSchemaEntry::CreateCollation(CatalogTransacti
 	throw Unsupported("CREATE COLLATION");
 }
 
-optional_ptr<CatalogEntry> MnemonicSchemaEntry::CreateType(CatalogTransaction, CreateTypeInfo &) {
-	throw Unsupported("CREATE TYPE");
+optional_ptr<CatalogEntry> MnemonicSchemaEntry::CreateType(CatalogTransaction transaction, CreateTypeInfo &info) {
+	auto &transaction_entry = MnemonicTransaction::Get(transaction.GetContext(), catalog);
+	return transaction_entry.CreateType(name.GetIdentifierName(), info);
 }
 
 optional_ptr<CatalogEntry> MnemonicSchemaEntry::LookupEntry(CatalogTransaction transaction,
                                                             const EntryLookupInfo &lookup_info) {
 	auto type = lookup_info.GetCatalogType();
-	if (type != CatalogType::TABLE_ENTRY && type != CatalogType::INDEX_ENTRY) {
+	if (type != CatalogType::TABLE_ENTRY && type != CatalogType::INDEX_ENTRY && type != CatalogType::TYPE_ENTRY) {
 		return nullptr;
 	}
 	auto generation = catalog.Cast<MnemonicCatalog>().GetGeneration(transaction);
 	if (type == CatalogType::INDEX_ENTRY) {
 		return generation->GetIndex(name.GetIdentifierName(), lookup_info.GetEntryName());
 	}
+	if (type == CatalogType::TYPE_ENTRY) {
+		// Unknown names must come back null: type names in CREATE TABLE are looked
+		// up here before the system catalog
+		return generation->GetType(name.GetIdentifierName(), lookup_info.GetEntryName());
+	}
 	return generation->GetTable(name.GetIdentifierName(), lookup_info.GetEntryName()).get();
 }
 
 void MnemonicSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
-	if (info.type != CatalogType::INDEX_ENTRY) {
+	auto &transaction = MnemonicTransaction::Get(context, catalog);
+	auto entry_name = info.GetQualifiedName().Name().GetIdentifierName();
+	bool if_exists = info.if_not_found != OnEntryNotFound::THROW_EXCEPTION;
+	if (info.type == CatalogType::INDEX_ENTRY) {
+		transaction.DropIndex(name.GetIdentifierName(), entry_name, if_exists);
+	} else if (info.type == CatalogType::TYPE_ENTRY) {
+		if (info.cascade) {
+			throw Unsupported("DROP TYPE ... CASCADE");
+		}
+		transaction.DropType(name.GetIdentifierName(), entry_name, if_exists);
+	} else {
 		throw Unsupported("DROP " + EnumUtil::ToString(info.type));
 	}
-	auto &transaction = MnemonicTransaction::Get(context, catalog);
-	transaction.DropIndex(info.GetQualifiedName().Name().GetIdentifierName(),
-	                      info.if_not_found != OnEntryNotFound::THROW_EXCEPTION);
 }
 
 void MnemonicSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {

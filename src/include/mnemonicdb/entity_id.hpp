@@ -23,6 +23,9 @@ static constexpr uint8_t ATTR = 0;
 static constexpr uint8_t TABLE = 1;
 static constexpr uint8_t TX = 2;
 static constexpr uint8_t DB = 3;
+//! Schema objects: schemas and named types. The first reserved partition, so
+//! user writes can never name or allocate IDs in it
+static constexpr uint8_t SCHEMA = 4;
 static constexpr uint8_t FIRST_RESERVED = 4;
 static constexpr uint8_t FIRST_USER = 16;
 static constexpr uint8_t LAST_USER = 254;

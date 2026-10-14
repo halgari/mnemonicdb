@@ -4,6 +4,7 @@
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/database_manager.hpp"
@@ -22,8 +23,10 @@ struct HistoryBindData : public TableFunctionData {
 	explicit HistoryBindData(MnemonicCatalog &catalog) : catalog(catalog) {
 	}
 	MnemonicCatalog &catalog;
-	//! Restrict to these attributes (a table's or one column), unless empty
+	//! Restrict to these attributes (a schema's, a table's or one column), when
+	//! `filtered`
 	vector<AttrId> attributes;
+	bool filtered = false;
 	optional_idx entity;
 	TxId since = 0;
 	TxId until = mnemonicdb::LOCAL_MASK;
@@ -60,6 +63,7 @@ struct HistoryState : public GlobalTableFunctionState {
 	std::unique_ptr<rocksdb::Iterator> log;
 	//! The last tx returned
 	TxId until = mnemonicdb::LOCAL_MASK;
+	bool filtered = false;
 	unordered_set<AttrId> attribute_filter;
 	unordered_map<AttrId, unique_ptr<AttributeInfo>> attributes;
 
@@ -89,6 +93,7 @@ static unique_ptr<FunctionData> HistoryBindInternal(ClientContext &context, Tabl
 	result->tx_changes = tx_changes;
 	auto &schema = MnemonicTransaction::Get(context, mnemonic_catalog).GetSchema();
 
+	string schema_filter;
 	string table_name;
 	string column_name;
 	for (auto &entry : input.named_parameters) {
@@ -97,7 +102,9 @@ static unique_ptr<FunctionData> HistoryBindInternal(ClientContext &context, Tabl
 		if (value.IsNull()) {
 			continue;
 		}
-		if (key == "table_name") {
+		if (key == "schema_name") {
+			schema_filter = value.GetValue<string>();
+		} else if (key == "table_name") {
 			table_name = value.GetValue<string>();
 		} else if (key == "column_name") {
 			column_name = value.GetValue<string>();
@@ -112,38 +119,55 @@ static unique_ptr<FunctionData> HistoryBindInternal(ClientContext &context, Tabl
 	if (!column_name.empty() && table_name.empty()) {
 		throw BinderException("%s: column_name := needs table_name :=", function_name);
 	}
+	auto &view = MnemonicTransaction::Get(context, mnemonic_catalog).GetReadView();
+	// Every attribute ever attached to `table`: its columns, plus dropped columns,
+	// whose table link is in the history index
+	auto add_table_attributes = [&](const mnemonicdb::TableDef &table) {
+		result->attributes.insert(result->attributes.end(), table.attributes.begin(), table.attributes.end());
+		string table_ref;
+		mnemonicdb::PutEntityId(table_ref, table.id);
+		for (auto &datom :
+		     view.ScanPrefix(ColumnFamily::AEVT_HIST, mnemonicdb::AevtPrefix(mnemonicdb::sys::ATTRIBUTES_TABLE))) {
+			auto local = static_cast<AttrId>(mnemonicdb::LocalOf(datom.e));
+			if (datom.v == table_ref && !schema.FindAttributeById(local)) {
+				result->attributes.push_back(local);
+			}
+		}
+	};
 	if (!table_name.empty()) {
-		// "table" or "schema.table"
-		string schema_name = "main";
+		// "table" or "schema.table", or schema_name := with a bare table name
+		string schema_name = schema_filter.empty() ? "main" : schema_filter;
 		auto dot = table_name.find('.');
 		if (dot != string::npos) {
-			schema_name = table_name.substr(0, dot);
+			auto table_schema = table_name.substr(0, dot);
+			if (!schema_filter.empty() && !StringUtil::CIEquals(schema_filter, table_schema)) {
+				throw BinderException("%s: table_name := \"%s\" is not in schema_name := \"%s\"", function_name,
+				                      table_name, schema_filter);
+			}
+			schema_name = table_schema;
 			table_name = table_name.substr(dot + 1);
 		}
 		auto table = schema.FindTable(schema_name, table_name);
 		if (!table) {
 			throw BinderException("%s: table \"%s.%s\" does not exist", function_name, schema_name, table_name);
 		}
+		result->filtered = true;
 		if (column_name.empty()) {
-			result->attributes = table->attributes;
-			// Columns dropped from the table keep their history: their table link is
-			// in the history index
-			auto &view = MnemonicTransaction::Get(context, mnemonic_catalog).GetReadView();
-			string table_ref;
-			mnemonicdb::PutEntityId(table_ref, table->id);
-			for (auto &datom :
-			     view.ScanPrefix(ColumnFamily::AEVT_HIST, mnemonicdb::AevtPrefix(mnemonicdb::sys::ATTRIBUTES_TABLE))) {
-				auto local = static_cast<AttrId>(mnemonicdb::LocalOf(datom.e));
-				if (datom.v == table_ref && !schema.FindAttributeById(local)) {
-					result->attributes.push_back(local);
-				}
-			}
+			add_table_attributes(*table);
 		} else {
 			auto attr = schema.FindAttribute(*table, column_name);
 			if (!attr) {
 				throw BinderException("%s: table \"%s\" has no column \"%s\"", function_name, table_name, column_name);
 			}
 			result->attributes.push_back(attr->Local());
+		}
+	} else if (!schema_filter.empty()) {
+		if (!schema.FindSchema(schema_filter)) {
+			throw BinderException("%s: schema \"%s\" does not exist", function_name, schema_filter);
+		}
+		result->filtered = true;
+		for (auto table : schema.TablesInSchema(schema.FindSchema(schema_filter)->name)) {
+			add_table_attributes(*table);
 		}
 	}
 
@@ -192,6 +216,7 @@ static unique_ptr<GlobalTableFunctionState> HistoryInit(ClientContext &context, 
 	transaction.MarkDataRead();
 	auto &view = transaction.GetReadView();
 	auto state = make_uniq<HistoryState>();
+	state->filtered = data.filtered;
 	state->attribute_filter.insert(data.attributes.begin(), data.attributes.end());
 	state->until = data.until;
 
@@ -206,9 +231,13 @@ static unique_ptr<GlobalTableFunctionState> HistoryInit(ClientContext &context, 
 		}
 		return std::move(state);
 	}
+	if (data.filtered && data.attributes.empty()) {
+		// A filter that matches no attribute (e.g. a schema without tables)
+		return std::move(state);
+	}
 	if (data.entity.IsValid()) {
 		auto entity = data.entity.GetIndex();
-		if (data.attributes.empty()) {
+		if (!data.filtered) {
 			CollectEvents(view, ColumnFamily::EAVT, ColumnFamily::EAVT_HIST, mnemonicdb::EavtPrefix(entity),
 			              state->events);
 		} else {
@@ -271,8 +300,7 @@ static AttributeInfo &GetAttributeInfo(ClientContext &context, HistoryState &sta
 			throw InternalException("MnemonicDB: attribute %d has no definition", local);
 		}
 		mnemonicdb::AttributeDef dropped(mnemonicdb::AttrEntity(local), 0, info->column,
-		                                 TransformStringToLogicalType(type_name, context), mnemonicdb::Uniqueness::NONE,
-		                                 false);
+		                                 schema.ParseType(type_name, context), mnemonicdb::Uniqueness::NONE, false);
 		info->codec = make_uniq<mnemonicdb::ValueCodec>(dropped.codec);
 	}
 	auto &result = *info;
@@ -307,7 +335,7 @@ static void HistoryFunction(ClientContext &context, TableFunctionInput &input, D
 			if (datom.t > state.until) {
 				break;
 			}
-			if (!state.attribute_filter.empty() && state.attribute_filter.count(datom.a) == 0) {
+			if (state.filtered && state.attribute_filter.count(datom.a) == 0) {
 				continue;
 			}
 			auto op = mnemonicdb::DecodeTxOp(std::string_view(it.value().data(), it.value().size()));
@@ -330,6 +358,7 @@ static void HistoryFunction(ClientContext &context, TableFunctionInput &input, D
 
 void RegisterHistoryFunction(ExtensionLoader &loader) {
 	TableFunction function("mnemonicdb_history", {LogicalType::VARCHAR}, HistoryFunction, HistoryBind, HistoryInit);
+	function.named_parameters["schema_name"] = LogicalType::VARCHAR;
 	function.named_parameters["table_name"] = LogicalType::VARCHAR;
 	function.named_parameters["column_name"] = LogicalType::VARCHAR;
 	function.named_parameters["entity"] = LogicalType::UBIGINT;
@@ -343,6 +372,7 @@ void RegisterHistoryFunction(ExtensionLoader &loader) {
 	TableFunctionSet tx_changes("mnemonicdb_tx_changes");
 	for (auto &arguments : {vector<LogicalType> {}, vector<LogicalType> {LogicalType::VARCHAR}}) {
 		TableFunction overload("mnemonicdb_tx_changes", arguments, HistoryFunction, TxChangesBind, HistoryInit);
+		overload.named_parameters["schema_name"] = LogicalType::VARCHAR;
 		overload.named_parameters["table_name"] = LogicalType::VARCHAR;
 		overload.named_parameters["column_name"] = LogicalType::VARCHAR;
 		tx_changes.AddFunction(overload);

@@ -6,7 +6,11 @@
 #include "mnemonicdb/mnemonic_table_entry.hpp"
 #include "mnemonicdb/mnemonic_transaction.hpp"
 
+#include "duckdb/catalog/catalog_entry/type_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/parsed_data/create_type_info.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/parser/parsed_data/create_index_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
@@ -23,8 +27,19 @@ namespace duckdb {
 MnemonicCatalogGeneration::MnemonicCatalogGeneration(MnemonicCatalog &catalog,
                                                      shared_ptr<const mnemonicdb::Schema> schema_p)
     : schema(std::move(schema_p)) {
-	for (auto schema_name : {"main", "sys"}) {
+	for (auto schema_def : schema->AllSchemas()) {
+		auto &schema_name = schema_def->name;
 		auto &schema_entry = catalog.GetSchemaEntry(schema_name);
+		schemas.push_back(schema_entry);
+		for (auto type : schema->TypesInSchema(schema_name)) {
+			CreateTypeInfo info(type->name, type->type);
+			info.SetQualifiedName(
+			    QualifiedName(Identifier(catalog.GetName()), Identifier(schema_name), Identifier(type->name)));
+			if (!type->doc.empty()) {
+				info.comment = Value(type->doc);
+			}
+			types[schema_name][type->name] = make_uniq<TypeCatalogEntry>(catalog, schema_entry, info);
+		}
 		for (auto table : schema->TablesInSchema(schema_name)) {
 			auto info = MnemonicTableEntry::MakeCreateInfo(schema_entry, *schema, *table);
 			auto &table_entry = *(tables[schema_name][table->name] =
@@ -65,6 +80,42 @@ void MnemonicCatalogGeneration::ScanIndexes(const string &schema_name,
 
 MnemonicCatalogGeneration::~MnemonicCatalogGeneration() = default;
 
+optional_ptr<CatalogEntry> MnemonicCatalogGeneration::GetType(const string &schema_name,
+                                                              const string &type_name) const {
+	auto schema_types = types.find(schema_name);
+	if (schema_types == types.end()) {
+		return nullptr;
+	}
+	auto entry = schema_types->second.find(type_name);
+	return entry == schema_types->second.end() ? nullptr : entry->second.get();
+}
+
+void MnemonicCatalogGeneration::ScanTypes(const string &schema_name,
+                                          const std::function<void(CatalogEntry &)> &callback) const {
+	auto schema_types = types.find(schema_name);
+	if (schema_types == types.end()) {
+		return;
+	}
+	for (auto &entry : schema_types->second) {
+		callback(*entry.second);
+	}
+}
+
+optional_ptr<MnemonicSchemaEntry> MnemonicCatalogGeneration::GetSchemaEntry(const string &schema_name) const {
+	for (auto &entry : schemas) {
+		if (StringUtil::CIEquals(entry.get().name.GetIdentifierName(), schema_name)) {
+			return &entry.get();
+		}
+	}
+	return nullptr;
+}
+
+void MnemonicCatalogGeneration::ScanSchemas(const std::function<void(SchemaCatalogEntry &)> &callback) const {
+	for (auto &entry : schemas) {
+		callback(entry.get());
+	}
+}
+
 optional_ptr<MnemonicTableEntry> MnemonicCatalogGeneration::GetTable(const string &schema_name,
                                                                      const string &table_name) const {
 	auto schema_tables = tables.find(schema_name);
@@ -97,23 +148,20 @@ MnemonicCatalog::MnemonicCatalog(AttachedDatabase &db, unique_ptr<mnemonicdb::St
 MnemonicCatalog::~MnemonicCatalog() = default;
 
 void MnemonicCatalog::Initialize(bool load_builtin) {
-	for (auto name : {"main", "sys"}) {
-		CreateSchemaInfo info;
-		info.SetQualifiedName(QualifiedName({Identifier(name)}, Identifier()));
-		info.internal = true;
-		schemas.push_back(make_uniq<MnemonicSchemaEntry>(*this, info));
-	}
 	generation = make_shared_ptr<MnemonicCatalogGeneration>(*this, initial_schema);
 	initial_schema.reset();
 }
 
 MnemonicSchemaEntry &MnemonicCatalog::GetSchemaEntry(const string &name) {
-	for (auto &schema : schemas) {
-		if (schema->name == name) {
-			return *schema;
-		}
+	lock_guard<mutex> guard(schema_entry_lock);
+	auto &entry = schema_entries[name];
+	if (!entry) {
+		CreateSchemaInfo info;
+		info.SetQualifiedName(QualifiedName({Identifier(name)}, Identifier()));
+		info.internal = name == "main" || name == "sys";
+		entry = make_uniq<MnemonicSchemaEntry>(*this, info);
 	}
-	throw InternalException("MnemonicDB: no schema \"%s\"", name);
+	return *entry;
 }
 
 shared_ptr<MnemonicCatalogGeneration> MnemonicCatalog::GetGeneration() {
@@ -149,21 +197,35 @@ shared_ptr<MnemonicCatalogGeneration> MnemonicCatalog::GetGeneration(CatalogTran
 	return GetGeneration();
 }
 
-optional_ptr<CatalogEntry> MnemonicCatalog::CreateSchema(CatalogTransaction, CreateSchemaInfo &) {
-	throw NotImplementedException("MnemonicDB schemas are fixed: only \"main\" and \"sys\" exist");
+optional_ptr<CatalogEntry> MnemonicCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
+	if (info.IsNested()) {
+		throw NotImplementedException("MnemonicDB does not support nested schemas");
+	}
+	if (!transaction.HasContext()) {
+		throw InternalException("MnemonicDB: CREATE SCHEMA without a client context");
+	}
+	auto &transaction_entry = MnemonicTransaction::Get(transaction.GetContext(), *this);
+	return transaction_entry.CreateSchema(info);
 }
 
-void MnemonicCatalog::DropSchema(ClientContext &, DropInfo &) {
-	throw NotImplementedException("MnemonicDB schemas are fixed: only \"main\" and \"sys\" exist");
+void MnemonicCatalog::DropSchema(ClientContext &context, DropInfo &info) {
+	auto &path = info.GetQualifiedName().Path();
+	// The path is [catalog, schema] after binding, or just [schema]
+	if (path.size() > 2) {
+		throw NotImplementedException("MnemonicDB does not support nested schemas");
+	}
+	auto &transaction = MnemonicTransaction::Get(context, *this);
+	transaction.DropSchema(info.GetQualifiedName().Name().GetIdentifierName(),
+	                       info.if_not_found != OnEntryNotFound::THROW_EXCEPTION, info.cascade);
 }
 
-optional_ptr<SchemaCatalogEntry> MnemonicCatalog::LookupSchema(CatalogTransaction, const EntryLookupInfo &schema_lookup,
+optional_ptr<SchemaCatalogEntry> MnemonicCatalog::LookupSchema(CatalogTransaction transaction,
+                                                               const EntryLookupInfo &schema_lookup,
                                                                OnEntryNotFound if_not_found) {
 	auto &name = schema_lookup.GetEntryName();
-	for (auto &schema : schemas) {
-		if (schema->name == name) {
-			return schema.get();
-		}
+	auto entry = GetGeneration(transaction)->GetSchemaEntry(name);
+	if (entry) {
+		return entry.get();
 	}
 	if (if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
 		throw CatalogException("Schema with name \"%s\" not found in MnemonicDB database", name);
@@ -171,10 +233,8 @@ optional_ptr<SchemaCatalogEntry> MnemonicCatalog::LookupSchema(CatalogTransactio
 	return nullptr;
 }
 
-void MnemonicCatalog::ScanSchemas(ClientContext &, std::function<void(SchemaCatalogEntry &)> callback) {
-	for (auto &schema : schemas) {
-		callback(*schema);
-	}
+void MnemonicCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
+	MnemonicTransaction::Get(context, *this).GetGeneration()->ScanSchemas(callback);
 }
 
 PhysicalOperator &MnemonicCatalog::PlanCreateTableAs(ClientContext &, PhysicalPlanGenerator &, LogicalCreateTable &,

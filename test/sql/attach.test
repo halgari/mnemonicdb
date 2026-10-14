@@ -29,8 +29,10 @@ SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'd' OR
 ----
 sys	assertions
 sys	attributes
+sys	schemas
 sys	tables
 sys	tx
+sys	types
 
 # Transactions can begin and commit against the database
 statement ok
@@ -42,10 +44,11 @@ SELECT * FROM mnemonicdb_info('d')
 statement ok
 COMMIT
 
+# sys is reserved (user schemas are covered by schemas.test)
 statement error
-CREATE SCHEMA d.other
+CREATE SCHEMA d.sys
 ----
-schemas are fixed
+schema "sys" is reserved
 
 statement ok
 DETACH d

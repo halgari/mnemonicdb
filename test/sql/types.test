@@ -1,0 +1,565 @@
+# name: test/sql/types.test
+# description: Named types: CREATE TYPE as schema data, use in any schema, ENUM append, DROP TYPE, reopen
+# group: [sql]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/types.mnemonic' AS d (TYPE mnemonicdb)
+
+# tx 2, 3
+statement ok
+CREATE SCHEMA d.core
+
+statement ok
+CREATE SCHEMA d.mods
+
+# tx 4
+statement ok
+CREATE TYPE d.core.layer AS ENUM ('system', 'game', 'dlc', 'mods', 'overrides', 'generated')
+
+# tx 5: a STRUCT type using another named type
+statement ok
+CREATE TYPE d.core.cond AS STRUCT(layer d.core.layer, priority INTEGER)
+
+# tx 6
+statement ok
+CREATE TYPE d.core.source AS UNION(path VARCHAR, layer d.core.layer)
+
+# tx 7: types can live in main too
+statement ok
+CREATE TYPE d.mood AS ENUM ('happy', 'sad')
+
+statement ok
+CREATE TYPE IF NOT EXISTS d.core.layer AS ENUM ('x')
+
+statement error
+CREATE TYPE d.core.layer AS ENUM ('x')
+----
+already exists
+
+statement error
+CREATE TYPE d.sys.t AS ENUM ('x')
+----
+schema "sys" is reserved
+
+statement error
+CREATE TYPE d.core.r AS REF
+----
+cannot be REF
+
+statement error
+CREATE TYPE d.core.v AS VARIANT
+----
+VARIANT
+
+# Stored as schema data: the definition names other named types by their qualified name
+query TTTII
+SELECT schema, name, definition, mnemonicdb_id_partition(id), mnemonicdb_id_local(id) FROM d.sys.types ORDER BY id
+----
+core	layer	ENUM('system', 'game', 'dlc', 'mods', 'overrides', 'generated')	4	18
+core	cond	STRUCT(layer core.layer, priority INTEGER)	4	19
+core	source	UNION(path VARCHAR, layer core.layer)	4	20
+main	mood	ENUM('happy', 'sad')	4	21
+
+query TTT
+SELECT schema_name, type_name, logical_type FROM duckdb_types() WHERE database_name = 'd' ORDER BY ALL
+----
+core	cond	STRUCT
+core	layer	ENUM
+core	source	UNION
+main	mood	ENUM
+
+# sys.types is written only by DDL
+statement error
+INSERT INTO d.sys.types (schema, name, definition) VALUES ('core', 'x', 'INTEGER')
+----
+only through CREATE TYPE
+
+#
+# Named types as column types, in tables of any schema
+#
+
+# tx 8, 9, 10
+statement ok
+CREATE TABLE d.core.files (path VARCHAR PRIMARY KEY, layer d.core.layer, conds d.core.cond[], origin d.core.source, layers MAP(VARCHAR, d.core.layer))
+
+statement ok
+CREATE TABLE d.mods.plugins (name VARCHAR PRIMARY KEY, layer d.core.layer, feeling mood)
+
+statement ok
+CREATE TABLE d.notes (body VARCHAR, feeling d.main.mood, layer d.core.layer)
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'd' AND table_name = 'files' ORDER BY column_index
+----
+id	REF
+path	VARCHAR
+layer	ENUM('system', 'game', 'dlc', 'mods', 'overrides', 'generated')
+conds	STRUCT(layer ENUM('system', 'game', 'dlc', 'mods', 'overrides', 'generated'), priority INTEGER)[]
+origin	UNION(path VARCHAR, layer ENUM('system', 'game', 'dlc', 'mods', 'overrides', 'generated'))
+layers	MAP(VARCHAR, ENUM('system', 'game', 'dlc', 'mods', 'overrides', 'generated'))
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'd' AND table_name = 'plugins' ORDER BY column_index
+----
+id	REF
+name	VARCHAR
+layer	ENUM('system', 'game', 'dlc', 'mods', 'overrides', 'generated')
+feeling	ENUM('happy', 'sad')
+
+query TT
+SELECT a.name, a.type FROM d.sys.attributes a JOIN d.sys.tables t ON a.table_id = t.id WHERE t.name = 'files' ORDER BY a.id
+----
+path	VARCHAR
+layer	core.layer
+conds	core.cond[]
+origin	core."source"
+layers	MAP(VARCHAR, core.layer)
+
+# tx 11, 12, 13
+statement ok
+INSERT INTO d.core.files (path, layer, conds, origin, layers) VALUES
+    ('a.esp', 'game', [{'layer': 'dlc', 'priority': 1}], 'from/here'::VARCHAR, MAP {'k': 'mods'}),
+    ('b.esp', 'mods'::d.core.layer, NULL, union_value(layer := 'dlc'), NULL)
+
+statement ok
+INSERT INTO d.mods.plugins (name, layer, feeling) VALUES ('p', 'overrides', 'happy')
+
+statement ok
+INSERT INTO d.notes (body, feeling, layer) VALUES ('n', 'sad', 'system')
+
+statement error
+INSERT INTO d.core.files (path, layer) VALUES ('c.esp', 'nope')
+----
+nope
+
+query TTTTT
+SELECT path, layer, conds, origin, layers FROM d.core.files ORDER BY path
+----
+a.esp	game	[{'layer': dlc, 'priority': 1}]	from/here	{k=mods}
+b.esp	mods	NULL	dlc	NULL
+
+query TT
+SELECT path, union_tag(origin) FROM d.core.files ORDER BY path
+----
+a.esp	path
+b.esp	layer
+
+query T
+SELECT path FROM d.core.files WHERE layer > 'game' ORDER BY path
+----
+b.esp
+
+query TTT
+SELECT name, layer, feeling FROM d.mods.plugins
+----
+p	overrides	happy
+
+statement ok
+CREATE INDEX layer_idx ON d.core.files (layer)
+
+query T
+SELECT path FROM d.core.files WHERE layer = 'mods'
+----
+b.esp
+
+# Comparing two columns of the same named type
+query TT
+SELECT f.path, p.name FROM d.core.files f JOIN d.mods.plugins p ON f.layer < p.layer ORDER BY ALL
+----
+a.esp	p
+b.esp	p
+
+#
+# Appending ENUM values: CREATE OR REPLACE TYPE with a strict extension
+#
+
+# Rejected: removing, reordering or renaming values, or changing a non-ENUM type
+statement error
+CREATE OR REPLACE TYPE d.core.layer AS ENUM ('system', 'game', 'dlc', 'mods', 'overrides')
+----
+removes 'generated'
+
+statement error
+CREATE OR REPLACE TYPE d.core.layer AS ENUM ('game', 'system', 'dlc', 'mods', 'overrides', 'generated', 'extra')
+----
+value 1 is 'game' and was 'system'
+
+statement error
+CREATE OR REPLACE TYPE d.core.layer AS ENUM ('system', 'game', 'DLC', 'mods', 'overrides', 'generated')
+----
+values cannot be reordered, renamed or removed
+
+statement error
+CREATE OR REPLACE TYPE d.core.layer AS VARCHAR
+----
+the only supported change to a named type is appending values to an ENUM
+
+statement error
+CREATE OR REPLACE TYPE d.core.cond AS STRUCT(layer d.core.layer, priority BIGINT)
+----
+cannot be redefined
+
+# The same definition again changes nothing and commits nothing
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+14
+
+statement ok
+CREATE OR REPLACE TYPE d.core.layer AS ENUM ('system', 'game', 'dlc', 'mods', 'overrides', 'generated')
+
+query I
+SELECT last_tx FROM mnemonicdb_info('d')
+----
+14
+
+# tx 15: append
+statement ok
+CREATE OR REPLACE TYPE d.core.layer AS ENUM ('system', 'game', 'dlc', 'mods', 'overrides', 'generated', 'patches')
+
+query TT
+SELECT name, definition FROM d.sys.types WHERE name = 'layer'
+----
+layer	ENUM('system', 'game', 'dlc', 'mods', 'overrides', 'generated', 'patches')
+
+# Every column using the type, directly or through cond/source/MAP, sees the new value; old values are unchanged
+statement ok
+INSERT INTO d.core.files (path, layer, conds, origin, layers) VALUES ('c.esp', 'patches', [{'layer': 'patches', 'priority': 2}], union_value(layer := 'patches'), MAP {'p': 'patches'})
+
+statement ok
+INSERT INTO d.mods.plugins (name, layer) VALUES ('q', 'patches')
+
+query TTTTT
+SELECT path, layer, conds, origin, layers FROM d.core.files ORDER BY path
+----
+a.esp	game	[{'layer': dlc, 'priority': 1}]	from/here	{k=mods}
+b.esp	mods	NULL	dlc	NULL
+c.esp	patches	[{'layer': patches, 'priority': 2}]	patches	{p=patches}
+
+query T
+SELECT path FROM d.core.files WHERE layer >= 'mods' ORDER BY path
+----
+b.esp
+c.esp
+
+query T
+SELECT path FROM d.core.files WHERE layer = 'patches'
+----
+c.esp
+
+query TT
+SELECT name, layer FROM d.mods.plugins ORDER BY name
+----
+p	overrides
+q	patches
+
+# Time travel reads old data through the current type
+query TT
+SELECT path, layer FROM d.core.files AT (VERSION => 11) ORDER BY path
+----
+a.esp	game
+b.esp	mods
+
+# The definition has history
+query TT
+SELECT tx, value::VARCHAR FROM mnemonicdb_history('d', table_name := 'sys.types', column_name := 'definition') WHERE added AND value::VARCHAR LIKE 'ENUM(''system''%' ORDER BY tx
+----
+4	ENUM('system', 'game', 'dlc', 'mods', 'overrides', 'generated')
+15	ENUM('system', 'game', 'dlc', 'mods', 'overrides', 'generated', 'patches')
+
+query T
+SELECT definition FROM d.sys.types AT (VERSION => 14) WHERE name = 'layer'
+----
+ENUM('system', 'game', 'dlc', 'mods', 'overrides', 'generated')
+
+# An append inside a transaction is private until commit, and rolls back
+statement ok
+BEGIN
+
+statement ok
+CREATE OR REPLACE TYPE d.core.layer AS ENUM ('system', 'game', 'dlc', 'mods', 'overrides', 'generated', 'patches', 'tmp')
+
+statement ok
+INSERT INTO d.core.files (path, layer) VALUES ('tmp.esp', 'tmp')
+
+statement ok
+ROLLBACK
+
+statement error
+INSERT INTO d.core.files (path, layer) VALUES ('tmp.esp', 'tmp')
+----
+tmp
+
+query I
+SELECT count(*) FROM d.core.files
+----
+3
+
+#
+# Growing an ENUM past 255 values changes its physical width: stored values are re-encoded
+#
+
+statement ok
+CREATE TYPE d.core.wide AS ENUM (SELECT 'w' || range::VARCHAR FROM range(255))
+
+statement ok
+CREATE TABLE d.core.wides (k VARCHAR PRIMARY KEY, w d.core.wide, ws d.core.wide[])
+
+statement ok
+CREATE INDEX w_idx ON d.core.wides (w)
+
+statement ok
+INSERT INTO d.core.wides (k, w, ws) VALUES ('a', 'w3', ['w1', 'w254']), ('b', 'w254', ['w0'])
+
+statement ok
+UPDATE d.core.wides SET w = 'w200' WHERE k = 'b'
+
+statement ok
+CREATE OR REPLACE TYPE d.core.wide AS ENUM (SELECT 'w' || range::VARCHAR FROM range(300))
+
+statement ok
+INSERT INTO d.core.wides (k, w, ws) VALUES ('c', 'w299', ['w256', 'w2'])
+
+query TTT
+SELECT k, w, ws FROM d.core.wides ORDER BY k
+----
+a	w3	[w1, w254]
+b	w200	[w0]
+c	w299	[w2, w256]
+
+query T
+SELECT k FROM d.core.wides WHERE w = 'w200'
+----
+b
+
+# Dictionary order (a string literal would compare as VARCHAR, as in DuckDB)
+query TI
+SELECT k, enum_code(w) FROM d.core.wides WHERE enum_code(w) > 100 ORDER BY k
+----
+b	200
+c	299
+
+query TTT
+SELECT column_name, value::VARCHAR, added FROM mnemonicdb_history('d', table_name := 'core.wides', column_name := 'w') ORDER BY tx, added
+----
+w	w3	true
+w	w254	true
+w	w254	false
+w	w200	true
+w	w299	true
+
+#
+# Types from elsewhere
+#
+
+# A DuckDB type from another catalog has no identity here: its definition is copied into the column
+statement ok
+CREATE TYPE memory.main.colour AS ENUM ('red', 'green')
+
+statement ok
+CREATE TABLE d.paint (c memory.main.colour)
+
+query T
+SELECT a.type FROM d.sys.attributes a JOIN d.sys.tables t ON a.table_id = t.id WHERE t.name = 'paint'
+----
+ENUM('red', 'green')
+
+# A named type of another MnemonicDB database is refused
+statement ok
+ATTACH '{TEST_DIR}/types_other.mnemonic' AS e (TYPE mnemonicdb)
+
+statement ok
+CREATE TYPE e.main.alien AS ENUM ('x', 'y')
+
+statement error
+CREATE TABLE d.bad (a e.main.alien)
+----
+is not a type of this database
+
+#
+# DROP TYPE
+#
+
+statement error
+DROP TYPE d.core.layer
+----
+column "core.files.layer" uses it
+
+statement error
+DROP TYPE d.core.cond
+----
+column "core.files.conds" uses it
+
+statement ok
+CREATE TYPE d.core.unused AS STRUCT(a INTEGER, b VARCHAR)
+
+statement ok
+CREATE TYPE d.core.wrapper AS STRUCT(u d.core.unused)
+
+statement error
+DROP TYPE d.core.unused
+----
+type "core.wrapper" uses it
+
+statement ok
+DROP TYPE d.core.wrapper
+
+statement ok
+DROP TYPE d.core.unused
+
+statement error
+DROP TYPE d.core.unused
+----
+does not exist
+
+statement ok
+DROP TYPE IF EXISTS d.core.unused
+
+# A schema holding only types can be dropped once they are
+statement ok
+CREATE SCHEMA d.scratch
+
+statement ok
+CREATE TYPE d.scratch.t AS ENUM ('a')
+
+statement error
+DROP SCHEMA d.scratch
+----
+is not empty (0 tables, 1 types)
+
+statement ok
+DROP TYPE d.scratch.t
+
+statement ok
+DROP SCHEMA d.scratch
+
+#
+# ALTER TABLE with named types
+#
+
+statement ok
+ALTER TABLE d.notes ADD COLUMN extra d.core.cond
+
+statement ok
+UPDATE d.notes SET extra = {'layer': 'game', 'priority': 3}
+
+# ENUM to VARCHAR is a safe type change
+statement ok
+ALTER TABLE d.notes ALTER COLUMN feeling TYPE VARCHAR
+
+query TT
+SELECT a.name, a.type FROM d.sys.attributes a JOIN d.sys.tables t ON a.table_id = t.id WHERE t.name = 'notes' ORDER BY a.id
+----
+body	VARCHAR
+feeling	VARCHAR
+layer	core.layer
+extra	core.cond
+
+query TTT
+SELECT feeling, extra.layer, extra.priority FROM d.notes
+----
+sad	game	3
+
+#
+# Plain types in main are unchanged
+#
+
+statement ok
+CREATE TABLE d.plain (e ENUM('a', 'b'), s STRUCT(x INTEGER))
+
+statement ok
+INSERT INTO d.plain VALUES (DEFAULT, 'b', {'x': 1})
+
+query TT
+SELECT e, s FROM d.plain
+----
+b	{'x': 1}
+
+query TT
+SELECT a.name, a.type FROM d.sys.attributes a JOIN d.sys.tables t ON a.table_id = t.id WHERE t.name = 'plain' ORDER BY a.id
+----
+e	ENUM('a', 'b')
+s	STRUCT(x INTEGER)
+
+#
+# Reopen
+#
+
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/types.mnemonic' AS d (TYPE mnemonicdb)
+
+query TTT
+SELECT schema_name, type_name, logical_type FROM duckdb_types() WHERE database_name = 'd' ORDER BY ALL
+----
+core	cond	STRUCT
+core	layer	ENUM
+core	source	UNION
+core	wide	ENUM
+main	mood	ENUM
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'd' AND table_name = 'files' ORDER BY column_index
+----
+id	REF
+path	VARCHAR
+layer	ENUM('system', 'game', 'dlc', 'mods', 'overrides', 'generated', 'patches')
+conds	STRUCT(layer ENUM('system', 'game', 'dlc', 'mods', 'overrides', 'generated', 'patches'), priority INTEGER)[]
+origin	UNION(path VARCHAR, layer ENUM('system', 'game', 'dlc', 'mods', 'overrides', 'generated', 'patches'))
+layers	MAP(VARCHAR, ENUM('system', 'game', 'dlc', 'mods', 'overrides', 'generated', 'patches'))
+
+query TTTTT
+SELECT path, layer, conds, origin, layers FROM d.core.files ORDER BY path
+----
+a.esp	game	[{'layer': dlc, 'priority': 1}]	from/here	{k=mods}
+b.esp	mods	NULL	dlc	NULL
+c.esp	patches	[{'layer': patches, 'priority': 2}]	patches	{p=patches}
+
+query TTT
+SELECT k, w, ws FROM d.core.wides ORDER BY k
+----
+a	w3	[w1, w254]
+b	w200	[w0]
+c	w299	[w2, w256]
+
+query T
+SELECT k FROM d.core.wides WHERE w = 'w299'
+----
+c
+
+query TTTT
+SELECT body, feeling, layer, extra FROM d.notes
+----
+n	sad	system	{'layer': game, 'priority': 3}
+
+# New tables can use the reloaded types, and appends still work after reopening
+statement ok
+CREATE TABLE d.mods.more (layer d.core.layer)
+
+statement ok
+CREATE OR REPLACE TYPE d.core.layer AS ENUM ('system', 'game', 'dlc', 'mods', 'overrides', 'generated', 'patches', 'late')
+
+statement ok
+INSERT INTO d.mods.more (layer) VALUES ('late'), ('system')
+
+query T
+SELECT layer FROM d.mods.more ORDER BY layer
+----
+system
+late
+
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/types.mnemonic' AS d (TYPE mnemonicdb)
+
+query T
+SELECT layer FROM d.mods.more ORDER BY layer
+----
+system
+late

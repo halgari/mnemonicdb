@@ -14,6 +14,9 @@
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/parser/parsed_data/create_type_info.hpp"
+#include "duckdb/catalog/default/default_schemas.hpp"
 #include "duckdb/function/cast_rules.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
@@ -181,10 +184,13 @@ optional_ptr<CatalogEntry> MnemonicTransaction::CreateTable(MnemonicSchemaEntry 
 	auto &info = bound_info.Base();
 	auto schema_name = schema_entry.name.GetIdentifierName();
 	auto table_name = info.GetTableName().GetIdentifierName();
-	if (schema_name != "main") {
-		throw CatalogException("MnemonicDB: tables can only be created in schema \"main\"");
-	}
 	auto &schema = GetSchema();
+	if (schema_name == "sys") {
+		throw CatalogException("MnemonicDB: schema \"sys\" is reserved: tables cannot be created in it");
+	}
+	if (!schema.FindSchema(schema_name)) {
+		throw CatalogException("MnemonicDB: schema \"%s\" does not exist", schema_name);
+	}
 	if (auto existing = schema.FindTable(schema_name, table_name)) {
 		switch (info.on_conflict) {
 		case OnCreateConflict::IGNORE_ON_CONFLICT:
@@ -268,6 +274,7 @@ mnemonicdb::AttributeDef MnemonicTransaction::NewAttribute(EntityId table, const
 	if (column.HasDefaultValue()) {
 		throw NotImplementedException("MnemonicDB does not support column defaults");
 	}
+	CheckNamedTypes(column.Type());
 	return mnemonicdb::AttributeDef(store.AllocateId(mnemonicdb::partition::ATTR), table, name, column.Type(), unique,
 	                                false);
 }
@@ -305,7 +312,7 @@ void MnemonicTransaction::AlterTable(const string &schema_name, AlterTableInfo &
 		throw CatalogException("MnemonicDB: table \"%s\" does not exist", table_name);
 	}
 	bool tx_add_column = table->id == mnemonicdb::sys::TX && info.alter_table_type == AlterTableType::ADD_COLUMN;
-	if (table->schema != "main" && !tx_add_column) {
+	if (table->schema == "sys" && !tx_add_column) {
 		throw NotImplementedException("MnemonicDB: sys tables cannot be altered, "
 		                              "except ADD COLUMN on sys.tx");
 	}
@@ -402,7 +409,8 @@ void MnemonicTransaction::AlterTable(const string &schema_name, AlterTableInfo &
 		if (change.expression && change.expression->GetExpressionClass() != ExpressionClass::CAST) {
 			throw NotImplementedException("MnemonicDB does not support ALTER COLUMN TYPE ... USING");
 		}
-		if (!IsSafeTypeChange(attr.type, change.target_type)) {
+		CheckNamedTypes(change.target_type);
+		if (!IsSafeTypeChange(attr.type, mnemonicdb::StripNamedTypeAliases(change.target_type))) {
 			throw NotImplementedException("MnemonicDB cannot change column \"%s\" from %s to %s: only "
 			                              "conversions "
 			                              "that keep distinct values distinct are allowed",
@@ -417,7 +425,7 @@ void MnemonicTransaction::AlterTable(const string &schema_name, AlterTableInfo &
 			return new_codec.EncodeValue(old_codec.DecodeValue(v).DefaultCastAs(target, true));
 		});
 		auto &sys_type = schema.GetAttribute(mnemonicdb::sys::ATTRIBUTES_TYPE);
-		writer.Assert(sys_type, attr.id, sys_type.codec.EncodeValue(Value(changed.type.ToString())));
+		writer.Assert(sys_type, attr.id, sys_type.codec.EncodeValue(Value(changed.declared.ToString())));
 		SetSchema(schema.WithAttribute(std::move(changed)));
 		break;
 	}
@@ -439,14 +447,14 @@ void MnemonicTransaction::ReloadSchema(ClientContext &context) {
 	                                               mnemonicdb::AevtPrefix(mnemonicdb::sys::TABLES_SCHEMA))) {
 		auto schema_name =
 		    old_schema.GetAttribute(mnemonicdb::sys::TABLES_SCHEMA).codec.DecodeValue(datom.v).ToString();
-		if (schema_name != "main" && schema_name != "sys") {
-			throw InvalidInputException("MnemonicDB: unknown schema \"%s\": user tables live in \"main\"", schema_name);
+		if (!old_schema.FindSchema(schema_name)) {
+			throw InvalidInputException("MnemonicDB: unknown schema \"%s\"; create it with CREATE SCHEMA", schema_name);
 		}
 	}
 	auto new_schema = mnemonicdb::Schema::Load(writer.GetView(), context);
 	for (auto table : new_schema->TablesInSchema("sys")) {
 		if (!old_schema.FindTable(table->id)) {
-			throw InvalidInputException("MnemonicDB: user tables must be in schema \"main\"");
+			throw InvalidInputException("MnemonicDB: schema \"sys\" is reserved: user tables cannot be created in it");
 		}
 	}
 	for (auto old_attr : old_schema.AllAttributes()) {
@@ -464,7 +472,7 @@ void MnemonicTransaction::ReloadSchema(ClientContext &context) {
 			                              old_attr->name);
 		}
 		auto &new_attr = new_schema->GetAttribute(old_attr->Local());
-		if (new_attr.type != old_attr->type) {
+		if (new_attr.declared != old_attr->declared) {
 			throw NotImplementedException("MnemonicDB: the type of \"%s\" cannot be changed through "
 			                              "sys.attributes; use ALTER TABLE ... TYPE",
 			                              old_attr->name);
@@ -506,7 +514,7 @@ void MnemonicTransaction::CreateIndex(MnemonicTableEntry &table_entry, const str
 	if (!attr) {
 		throw BinderException("MnemonicDB: table \"%s\" has no column \"%s\"", table->name, column);
 	}
-	if (schema.FindIndex(index_name)) {
+	if (schema.FindIndex(table->schema, index_name)) {
 		if (if_not_exists) {
 			return;
 		}
@@ -528,9 +536,9 @@ void MnemonicTransaction::CreateIndex(MnemonicTableEntry &table_entry, const str
 	statement.Commit();
 }
 
-void MnemonicTransaction::DropIndex(const string &index_name, bool if_exists) {
+void MnemonicTransaction::DropIndex(const string &schema_name, const string &index_name, bool if_exists) {
 	auto &schema = GetSchema();
-	auto attr = schema.FindIndex(index_name);
+	auto attr = schema.FindIndex(schema_name, index_name);
 	if (!attr) {
 		if (if_exists) {
 			return;
@@ -550,6 +558,309 @@ void MnemonicTransaction::DropIndex(const string &index_name, bool if_exists) {
 		writer.RebuildAvet(*attr, true);
 	}
 	SetSchema(schema.WithAttribute(std::move(dropped)));
+	statement.Commit();
+}
+
+//===--------------------------------------------------------------------===//
+// Schemas and named types
+//===--------------------------------------------------------------------===//
+optional_ptr<CatalogEntry> MnemonicTransaction::CreateSchema(CreateSchemaInfo &info) {
+	auto schema_name = info.SchemaName().GetIdentifierName();
+	auto &schema = GetSchema();
+	if (StringUtil::CIEquals(schema_name, "sys") && info.on_conflict != OnCreateConflict::IGNORE_ON_CONFLICT) {
+		throw CatalogException("MnemonicDB: schema \"sys\" is reserved");
+	}
+	if (schema.FindSchema(schema_name)) {
+		switch (info.on_conflict) {
+		case OnCreateConflict::IGNORE_ON_CONFLICT:
+			return nullptr;
+		case OnCreateConflict::REPLACE_ON_CONFLICT:
+			throw NotImplementedException("MnemonicDB does not support CREATE OR REPLACE SCHEMA");
+		default:
+			throw CatalogException::EntryAlreadyExists(CatalogType::SCHEMA_ENTRY, info.SchemaName());
+		}
+	}
+	if (DefaultSchemaGenerator::IsDefaultSchema(info.SchemaName()) || StringUtil::CIEquals(schema_name, "temp")) {
+		throw CatalogException("MnemonicDB: schema name \"%s\" is reserved", schema_name);
+	}
+	auto &writer = GetWriter();
+	MnemonicStatement statement(*this);
+	mnemonicdb::SchemaDef def;
+	def.id = store.AllocateId(mnemonicdb::partition::SCHEMA);
+	def.name = schema_name;
+	if (!info.comment.IsNull()) {
+		def.doc = info.comment.ToString();
+	}
+	mnemonicdb::Schema::WriteSchema(writer, schema, def);
+	SetSchema(schema.WithSchema(std::move(def)));
+	statement.Commit();
+	return generation->GetSchemaEntry(schema_name).get();
+}
+
+void MnemonicTransaction::DropSchema(const string &schema_name, bool if_exists, bool cascade) {
+	auto &schema = GetSchema();
+	auto def = schema.FindSchema(schema_name);
+	if (!def) {
+		if (if_exists) {
+			return;
+		}
+		throw CatalogException("MnemonicDB: schema \"%s\" does not exist", schema_name);
+	}
+	if (def->id == mnemonicdb::sys::MAIN_SCHEMA || def->id == mnemonicdb::sys::SYS_SCHEMA) {
+		throw CatalogException("MnemonicDB: schema \"%s\" is built in and cannot be dropped", def->name);
+	}
+	if (cascade) {
+		throw NotImplementedException("MnemonicDB does not support DROP SCHEMA ... CASCADE: only an empty schema "
+		                              "can be dropped");
+	}
+	auto tables = schema.TablesInSchema(def->name).size();
+	auto types = schema.TypesInSchema(def->name).size();
+	if (tables > 0 || types > 0) {
+		throw CatalogException("MnemonicDB: schema \"%s\" is not empty (%d tables, %d types): only an empty schema "
+		                       "can be dropped",
+		                       def->name, tables, types);
+	}
+	auto &writer = GetWriter();
+	MnemonicStatement statement(*this);
+	for (auto sys_attr : {mnemonicdb::sys::SCHEMAS_NAME, mnemonicdb::sys::SCHEMAS_DOC}) {
+		writer.RetractAll(schema.GetAttribute(sys_attr), def->id);
+	}
+	SetSchema(schema.WithoutSchema(def->name));
+	statement.Commit();
+}
+
+//! Visit every named-type alias in `type`
+static void ForEachAlias(const LogicalType &type, const std::function<void(const LogicalType &)> &callback) {
+	if (type.HasAlias()) {
+		callback(type);
+	}
+	switch (type.id()) {
+	case LogicalTypeId::LIST:
+		ForEachAlias(ListType::GetChildType(type), callback);
+		break;
+	case LogicalTypeId::ARRAY:
+		ForEachAlias(ArrayType::GetChildType(type), callback);
+		break;
+	case LogicalTypeId::MAP:
+		ForEachAlias(MapType::KeyType(type), callback);
+		ForEachAlias(MapType::ValueType(type), callback);
+		break;
+	case LogicalTypeId::STRUCT:
+		for (auto &child : StructType::GetChildTypes(type)) {
+			ForEachAlias(child.second, callback);
+		}
+		break;
+	case LogicalTypeId::UNION:
+		for (idx_t i = 0; i < UnionType::GetMemberCount(type); i++) {
+			ForEachAlias(UnionType::GetMemberType(type, i), callback);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+void MnemonicTransaction::CheckNamedTypes(const LogicalType &type) const {
+	auto &schema = GetSchema();
+	ForEachAlias(type, [&](const LogicalType &aliased) {
+		// Named types carry a schema-qualified alias; one-part aliases are
+		// extension types such as REF
+		if (!mnemonicdb::IsNamedTypeAlias(aliased.GetAlias())) {
+			return;
+		}
+		auto components = QualifiedName::ParseComponents(aliased.GetAlias());
+		auto def = schema.FindType(components[0].GetIdentifierName(), components[1].GetIdentifierName());
+		if (!def || def->type != aliased) {
+			throw BinderException("MnemonicDB: type \"%s\" is not a type of this database; a column can only use "
+			                      "named types from its own database",
+			                      aliased.GetAlias());
+		}
+	});
+}
+
+//! Whether values of `a` and `b` have the same stored encoding: the types differ
+//! at most in ENUM dictionaries whose physical width is the same
+static bool SameEncoding(const LogicalType &a, const LogicalType &b) {
+	if (a.id() != b.id() || a.InternalType() != b.InternalType()) {
+		return false;
+	}
+	switch (a.id()) {
+	case LogicalTypeId::LIST:
+		return SameEncoding(ListType::GetChildType(a), ListType::GetChildType(b));
+	case LogicalTypeId::ARRAY:
+		return ArrayType::GetSize(a) == ArrayType::GetSize(b) &&
+		       SameEncoding(ArrayType::GetChildType(a), ArrayType::GetChildType(b));
+	case LogicalTypeId::MAP:
+		return SameEncoding(MapType::KeyType(a), MapType::KeyType(b)) &&
+		       SameEncoding(MapType::ValueType(a), MapType::ValueType(b));
+	case LogicalTypeId::STRUCT: {
+		auto &a_children = StructType::GetChildTypes(a);
+		auto &b_children = StructType::GetChildTypes(b);
+		if (a_children.size() != b_children.size()) {
+			return false;
+		}
+		for (idx_t i = 0; i < a_children.size(); i++) {
+			if (!SameEncoding(a_children[i].second, b_children[i].second)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case LogicalTypeId::UNION: {
+		auto count = UnionType::GetMemberCount(a);
+		if (count != UnionType::GetMemberCount(b)) {
+			return false;
+		}
+		for (idx_t i = 0; i < count; i++) {
+			if (!SameEncoding(UnionType::GetMemberType(a, i), UnionType::GetMemberType(b, i))) {
+				return false;
+			}
+		}
+		return true;
+	}
+	default:
+		return true;
+	}
+}
+
+optional_ptr<CatalogEntry> MnemonicTransaction::CreateType(const string &schema_name, CreateTypeInfo &info) {
+	auto &schema = GetSchema();
+	auto type_name = info.GetTypeName().GetIdentifierName();
+	if (schema_name == "sys") {
+		throw CatalogException("MnemonicDB: schema \"sys\" is reserved: types cannot be created in it");
+	}
+	if (!schema.FindSchema(schema_name)) {
+		throw CatalogException("MnemonicDB: schema \"%s\" does not exist", schema_name);
+	}
+	if (info.temporary) {
+		throw NotImplementedException("MnemonicDB does not support temporary types");
+	}
+	if (mnemonicdb::IsRefType(info.type)) {
+		throw NotImplementedException("MnemonicDB: a named type cannot be REF");
+	}
+	// A named type defined as another named type is a copy of its definition
+	auto type = info.type.HasAlias() ? info.type.WithAlias(string()) : info.type;
+	CheckNamedTypes(type);
+	// Throws for types the store cannot encode
+	mnemonicdb::ValueCodec codec(type.id() == LogicalTypeId::LIST ? ListType::GetChildType(type) : type);
+
+	if (auto existing = schema.FindType(schema_name, type_name)) {
+		switch (info.on_conflict) {
+		case OnCreateConflict::IGNORE_ON_CONFLICT:
+			return nullptr;
+		case OnCreateConflict::REPLACE_ON_CONFLICT:
+			ReplaceType(*existing, type);
+			return generation->GetType(schema_name, type_name);
+		default:
+			throw CatalogException::EntryAlreadyExists(CatalogType::TYPE_ENTRY, info.GetTypeName());
+		}
+	}
+
+	auto &writer = GetWriter();
+	MnemonicStatement statement(*this);
+	mnemonicdb::TypeDef def;
+	def.id = store.AllocateId(mnemonicdb::partition::SCHEMA);
+	def.schema = schema.FindSchema(schema_name)->name;
+	def.name = type_name;
+	def.definition = type.ToString();
+	if (!info.comment.IsNull()) {
+		def.doc = info.comment.ToString();
+	}
+	def.type = type.WithAlias(mnemonicdb::NamedTypeAlias(def.schema, def.name));
+	mnemonicdb::Schema::WriteType(writer, schema, def);
+	SetSchema(schema.WithType(std::move(def)));
+	statement.Commit();
+	return generation->GetType(schema_name, type_name);
+}
+
+void MnemonicTransaction::ReplaceType(const mnemonicdb::TypeDef &existing, const LogicalType &type) {
+	auto old_type = existing.type.WithAlias(string());
+	if (old_type == type) {
+		return;
+	}
+	auto qualified = existing.schema + "." + existing.name;
+	if (old_type.id() != LogicalTypeId::ENUM || type.id() != LogicalTypeId::ENUM) {
+		throw NotImplementedException("MnemonicDB: type \"%s\" cannot be redefined: the only supported change to a "
+		                              "named type is appending values to an ENUM",
+		                              qualified);
+	}
+	auto old_size = EnumType::GetSize(old_type);
+	auto new_size = EnumType::GetSize(type);
+	for (idx_t i = 0; i < old_size; i++) {
+		auto old_value = EnumType::GetString(old_type, i).GetString();
+		if (i >= new_size) {
+			throw NotImplementedException("MnemonicDB: ENUM type \"%s\" can only be extended by appending values, "
+			                              "but the new definition removes '%s'",
+			                              qualified, old_value);
+		}
+		auto new_value = EnumType::GetString(type, i).GetString();
+		if (old_value != new_value) {
+			throw NotImplementedException("MnemonicDB: ENUM type \"%s\" can only be extended by appending values: "
+			                              "existing values must keep their positions, but value %d is '%s' and was "
+			                              "'%s' (values cannot be reordered, renamed or removed)",
+			                              qualified, i + 1, new_value, old_value);
+		}
+	}
+	auto client = context.lock();
+	if (!client) {
+		throw InternalException("MnemonicDB: no client context");
+	}
+	auto &old_schema = GetSchema();
+	auto &writer = GetWriter();
+	MnemonicStatement statement(*this);
+	auto &sys_definition = old_schema.GetAttribute(mnemonicdb::sys::TYPES_DEFINITION);
+	writer.Assert(sys_definition, existing.id, sys_definition.codec.EncodeValue(Value(type.ToString())));
+	// Every type and attribute using the type is re-resolved by name. Old
+	// dictionary indexes stay valid, so stored values only need re-encoding where
+	// an ENUM grew past its physical width (e.g. 256 values)
+	auto new_schema = mnemonicdb::Schema::Load(writer.GetView(), *client);
+	for (auto old_attr : old_schema.AllAttributes()) {
+		auto &new_attr = new_schema->GetAttribute(old_attr->Local());
+		if (new_attr.type == old_attr->type || SameEncoding(old_attr->value_type, new_attr.value_type)) {
+			continue;
+		}
+		auto &old_codec = old_attr->codec;
+		auto &new_codec = new_attr.codec;
+		auto &target = new_attr.value_type;
+		writer.RewriteAttribute(*old_attr, new_attr, [&](std::string_view v) {
+			return new_codec.EncodeValue(old_codec.DecodeValue(v).DefaultCastAs(target, true));
+		});
+	}
+	SetSchema(std::move(new_schema));
+	statement.Commit();
+}
+
+void MnemonicTransaction::DropType(const string &schema_name, const string &type_name, bool if_exists) {
+	auto &schema = GetSchema();
+	auto def = schema.FindType(schema_name, type_name);
+	if (!def) {
+		if (if_exists) {
+			return;
+		}
+		throw CatalogException("MnemonicDB: type \"%s.%s\" does not exist", schema_name, type_name);
+	}
+	auto alias = mnemonicdb::NamedTypeAlias(def->schema, def->name);
+	for (auto attr : schema.AllAttributes()) {
+		if (mnemonicdb::TypeReferences(attr->declared, alias)) {
+			auto table = schema.FindTable(attr->table);
+			throw CatalogException("MnemonicDB: type \"%s.%s\" cannot be dropped: column \"%s.%s.%s\" uses it",
+			                       def->schema, def->name, table ? table->schema : string(),
+			                       table ? table->name : string(), attr->name);
+		}
+	}
+	for (auto other : schema.AllTypes()) {
+		if (other->id != def->id && mnemonicdb::TypeReferences(other->type.WithAlias(string()), alias)) {
+			throw CatalogException("MnemonicDB: type \"%s.%s\" cannot be dropped: type \"%s.%s\" uses it", def->schema,
+			                       def->name, other->schema, other->name);
+		}
+	}
+	auto &writer = GetWriter();
+	MnemonicStatement statement(*this);
+	for (auto sys_attr : {mnemonicdb::sys::TYPES_SCHEMA, mnemonicdb::sys::TYPES_NAME, mnemonicdb::sys::TYPES_DEFINITION,
+	                      mnemonicdb::sys::TYPES_DOC}) {
+		writer.RetractAll(schema.GetAttribute(sys_attr), def->id);
+	}
+	SetSchema(schema.WithoutType(def->id));
 	statement.Commit();
 }
 

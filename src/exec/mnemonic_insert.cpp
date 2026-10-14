@@ -336,6 +336,7 @@ PhysicalOperator &PlanMnemonicInsert(ClientContext &, PhysicalPlanGenerator &pla
 		throw NotImplementedException("MnemonicDB does not support INSERT without a source");
 	}
 	auto &table = op.table.Cast<MnemonicTableEntry>();
+	table.CheckDmlAllowed();
 	auto &insert = planner.Make<MnemonicInsert>(op.types, table, op.estimated_cardinality);
 	insert.children.push_back(*plan);
 	return insert;

@@ -40,6 +40,7 @@ static uint64_t FirstLocal(uint8_t part) {
 	case partition::ATTR:
 		return 64;
 	case partition::TABLE:
+	case partition::SCHEMA:
 		return 16;
 	default:
 		return 1;

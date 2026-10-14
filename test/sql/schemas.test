@@ -1,0 +1,667 @@
+# name: test/sql/schemas.test
+# description: User schemas: CREATE/DROP SCHEMA, four-part names in every path, sys.schemas history
+# group: [sql]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/schemas.mnemonic' AS d (TYPE mnemonicdb)
+
+# main and sys are built-in rows of sys.schemas, in partition 4 (schema objects)
+query TII
+SELECT name, mnemonicdb_id_partition(id), mnemonicdb_id_local(id) FROM d.sys.schemas ORDER BY id
+----
+main	4	1
+sys	4	2
+
+# tx 2
+statement ok
+CREATE SCHEMA d.core
+
+# tx 3
+statement ok
+CREATE SCHEMA d.mods
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS d.core
+
+statement error
+CREATE SCHEMA d.core
+----
+already exists
+
+# sys stays reserved, and main is always there
+statement error
+CREATE SCHEMA d.sys
+----
+schema "sys" is reserved
+
+statement error
+CREATE SCHEMA d.main
+----
+already exists
+
+statement error
+CREATE SCHEMA d.information_schema
+----
+is reserved
+
+statement error
+CREATE TABLE d.sys.mine (x INTEGER)
+----
+schema "sys" is reserved
+
+statement error
+CREATE TABLE d.nowhere.t (x INTEGER)
+----
+nowhere
+
+query TII
+SELECT name, mnemonicdb_id_partition(id), mnemonicdb_id_local(id) FROM d.sys.schemas ORDER BY id
+----
+main	4	1
+sys	4	2
+core	4	16
+mods	4	17
+
+query T
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'd' ORDER BY schema_name
+----
+core
+main
+mods
+sys
+
+# sys.schemas is written only by DDL
+statement error
+INSERT INTO d.sys.schemas (name) VALUES ('sneaky')
+----
+only through CREATE SCHEMA
+
+statement error
+UPDATE d.sys.schemas SET name = 'x' WHERE name = 'core'
+----
+only through CREATE SCHEMA
+
+statement error
+DELETE FROM d.sys.schemas WHERE name = 'core'
+----
+cannot be deleted
+
+#
+# The same table name in three schemas: distinct table entities and attributes
+#
+
+# tx 4, 5, 6
+statement ok
+CREATE TABLE d.core.files (path VARCHAR PRIMARY KEY, size BIGINT)
+
+statement ok
+CREATE TABLE d.mods.files (path VARCHAR PRIMARY KEY, size BIGINT)
+
+statement ok
+CREATE TABLE d.files (path VARCHAR PRIMARY KEY, size BIGINT)
+
+query TTII
+SELECT t.schema, a.name, mnemonicdb_id_local(t.id), mnemonicdb_id_local(a.id)
+FROM d.sys.attributes a JOIN d.sys.tables t ON a.table_id = t.id
+WHERE t.name = 'files' ORDER BY a.id
+----
+core	path	16	64
+core	size	16	65
+mods	path	17	66
+mods	size	17	67
+main	path	18	68
+main	size	18	69
+
+query TT
+SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'd' AND table_name = 'files' ORDER BY ALL
+----
+core	files
+main	files
+mods	files
+
+statement error
+CREATE TABLE d.core.files (x INTEGER)
+----
+already exists
+
+statement ok
+CREATE TABLE IF NOT EXISTS d.core.files (x INTEGER)
+
+#
+# DML through four-part names
+#
+
+# tx 7, 8, 9
+statement ok
+INSERT INTO d.core.files (path, size) VALUES ('a', 1), ('b', 2)
+
+statement ok
+INSERT INTO d.mods.files (path, size) VALUES ('a', 10)
+
+statement ok
+INSERT INTO d.files (path, size) VALUES ('main-a', 100)
+
+query TI
+SELECT path, size FROM d.core.files ORDER BY path
+----
+a	1
+b	2
+
+query TI
+SELECT path, size FROM d.mods.files ORDER BY path
+----
+a	10
+
+query TI
+SELECT path, size FROM d.main.files ORDER BY path
+----
+main-a	100
+
+query TI
+SELECT path, size FROM d.files ORDER BY path
+----
+main-a	100
+
+# Uniqueness is per attribute, so the same path in two schemas is no conflict.
+# tx 10
+statement ok
+UPDATE d.core.files SET size = size + 1 WHERE path = 'b'
+
+# tx 11
+statement ok
+DELETE FROM d.core.files WHERE path = 'a'
+
+# tx 12: upsert
+statement ok
+INSERT INTO d.mods.files (path, size) VALUES ('a', 11), ('c', 30) ON CONFLICT (path) DO UPDATE SET size = excluded.size
+
+query TI
+SELECT path, size FROM d.core.files ORDER BY path
+----
+b	3
+
+query TI
+SELECT path, size FROM d.mods.files ORDER BY path
+----
+a	11
+c	30
+
+# An entity can be in tables of several schemas; joins on id fuse across schemas
+statement ok
+INSERT INTO d.core.files (id, path, size) SELECT id, 'c-core', 300 FROM d.mods.files WHERE path = 'c'
+
+query TT
+SELECT m.path, c.path FROM d.mods.files m JOIN d.core.files c ON c.id = m.id
+----
+c	c-core
+
+query II
+EXPLAIN SELECT m.path, c.path FROM d.mods.files m JOIN d.core.files c ON c.id = m.id
+----
+physical_plan	<!REGEX>:.*Join.*
+
+# Single-datom add/retract take three-part names
+statement ok
+SET VARIABLE b_id = (SELECT id FROM d.core.files WHERE path = 'b')
+
+query T
+CALL mnemonicdb_add('d.core.files', getvariable('b_id'), 'size', 4)
+----
+true
+
+query TI
+SELECT path, size FROM d.core.files WHERE path = 'b'
+----
+b	4
+
+#
+# CREATE INDEX: index names are per schema
+#
+
+statement ok
+CREATE INDEX size_idx ON d.core.files (size)
+
+statement ok
+CREATE INDEX size_idx ON d.mods.files (size)
+
+statement error
+CREATE INDEX size_idx ON d.core.files (path)
+----
+already exists
+
+query TTT
+SELECT schema_name, index_name, table_name FROM duckdb_indexes() WHERE database_name = 'd' ORDER BY ALL
+----
+core	size_idx	files
+mods	size_idx	files
+
+query TI
+SELECT path, size FROM d.mods.files WHERE size = 30
+----
+c	30
+
+statement ok
+DROP INDEX d.mods.size_idx
+
+query TTT
+SELECT schema_name, index_name, table_name FROM duckdb_indexes() WHERE database_name = 'd' ORDER BY ALL
+----
+core	size_idx	files
+
+query TI
+SELECT path, size FROM d.core.files WHERE size = 4
+----
+b	4
+
+#
+# ALTER TABLE in a user schema
+#
+
+statement ok
+ALTER TABLE d.mods.files ADD COLUMN note VARCHAR
+
+statement ok
+ALTER TABLE d.mods.files RENAME COLUMN note TO remark
+
+statement ok
+UPDATE d.mods.files SET remark = 'hi' WHERE path = 'a'
+
+statement ok
+ALTER TABLE d.mods.files RENAME TO assets
+
+query TIT
+SELECT path, size, remark FROM d.mods.assets ORDER BY path
+----
+a	11	hi
+c	30	NULL
+
+statement error
+SELECT * FROM d.mods.files
+----
+does not exist
+
+# The other files tables are untouched
+query TI
+SELECT path, size FROM d.files
+----
+main-a	100
+
+statement ok
+ALTER TABLE d.mods.assets RENAME TO files
+
+statement ok
+ALTER TABLE d.mods.files DROP COLUMN remark
+
+#
+# USE: unqualified names resolve in the chosen schema
+#
+
+statement ok
+USE d.core
+
+query TI
+SELECT path, size FROM files ORDER BY path
+----
+b	4
+c-core	300
+
+statement ok
+INSERT INTO files (path, size) VALUES ('d', 5)
+
+statement ok
+CREATE TABLE plugins (name VARCHAR)
+
+query TT
+SELECT schema, name FROM d.sys.tables WHERE name = 'plugins'
+----
+core	plugins
+
+statement ok
+USE memory
+
+query TI
+SELECT path, size FROM d.core.files ORDER BY path
+----
+b	4
+c-core	300
+d	5
+
+#
+# History and AT
+#
+
+# Schema creation is schema-as-data with history
+query ITTT
+SELECT tx, column_name, value::VARCHAR, added FROM mnemonicdb_history('d', table_name := 'sys.schemas') WHERE tx > 1 ORDER BY tx
+----
+2	name	core	true
+3	name	mods	true
+
+query T
+SELECT name FROM d.sys.schemas AT (VERSION => 2) ORDER BY id
+----
+main
+sys
+core
+
+query T
+SELECT name FROM d.sys.tables AT (VERSION => 5) WHERE schema <> 'sys' ORDER BY id
+----
+files
+files
+
+query TI
+SELECT path, size FROM d.core.files AT (VERSION => 7) ORDER BY path
+----
+a	1
+b	2
+
+query TI
+SELECT path, size FROM d.core.files AT (VERSION => 10) ORDER BY path
+----
+a	1
+b	3
+
+query TI
+SELECT path, size FROM d.mods.files AT (VERSION => 8) ORDER BY path
+----
+a	10
+
+# Before the table existed: no rows
+query I
+SELECT count(*) FROM d.core.files AT (VERSION => 3)
+----
+0
+
+query ITTTTT
+SELECT tx, schema_name, table_name, column_name, value::VARCHAR, added FROM mnemonicdb_history('d', table_name := 'core.files') WHERE tx <= 11 ORDER BY tx, entity, column_name, added
+----
+7	core	files	path	a	true
+7	core	files	size	1	true
+7	core	files	path	b	true
+7	core	files	size	2	true
+10	core	files	size	2	false
+10	core	files	size	3	true
+11	core	files	path	a	false
+11	core	files	size	1	false
+
+# schema_name := filters (dropped columns, like remark, keep their history) to the tables of a schema
+query T
+SELECT DISTINCT schema_name || '.' || table_name FROM mnemonicdb_history('d', schema_name := 'mods') ORDER BY 1
+----
+mods.files
+
+query I
+SELECT count(*) FROM mnemonicdb_history('d', schema_name := 'mods', table_name := 'files')
+----
+8
+
+query ITT
+SELECT tx, column_name, value::VARCHAR FROM mnemonicdb_history('d', schema_name := 'core', table_name := 'files', column_name := 'size') WHERE tx <= 10 ORDER BY tx, added
+----
+7	size	1
+7	size	2
+10	size	2
+10	size	3
+
+statement error
+SELECT * FROM mnemonicdb_history('d', schema_name := 'nope')
+----
+does not exist
+
+statement error
+SELECT * FROM mnemonicdb_history('d', schema_name := 'core', table_name := 'mods.files')
+----
+is not in schema_name
+
+statement error
+SELECT * FROM mnemonicdb_history('d', table_name := 'nope.files')
+----
+does not exist
+
+#
+# Commit assertions referencing schema-qualified tables
+#
+
+statement ok
+INSERT INTO d.sys.assertions (name, query) VALUES
+    ('core_sizes_positive', 'SELECT path FROM core.files WHERE size <= 0'),
+    ('mods_sizes_small', 'SELECT path FROM d.mods.files WHERE size > 1000')
+
+statement error
+INSERT INTO d.core.files (path, size) VALUES ('neg', -1)
+----
+assertion "core_sizes_positive" failed (1 row): (neg)
+
+statement error
+INSERT INTO d.mods.files (path, size) VALUES ('big', 5000)
+----
+assertion "mods_sizes_small" failed (1 row): (big)
+
+# main.files is not covered by either
+statement ok
+INSERT INTO d.files (path, size) VALUES ('neg', -1)
+
+# mnemonicdb_tx_changes with a schema filter
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d.mods.files (path, size) VALUES ('e', 7)
+
+statement ok
+INSERT INTO d.files (path, size) VALUES ('main-e', 7)
+
+query TTTT
+SELECT schema_name, table_name, column_name, value::VARCHAR FROM mnemonicdb_tx_changes('d', schema_name := 'mods') ORDER BY column_name
+----
+mods	files	path	e
+mods	files	size	7
+
+query I
+SELECT count(*) FROM mnemonicdb_tx_changes('d', schema_name := 'core')
+----
+0
+
+query I
+SELECT count(*) FROM mnemonicdb_tx_changes('d', table_name := 'main.files')
+----
+2
+
+statement ok
+COMMIT
+
+statement ok
+DELETE FROM d.sys.assertions
+
+#
+# Transactions: a new schema is private until commit and rolls back cleanly
+#
+
+statement ok
+BEGIN
+
+statement ok
+CREATE SCHEMA d.staging
+
+statement ok
+CREATE TABLE d.staging.t (x INTEGER)
+
+statement ok
+INSERT INTO d.staging.t (x) VALUES (1)
+
+query I
+SELECT x FROM d.staging.t
+----
+1
+
+statement ok con2
+SELECT 1
+
+statement error con2
+SELECT * FROM d.staging.t
+----
+staging
+
+statement ok
+ROLLBACK
+
+statement error
+SELECT * FROM d.staging.t
+----
+staging
+
+query I
+SELECT count(*) FROM d.sys.schemas WHERE name = 'staging'
+----
+0
+
+# Schema and table created in one committed transaction
+statement ok
+BEGIN
+
+statement ok
+CREATE SCHEMA d.kept
+
+statement ok
+CREATE TABLE d.kept.scratch (x INTEGER)
+
+statement ok
+COMMIT
+
+query T
+SELECT name FROM d.sys.schemas WHERE name = 'kept'
+----
+kept
+
+#
+# DROP SCHEMA: only empty schemas; never main or sys; no CASCADE
+#
+
+statement error
+DROP SCHEMA d.core
+----
+is not empty (2 tables, 0 types)
+
+statement error
+DROP SCHEMA d.core CASCADE
+----
+CASCADE
+
+statement error
+DROP SCHEMA d.main
+----
+built in
+
+statement error
+DROP SCHEMA d.sys
+----
+built in
+
+statement error
+DROP SCHEMA d.nope
+----
+does not exist
+
+statement ok
+DROP SCHEMA IF EXISTS d.nope
+
+statement error
+DROP SCHEMA d.kept
+----
+is not empty (1 tables, 0 types)
+
+statement ok
+CREATE SCHEMA d.empty
+
+statement ok
+DROP SCHEMA d.empty
+
+query T
+SELECT name FROM d.sys.schemas ORDER BY id
+----
+main
+sys
+core
+mods
+kept
+
+# The dropped schema stays in history, and the name can be reused (new entity)
+query TT
+SELECT value::VARCHAR, added FROM mnemonicdb_history('d', table_name := 'sys.schemas') WHERE value::VARCHAR = 'empty' ORDER BY tx, added DESC
+----
+empty	true
+empty	false
+
+statement ok
+CREATE SCHEMA d.empty
+
+query I
+SELECT count(DISTINCT entity) FROM mnemonicdb_history('d', table_name := 'sys.schemas') WHERE value::VARCHAR = 'empty'
+----
+2
+
+statement ok
+CREATE TABLE d.kept.t (x INTEGER)
+
+#
+# Everything survives reopening
+#
+
+statement ok
+DETACH d
+
+statement ok
+ATTACH '{TEST_DIR}/schemas.mnemonic' AS d (TYPE mnemonicdb)
+
+query T
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'd' ORDER BY schema_name
+----
+core
+empty
+kept
+main
+mods
+sys
+
+query TI
+SELECT path, size FROM d.core.files ORDER BY path
+----
+b	4
+c-core	300
+d	5
+
+query TI
+SELECT path, size FROM d.mods.files ORDER BY path
+----
+a	11
+c	30
+e	7
+
+query TI
+SELECT path, size FROM d.files ORDER BY path
+----
+main-a	100
+main-e	7
+neg	-1
+
+query TTT
+SELECT schema_name, index_name, table_name FROM duckdb_indexes() WHERE database_name = 'd' ORDER BY ALL
+----
+core	size_idx	files
+
+query TI
+SELECT path, size FROM d.core.files AT (VERSION => 7) ORDER BY path
+----
+a	1
+b	2
+
+statement ok
+INSERT INTO d.kept.t (x) VALUES (42)
+
+query I
+SELECT x FROM d.kept.t
+----
+42

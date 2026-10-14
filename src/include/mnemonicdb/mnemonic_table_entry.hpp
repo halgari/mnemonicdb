@@ -2,6 +2,7 @@
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "mnemonicdb/schema.hpp"
+#include "duckdb/common/exception.hpp"
 
 namespace duckdb {
 
@@ -37,6 +38,15 @@ public:
 	}
 	const mnemonicdb::TableDef &GetTableDef() const {
 		return table;
+	}
+	//! sys.schemas and sys.types: written only by CREATE/DROP SCHEMA and
+	//! CREATE/DROP TYPE, never by DML; throws for them
+	void CheckDmlAllowed() const {
+		if (table.id == mnemonicdb::sys::SCHEMAS || table.id == mnemonicdb::sys::TYPES) {
+			throw NotImplementedException("MnemonicDB: sys.%s is changed only through %s", table.name,
+			                              table.id == mnemonicdb::sys::SCHEMAS ? "CREATE SCHEMA / DROP SCHEMA"
+			                                                                   : "CREATE TYPE / DROP TYPE");
+		}
 	}
 	//! The attribute behind physical column `index` (index 0 is `id`, which has
 	//! none)
