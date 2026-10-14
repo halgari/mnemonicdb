@@ -6,6 +6,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
@@ -74,6 +75,8 @@ struct HistoryState : public GlobalTableFunctionState {
 	bool filtered = false;
 	unordered_set<AttrId> attribute_filter;
 	unordered_map<AttrId, unique_ptr<AttributeInfo>> attributes;
+	//! The columns DuckDB reads, in output order (projection pushdown)
+	vector<column_t> columns;
 
 	idx_t MaxThreads() const override {
 		return 1;
@@ -230,6 +233,7 @@ static unique_ptr<GlobalTableFunctionState> HistoryInit(ClientContext &context, 
 	transaction.MarkDataRead();
 	auto &view = transaction.GetReadView();
 	auto state = make_uniq<HistoryState>();
+	state->columns = input.column_ids;
 	state->filtered = data.filtered;
 	state->attribute_filter.insert(data.attributes.begin(), data.attributes.end());
 	state->until = data.until;
@@ -322,24 +326,111 @@ static AttributeInfo &GetAttributeInfo(ClientContext &context, HistoryState &sta
 	return result;
 }
 
+//! A value to decode into row `row` of the output
+struct PendingValue {
+	idx_t row;
+	AttrId attr;
+	string encoded;
+};
+
+//! Decode the values of one output chunk into its VARIANT column, one cast per
+//! attribute: decoding each value into a Value and casting it to VARIANT costs
+//! microseconds per row
+static void FillValues(HistoryState &state, const vector<PendingValue> &values, Vector &result, idx_t count) {
+	vector<AttrId> order;
+	unordered_map<AttrId, vector<idx_t>> groups;
+	for (idx_t i = 0; i < values.size(); i++) {
+		auto &group = groups[values[i].attr];
+		if (group.empty()) {
+			order.push_back(values[i].attr);
+		}
+		group.push_back(i);
+	}
+	// Each attribute's values cast at once, appended to `all`; `sel` maps each
+	// output row to its value there
+	Vector all(LogicalType::VARIANT(), values.size());
+	SelectionVector sel(count);
+	for (idx_t row = 0; row < count; row++) {
+		sel.set_index(row, 0);
+	}
+	idx_t offset = 0;
+	for (auto attr : order) {
+		auto &rows = groups[attr];
+		auto &codec = *state.attributes.at(attr)->codec;
+		Vector typed(codec.GetType(), rows.size());
+		for (idx_t j = 0; j < rows.size(); j++) {
+			codec.Decode(values[rows[j]].encoded, typed, j);
+		}
+		Vector variant(LogicalType::VARIANT(), rows.size());
+		VectorOperations::DefaultCast(typed, variant, rows.size());
+		VectorOperations::Copy(variant, all, rows.size(), 0, offset);
+		for (idx_t j = 0; j < rows.size(); j++) {
+			sel.set_index(values[rows[j]].row, offset + j);
+		}
+		offset += rows.size();
+	}
+	VectorOperations::Copy(all, result, sel, count, 0, 0);
+}
+
 static void HistoryFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &data = input.bind_data->Cast<HistoryBindData>();
 	auto &state = input.global_state->Cast<HistoryState>();
 	auto &transaction = MnemonicTransaction::Get(context, data.catalog);
 
 	idx_t count = 0;
+	vector<PendingValue> pending_values;
+	// Only the columns DuckDB reads, written straight into the vectors: decoding
+	// the value (a VARIANT) is most of a row's cost, and most queries don't read it
+	auto set_string = [&](Vector &vector, const string &text) {
+		if (text.empty()) {
+			FlatVector::SetNull(vector, count, true);
+		} else {
+			FlatVector::GetDataMutable<string_t>(vector)[count] = StringVector::AddString(vector, text);
+		}
+	};
 	auto emit = [&](TxId tx, const Datom &datom, bool added) {
-		auto &info = GetAttributeInfo(context, state, transaction, datom.a);
-		output.data[0].SetValue(count, Value::UBIGINT(tx));
-		output.data[1].SetValue(count, Value::UBIGINT(datom.e));
-		output.data[2].SetValue(count, info.schema.empty() ? Value() : Value(info.schema));
-		output.data[3].SetValue(count, info.table.empty() ? Value() : Value(info.table));
-		output.data[4].SetValue(count, Value(info.column));
-		output.data[5].SetValue(count, Value::UBIGINT(mnemonicdb::AttrEntity(datom.a)));
-		output.data[6].SetValue(count, info.codec->DecodeValue(datom.v).DefaultCastAs(LogicalType::VARIANT()));
-		output.data[7].SetValue(count, Value::BOOLEAN(added));
-		if (data.tx_changes) {
-			output.data[8].SetValue(count, Value::BOOLEAN(transaction.MintedHere(datom.e)));
+		optional_ptr<AttributeInfo> info;
+		auto attribute = [&]() -> AttributeInfo & {
+			if (!info) {
+				info = &GetAttributeInfo(context, state, transaction, datom.a);
+			}
+			return *info;
+		};
+		for (idx_t k = 0; k < state.columns.size(); k++) {
+			auto &vector = output.data[k];
+			switch (state.columns[k]) {
+			case 0:
+				FlatVector::GetDataMutable<uint64_t>(vector)[count] = tx;
+				break;
+			case 1:
+				FlatVector::GetDataMutable<uint64_t>(vector)[count] = datom.e;
+				break;
+			case 2:
+				set_string(vector, attribute().schema);
+				break;
+			case 3:
+				set_string(vector, attribute().table);
+				break;
+			case 4:
+				FlatVector::GetDataMutable<string_t>(vector)[count] = StringVector::AddString(vector, attribute().column);
+				break;
+			case 5:
+				FlatVector::GetDataMutable<uint64_t>(vector)[count] = mnemonicdb::AttrEntity(datom.a);
+				break;
+			case 6:
+				attribute();
+				pending_values.push_back(PendingValue {count, datom.a, datom.v});
+				break;
+			case 7:
+				FlatVector::GetDataMutable<bool>(vector)[count] = added;
+				break;
+			case 8:
+				FlatVector::GetDataMutable<bool>(vector)[count] = transaction.MintedHere(datom.e);
+				break;
+			default:
+				// No column at all (e.g. count(*)): only the row count matters
+				break;
+			}
 		}
 		count++;
 	};
@@ -368,6 +459,11 @@ static void HistoryFunction(ClientContext &context, TableFunctionInput &input, D
 				continue;
 			}
 			emit(event.tx, event.datom, event.added);
+		}
+	}
+	for (idx_t k = 0; k < state.columns.size(); k++) {
+		if (state.columns[k] == 6 && !pending_values.empty()) {
+			FillValues(state, pending_values, output.data[k], count);
 		}
 	}
 	output.SetChildCardinality(count);
@@ -406,38 +502,55 @@ static idx_t ScaleTxChanges(MnemonicTransaction &transaction, const string &pref
 	return MaxValue<idx_t>(matched, idx_t(double(matched) / fraction));
 }
 
+//! Count the pending txlog entries of `transaction`'s tx per attribute, up to
+//! TX_CHANGES_COUNT_LIMIT
+static shared_ptr<const PendingSample> SamplePending(MnemonicTransaction &transaction, TxId tx) {
+	auto sample = make_shared_ptr<PendingSample>();
+	auto prefix = mnemonicdb::TxlogPrefix(tx);
+	auto it = transaction.GetReadView().NewIterator(ColumnFamily::TXLOG, prefix);
+	for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
+		if (sample->total == TX_CHANGES_COUNT_LIMIT) {
+			sample->truncated = true;
+			sample->stopped_at = it->key().ToString();
+			break;
+		}
+		sample->total++;
+		// The first entity of the partition the scan is in (e.g. past the tx
+		// entity's own datoms)
+		auto entity = mnemonicdb::GetEntityId(it->key().data() + mnemonicdb::PACKED_TX_SIZE);
+		if (sample->total == 1 || mnemonicdb::PartitionOf(entity) != mnemonicdb::PartitionOf(sample->first_entity)) {
+			sample->first_entity = entity;
+		}
+		// txlog keys are T5 E6 A2 V
+		auto key = it->key();
+		sample->per_attribute[mnemonicdb::GetAttrId(key.data() + mnemonicdb::PACKED_TX_SIZE +
+		                                            mnemonicdb::PACKED_ID_SIZE)]++;
+	}
+	return std::move(sample);
+}
+
 //! The number of rows mnemonicdb_tx_changes will return: its pending txlog
-//! entries (those of the filtered attributes), counted up to a limit
+//! entries (those of the filtered attributes), counted up to a limit. Commit
+//! assertions share one count.
 static idx_t EstimateTxChanges(ClientContext &context, const HistoryBindData &data) {
 	auto &transaction = MnemonicTransaction::Get(context, data.catalog);
 	auto tx = transaction.PendingTx();
 	if (tx == 0) {
 		return 0;
 	}
-	auto prefix = mnemonicdb::TxlogPrefix(tx);
-	auto it = transaction.GetReadView().NewIterator(ColumnFamily::TXLOG, prefix);
-	unordered_set<AttrId> filter(data.attributes.begin(), data.attributes.end());
-	idx_t scanned = 0;
+	auto sample = transaction.GetPendingSample([&]() { return SamplePending(transaction, tx); });
 	idx_t matched = 0;
-	EntityId first_entity = 0;
-	for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
-		if (++scanned > TX_CHANGES_COUNT_LIMIT) {
-			return ScaleTxChanges(transaction, prefix, first_entity, it->key(), matched);
+	if (!data.filtered) {
+		matched = sample->total;
+	} else {
+		for (auto attr : data.attributes) {
+			auto entry = sample->per_attribute.find(attr);
+			matched += entry == sample->per_attribute.end() ? 0 : entry->second;
 		}
-		// The first entity of the partition the scan is in (e.g. past the tx
-		// entity's own datoms)
-		auto entity = mnemonicdb::GetEntityId(it->key().data() + mnemonicdb::PACKED_TX_SIZE);
-		if (scanned == 1 || mnemonicdb::PartitionOf(entity) != mnemonicdb::PartitionOf(first_entity)) {
-			first_entity = entity;
-		}
-		if (!data.filtered) {
-			matched++;
-			continue;
-		}
-		// txlog keys are T5 E6 A2 V
-		auto key = it->key();
-		auto attr = mnemonicdb::GetAttrId(key.data() + mnemonicdb::PACKED_TX_SIZE + mnemonicdb::PACKED_ID_SIZE);
-		matched += filter.count(attr);
+	}
+	if (sample->truncated) {
+		return ScaleTxChanges(transaction, mnemonicdb::TxlogPrefix(tx), sample->first_entity,
+		                      rocksdb::Slice(sample->stopped_at), matched);
 	}
 	return matched;
 }
@@ -484,6 +597,7 @@ void RegisterHistoryFunction(ExtensionLoader &loader) {
 	function.named_parameters["since"] = LogicalType::UBIGINT;
 	function.named_parameters["until"] = LogicalType::UBIGINT;
 	function.cardinality = HistoryCardinality;
+	function.projection_pushdown = true;
 	loader.RegisterFunction(function);
 
 	// mnemonicdb_tx_changes([db], table_name :=, column_name :=): the datoms the
@@ -496,6 +610,7 @@ void RegisterHistoryFunction(ExtensionLoader &loader) {
 		overload.named_parameters["table_name"] = LogicalType::VARCHAR;
 		overload.named_parameters["column_name"] = LogicalType::VARCHAR;
 		overload.cardinality = HistoryCardinality;
+		overload.projection_pushdown = true;
 		tx_changes.AddFunction(overload);
 	}
 	loader.RegisterFunction(tx_changes);

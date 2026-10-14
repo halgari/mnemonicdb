@@ -719,10 +719,18 @@ INSERT INTO d.sys.assertions (name, query, doc) VALUES
   (its pending txlog entries for the filtered attributes, counted up to
   20,000; past that, the count so far is scaled by the share of the
   transaction's entity range the count reached), so a join builds its hash table on the changes rather than on a
-  large table. `mnemonicdb_history` estimates twice the current datoms of the
+  large table. The count is per attribute, made once per commit and shared by
+  all its assertions (the batch doesn't change while they run), so each call
+  only sums it. `mnemonicdb_history` estimates twice the current datoms of the
   attributes it reads. Table scans report distinct counts for `id` and for
   UNIQUE / PRIMARY KEY columns (never min/max, which DuckDB would trust for
   pruning).
+- **Columns.** `mnemonicdb_tx_changes` and `mnemonicdb_history` produce only
+  the columns a query reads (projection pushdown), written straight into the
+  output vectors. `value` is decoded per chunk, one batch per attribute (a typed
+  vector, cast to VARIANT at once), since decoding each value into a `Value` and
+  casting it took about 10 µs a row. A 6,000-datom transaction lists its
+  changes in about 3 ms with values (60 ms before), 2 ms without.
 - **Cost.** Up to `mnemonicdb_assertion_threads` connections per checked
   commit, each with two statements besides its queries; each query is parsed
   once per database and then planned and run per commit. With twelve trivial

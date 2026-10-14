@@ -5,6 +5,8 @@
 #include "duckdb/transaction/transaction.hpp"
 #include "mnemonicdb/tx_writer.hpp"
 
+#include <functional>
+
 namespace rocksdb {
 class Snapshot;
 }
@@ -23,6 +25,18 @@ struct CreateTypeInfo;
 class ColumnDefinition;
 
 class MnemonicTransaction;
+
+//! The pending txlog entries of a transaction, counted per attribute up to a
+//! limit: what mnemonicdb_tx_changes estimates its row count from
+struct PendingSample {
+	unordered_map<mnemonicdb::AttrId, idx_t> per_attribute;
+	idx_t total = 0;
+	//! Counting stopped at the limit: the key it stopped at, and the first entity
+	//! of the partition it was in
+	bool truncated = false;
+	string stopped_at;
+	mnemonicdb::EntityId first_entity = 0;
+};
 
 //! Makes one statement's writes atomic within the transaction: on failure (an
 //! exception before Commit), the write batch, tempid bindings, ID counters and
@@ -125,6 +139,10 @@ public:
 	bool IsBorrowed() const {
 		return parent != nullptr;
 	}
+	//! For a borrowed transaction, the parent's pending sample, made by `make`
+	//! once and shared by every assertion (the parent's batch doesn't change while
+	//! they run); otherwise a new one
+	shared_ptr<const PendingSample> GetPendingSample(const std::function<shared_ptr<const PendingSample>()> &make);
 
 	//! Evaluate commit assertions, then write this transaction's changes; called
 	//! by the transaction manager with the committing context
@@ -174,6 +192,10 @@ private:
 	//! Set for a borrowed transaction (assertion evaluation): the committing
 	//! transaction whose snapshot and batch `view` reads
 	MnemonicTransaction *parent = nullptr;
+	//! The pending sample shared by the assertions of this (committing)
+	//! transaction
+	mutex sample_lock;
+	shared_ptr<const PendingSample> pending_sample;
 };
 
 } // namespace duckdb

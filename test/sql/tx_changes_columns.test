@@ -1,0 +1,84 @@
+# name: test/sql/tx_changes_columns.test
+# description: mnemonicdb_tx_changes and mnemonicdb_history produce only the columns a query reads, and decode a chunk's values attribute by attribute; every column and value is as written, whatever the mix of types in a chunk
+# group: [sql]
+
+require mnemonicdb
+
+statement ok
+ATTACH '{TEST_DIR}/tx_changes_columns.mnemonic' AS d (TYPE mnemonicdb)
+
+statement ok
+CREATE TYPE d.pair AS STRUCT(a INTEGER, b VARCHAR)
+
+statement ok
+CREATE TABLE d.t (i INTEGER, s VARCHAR, p d.pair, l VARCHAR[], r REF, e VARCHAR)
+
+statement ok
+BEGIN
+
+# 3,000 entities, each with up to five attributes of different types (l is cardinality-many: a
+# datom per element), so every chunk mixes them
+statement ok
+INSERT INTO d.t (id, i, s, p, l) SELECT tempid('t' || x), x, 'name ' || x, {'a': x, 'b': 'b' || x}, ['x' || x, 'y'] FROM range(3000) r(x)
+
+statement ok
+UPDATE d.t SET r = id WHERE i % 3 = 0
+
+query IIIIIII
+SELECT count(*), count(DISTINCT entity), count(DISTINCT column_name), bool_and(added), bool_and(minted),
+       count(DISTINCT tx), count(DISTINCT attribute)
+FROM mnemonicdb_tx_changes('d')
+WHERE table_name = 't'
+----
+16000	3000	5	1	1	1	5
+
+# Each value as written
+query I
+SELECT count(*) FROM mnemonicdb_tx_changes('d') c JOIN d.t x ON x.id = c.entity
+WHERE (c.column_name = 'i' AND c.value::INTEGER IS DISTINCT FROM x.i)
+   OR (c.column_name = 's' AND c.value::VARCHAR IS DISTINCT FROM x.s)
+   OR (c.column_name = 'p' AND (c.value.a::INTEGER IS DISTINCT FROM x.p.a OR c.value.b::VARCHAR IS DISTINCT FROM x.p.b))
+   OR (c.column_name = 'l' AND NOT list_contains(x.l, c.value::VARCHAR))
+   OR (c.column_name = 'r' AND c.value::UBIGINT IS DISTINCT FROM x.r)
+----
+0
+
+# Only some columns, in any order, and none at all
+query III
+SELECT count(value), count(column_name), sum(CASE WHEN added THEN 1 END) FROM mnemonicdb_tx_changes('d')
+----
+16000	16000	16000
+
+query I
+SELECT count(*) FROM mnemonicdb_tx_changes('d')
+----
+16000
+
+query II
+SELECT column_name, variant_typeof(value) FROM mnemonicdb_tx_changes('d', table_name := 't') GROUP BY ALL ORDER BY ALL
+----
+i	INT32
+l	VARCHAR
+p	OBJECT(a, b)
+r	UINT64
+s	VARCHAR
+
+statement ok
+INSERT INTO d.sys.tx (id) VALUES (current_tx('d'))
+
+statement ok
+COMMIT
+
+# History reads the same way
+query I
+SELECT count(*) FROM mnemonicdb_history('d', table_name := 't') c JOIN d.t x ON x.id = c.entity
+WHERE (c.column_name = 'i' AND c.value::INTEGER IS DISTINCT FROM x.i)
+   OR (c.column_name = 'p' AND c.value.b::VARCHAR IS DISTINCT FROM x.p.b)
+   OR (c.column_name = 'l' AND NOT list_contains(x.l, c.value::VARCHAR))
+----
+0
+
+query II
+SELECT count(*), count(DISTINCT entity) FROM mnemonicdb_history('d', table_name := 't')
+----
+16000	3000

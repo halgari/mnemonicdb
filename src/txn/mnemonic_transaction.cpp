@@ -156,6 +156,18 @@ mnemonicdb::TxId MnemonicTransaction::PendingTx() const {
 	return parent ? parent->PendingTx() : 0;
 }
 
+shared_ptr<const PendingSample>
+MnemonicTransaction::GetPendingSample(const std::function<shared_ptr<const PendingSample>()> &make) {
+	if (!parent) {
+		return make();
+	}
+	lock_guard<mutex> guard(parent->sample_lock);
+	if (!parent->pending_sample) {
+		parent->pending_sample = make();
+	}
+	return parent->pending_sample;
+}
+
 bool MnemonicTransaction::MintedHere(mnemonicdb::EntityId e) const {
 	if (!writer) {
 		return parent ? parent->MintedHere(e) : false;
